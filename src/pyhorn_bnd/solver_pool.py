@@ -1,4 +1,4 @@
-"""Longest-common-prefix reuse of incremental Z3 solver contexts."""
+"""Fresh and cross-trace incremental Z3 solver backends."""
 
 from __future__ import annotations
 
@@ -9,8 +9,17 @@ import z3
 from .vc import VerificationCondition
 
 
+DEFAULT_MAX_SOLVERS = 16
+
+
 @dataclass(frozen=True)
 class SolverPoolStatistics:
+    """Common statistics reported by both solver backends.
+
+    In fresh mode, ``contexts`` and all reuse/push/pop counters are zero, while
+    ``solvers_created`` equals the number of traces checked.
+    """
+
     contexts: int
     solvers_created: int
     contexts_recycled: int
@@ -26,13 +35,107 @@ class SolverPoolStatistics:
 class SolverPoolCheck:
     result: z3.CheckSatResult
     checked_prefix_length: int
-    context_id: int
+    context_id: int | None
     common_prefix_length: int
     created_context: bool
     popped_steps: int
     pushed_steps: int
     reason_unknown: str | None = None
     model: z3.ModelRef | None = None
+
+
+class FreshTraceSolver:
+    """Original baseline: one fresh solver for every candidate trace.
+
+    The solver is extended monotonically with one SSA step at a time and
+    checked after every addition so that the first infeasible prefix can be
+    learned. No solver state survives across traces, and this backend never
+    calls ``push()`` or ``pop()``.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_ms: int = 1000,
+        random_seed: int | None = None,
+    ) -> None:
+        if timeout_ms < 0:
+            raise ValueError("timeout_ms must be non-negative")
+        self.timeout_ms = timeout_ms
+        self.random_seed = random_seed
+        self._solvers_created = 0
+        self._checks = 0
+        self._last_check: SolverPoolCheck | None = None
+
+    @property
+    def statistics(self) -> SolverPoolStatistics:
+        return SolverPoolStatistics(
+            contexts=0,
+            solvers_created=self._solvers_created,
+            contexts_recycled=0,
+            traces_reused=0,
+            exact_prefix_hits=0,
+            common_prefix_steps_reused=0,
+            pushes=0,
+            pops=0,
+            checks=self._checks,
+        )
+
+    @property
+    def last_check(self) -> SolverPoolCheck | None:
+        return self._last_check
+
+    @property
+    def context_prefixes(self) -> tuple[tuple[int, ...], ...]:
+        return ()
+
+    def _make_solver(self) -> z3.Solver:
+        solver = z3.Solver()
+        if self.timeout_ms:
+            solver.set(timeout=self.timeout_ms)
+        if self.random_seed is not None:
+            solver.set(random_seed=self.random_seed)
+        self._solvers_created += 1
+        return solver
+
+    def check(self, vc: VerificationCondition) -> SolverPoolCheck:
+        solver = self._make_solver()
+
+        for index, step in enumerate(vc.steps):
+            solver.add(step.constraint)
+            result = solver.check()
+            self._checks += 1
+
+            if result == z3.sat:
+                continue
+
+            check = SolverPoolCheck(
+                result=result,
+                checked_prefix_length=index + 1,
+                context_id=None,
+                common_prefix_length=0,
+                created_context=True,
+                popped_steps=0,
+                pushed_steps=0,
+                reason_unknown=(
+                    solver.reason_unknown() if result == z3.unknown else None
+                ),
+            )
+            self._last_check = check
+            return check
+
+        check = SolverPoolCheck(
+            result=z3.sat,
+            checked_prefix_length=len(vc.steps),
+            context_id=None,
+            common_prefix_length=0,
+            created_context=True,
+            popped_steps=0,
+            pushed_steps=0,
+            model=solver.model(),
+        )
+        self._last_check = check
+        return check
 
 
 @dataclass
@@ -60,9 +163,8 @@ class IncrementalSolverPool:
         *,
         timeout_ms: int = 1000,
         random_seed: int | None = None,
-        enabled: bool = True,
         reuse_min_ratio: float = 1.0 / 3.0,
-        max_contexts: int | None = None,
+        max_contexts: int | None = DEFAULT_MAX_SOLVERS,
     ) -> None:
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be non-negative")
@@ -73,7 +175,6 @@ class IncrementalSolverPool:
 
         self.timeout_ms = timeout_ms
         self.random_seed = random_seed
-        self.enabled = enabled
         self.reuse_min_ratio = reuse_min_ratio
         self.max_contexts = max_contexts
         self._contexts: list[_SolverContext] = []
@@ -128,7 +229,14 @@ class IncrementalSolverPool:
             and len(self._contexts) >= self.max_contexts
         ):
             victim = min(self._contexts, key=lambda item: item.last_used)
-            victim.solver = self._make_solver()
+            # Reuse the physical Z3 solver object so the configured limit also
+            # bounds solver allocations and their native memory. ``reset()``
+            # removes every assertion and backtracking scope.
+            victim.solver.reset()
+            if self.timeout_ms:
+                victim.solver.set(timeout=self.timeout_ms)
+            if self.random_seed is not None:
+                victim.solver.set(random_seed=self.random_seed)
             victim.rule_ids.clear()
             victim.last_used = self._clock
             self._contexts_recycled += 1
@@ -155,7 +263,7 @@ class IncrementalSolverPool:
     def _select_context(
         self, rule_ids: tuple[int, ...]
     ) -> tuple[_SolverContext, int, bool]:
-        if not self.enabled or not self._contexts:
+        if not self._contexts:
             return self._new_or_recycled_context(), 0, True
 
         best_context: _SolverContext | None = None

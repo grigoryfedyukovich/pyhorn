@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import z3
 
 from .horn import HornProgram, HornRule
-from .normalize import mk_and, substitute_many
+from .normalize import flatten_and, mk_and, substitute_many
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,117 @@ class VerificationCondition:
         for step in self.steps:
             solver.add(step.constraint)
         return "\n".join(comments) + "\n" + solver.to_smt2()
+
+
+class BndExplSmtDumpBuilder:
+    """Build the compact SSA formula used by the original ``bnd/expl`` dumps.
+
+    The explorer's internal VC deliberately keeps explicit rule-local and state
+    variables because that representation is convenient for caching.  The C++
+    dump format is more compact: source arguments are substituted with the
+    previous state, each non-query destination gets fresh ``__bnd_var_N``
+    symbols, and remaining rule-local variables use ``__loc_var_N``.
+    """
+
+    def __init__(self, program: HornProgram) -> None:
+        self.program = program
+
+    def build_formula(self, trace: tuple[HornRule, ...]) -> z3.BoolRef:
+        if not trace:
+            raise ValueError("an SMT dump requires a non-empty trace")
+
+        bind_index = 0
+        local_index = 0
+        current_state: tuple[z3.ExprRef, ...] | None = None
+        constraints: list[z3.BoolRef] = []
+
+        for step_index, rule in enumerate(trace):
+            substitutions: dict[z3.ExprRef, z3.ExprRef] = {}
+            links: list[z3.BoolRef] = []
+
+            if rule.src_relation is None:
+                if current_state is not None:
+                    raise ValueError(
+                        "fact rule encountered after the first trace step"
+                    )
+            else:
+                if current_state is None or len(rule.src_args) != len(current_state):
+                    raise ValueError(
+                        f"trace is disconnected at step {step_index}: {rule.short()}"
+                    )
+                for argument, state_var in zip(
+                    rule.src_args, current_state, strict=True
+                ):
+                    if _is_rule_constant(argument):
+                        previous = substitutions.get(argument)
+                        if previous is None:
+                            substitutions[argument] = state_var
+                        else:
+                            links.append(previous == state_var)
+                    else:
+                        links.append(argument == state_var)
+
+            if rule.dst_relation in self.program.query_relations:
+                destination_state = None
+            else:
+                destination_vars: list[z3.ExprRef] = []
+                for argument in rule.dst_args:
+                    destination_vars.append(
+                        z3.Const(f"__bnd_var_{bind_index}", argument.sort())
+                    )
+                    bind_index += 1
+                destination_state = tuple(destination_vars)
+
+                for argument, state_var in zip(
+                    rule.dst_args, destination_state, strict=True
+                ):
+                    if _is_rule_constant(argument) and argument not in substitutions:
+                        substitutions[argument] = state_var
+                    else:
+                        # This covers unchanged source variables, expressions in
+                        # relation arguments, and duplicate destination variables.
+                        links.append(argument == state_var)
+
+            for variable in rule.rule_vars:
+                if variable in substitutions:
+                    continue
+                substitutions[variable] = z3.Const(
+                    f"__loc_var_{local_index}", variable.sort()
+                )
+                local_index += 1
+
+            for item in (*flatten_and(rule.body), *links):
+                constraints.append(
+                    substitute_many(item, substitutions.items())
+                )
+
+            current_state = destination_state
+
+        if trace[-1].dst_relation not in self.program.query_relations:
+            raise ValueError("trace does not end in a query relation")
+        return mk_and(constraints)
+
+    def to_smt2(
+        self,
+        trace: tuple[HornRule, ...],
+        *,
+        bound: int,
+        result: str,
+    ) -> str:
+        formula = self.build_formula(trace)
+        declarations = _smt_declarations(formula)
+        sections = [
+            "; bnd/expl SMT dump",
+            f"; bound: {bound}",
+            f"; result: {result}",
+            "",
+        ]
+        if declarations:
+            sections.extend(declarations)
+            sections.append("")
+        sections.append(f"(assert {formula.sexpr()})")
+        sections.append("(check-sat)")
+        return "\n".join(sections) + "\n"
 
 
 @dataclass(frozen=True)
@@ -211,6 +322,55 @@ class VerificationConditionBuilder:
         if trace[-1].dst_relation not in self.program.query_relations:
             raise ValueError("trace does not end in a query relation")
         return VerificationCondition(trace=trace, steps=tuple(steps))
+
+
+def _is_rule_constant(expr: z3.ExprRef) -> bool:
+    return (
+        z3.is_const(expr)
+        and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED
+    )
+
+
+def _collect_uninterpreted_declarations(
+    expr: z3.ExprRef,
+) -> tuple[z3.FuncDeclRef, ...]:
+    found: dict[tuple[str, tuple[str, ...], str], z3.FuncDeclRef] = {}
+    stack: list[z3.ExprRef] = [expr]
+    while stack:
+        current = stack.pop()
+        if z3.is_quantifier(current):
+            stack.append(current.body())
+            continue
+        if not z3.is_app(current):
+            continue
+        declaration = current.decl()
+        if declaration.kind() == z3.Z3_OP_UNINTERPRETED:
+            key = (
+                str(declaration.name()),
+                tuple(declaration.domain(i).sexpr() for i in range(declaration.arity())),
+                declaration.range().sexpr(),
+            )
+            found[key] = declaration
+        stack.extend(current.children())
+    return tuple(found[key] for key in sorted(found))
+
+
+def _smt_symbol(name: object) -> str:
+    # Let Z3 quote symbols according to SMT-LIB rules.
+    return z3.Const(str(name), z3.IntSort()).sexpr()
+
+
+def _smt_declarations(expr: z3.ExprRef) -> list[str]:
+    declarations: list[str] = []
+    for declaration in _collect_uninterpreted_declarations(expr):
+        domains = " ".join(
+            declaration.domain(i).sexpr() for i in range(declaration.arity())
+        )
+        declarations.append(
+            f"(declare-fun {_smt_symbol(declaration.name())} "
+            f"({domains}) {declaration.range().sexpr()})"
+        )
+    return declarations
 
 
 def _safe_name(name: object) -> str:

@@ -11,11 +11,14 @@ from .explorer import (
 from .horn import HornParseError, HornProgram, HornRule, parse_chc_file
 from .normalize import HornNormalizationError
 from .solver_pool import (
+    DEFAULT_MAX_SOLVERS,
+    FreshTraceSolver,
     IncrementalSolverPool,
     SolverPoolCheck,
     SolverPoolStatistics,
 )
 from .vc import (
+    BndExplSmtDumpBuilder,
     SSAConstructionStatistics,
     StateVersion,
     VCStep,
@@ -25,8 +28,10 @@ from .vc import (
 )
 
 __all__ = [
+    "BndExplSmtDumpBuilder",
     "BoundedExplorer",
     "CheckStatus",
+    "DEFAULT_MAX_SOLVERS",
     "DepthStatistics",
     "ExplorationResult",
     "ExplorationStatus",
@@ -34,6 +39,7 @@ __all__ = [
     "HornParseError",
     "HornProgram",
     "HornRule",
+    "FreshTraceSolver",
     "IncrementalSolverPool",
     "SSAConstructionStatistics",
     "SolverPoolCheck",

@@ -11,8 +11,14 @@ from typing import Iterator
 import z3
 
 from .horn import ENTRY, HornProgram, HornRule
-from .solver_pool import IncrementalSolverPool, SolverPoolStatistics
+from .solver_pool import (
+    DEFAULT_MAX_SOLVERS,
+    FreshTraceSolver,
+    IncrementalSolverPool,
+    SolverPoolStatistics,
+)
 from .vc import (
+    BndExplSmtDumpBuilder,
     SSAConstructionStatistics,
     VerificationCondition,
     VerificationConditionBuilder,
@@ -104,64 +110,116 @@ class BoundedExplorer:
         *,
         timeout_ms: int = 1000,
         random_seed: int | None = None,
+        smt_dump_dir: Path | str | None = None,
         ssa_dump_dir: Path | str | None = None,
-        use_solver_pool: bool = True,
+        solver_mode: str = "pool",
+        use_solver_pool: bool | None = None,
         solver_reuse_min_ratio: float = 1.0 / 3.0,
-        max_solver_contexts: int | None = None,
+        max_solver_contexts: int | None = DEFAULT_MAX_SOLVERS,
     ) -> None:
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be non-negative")
+        if solver_mode not in {"pool", "fresh"}:
+            raise ValueError("solver_mode must be 'pool' or 'fresh'")
+        if use_solver_pool is not None:
+            compatibility_mode = "pool" if use_solver_pool else "fresh"
+            if solver_mode != "pool" and solver_mode != compatibility_mode:
+                raise ValueError(
+                    "solver_mode conflicts with the legacy use_solver_pool option"
+                )
+            solver_mode = compatibility_mode
+
         self.program = program
         self.timeout_ms = timeout_ms
         self.random_seed = random_seed
+        self.solver_mode = solver_mode
+        self.max_solver_contexts = (
+            max_solver_contexts if solver_mode == "pool" else None
+        )
         self.unsat_prefixes = UnsatPrefixSet()
         self.vc_builder = VerificationConditionBuilder(program)
-        self.solver_pool = IncrementalSolverPool(
-            timeout_ms=timeout_ms,
-            random_seed=random_seed,
-            enabled=use_solver_pool,
-            reuse_min_ratio=solver_reuse_min_ratio,
-            max_contexts=max_solver_contexts,
-        )
-        self.ssa_dump_dir = (
-            None if ssa_dump_dir is None else Path(ssa_dump_dir).resolve()
-        )
-        self._ssa_dump_count = 0
-        if self.ssa_dump_dir is not None:
-            if self.ssa_dump_dir.exists() and not self.ssa_dump_dir.is_dir():
+        self.smt_dump_builder = BndExplSmtDumpBuilder(program)
+        if smt_dump_dir is not None and ssa_dump_dir is not None:
+            if Path(smt_dump_dir).resolve() != Path(ssa_dump_dir).resolve():
                 raise ValueError(
-                    f"SSA dump path is not a directory: {self.ssa_dump_dir}"
+                    "smt_dump_dir conflicts with the legacy ssa_dump_dir option"
                 )
-            self.ssa_dump_dir.mkdir(parents=True, exist_ok=True)
-            if any(self.ssa_dump_dir.iterdir()):
+        dump_dir = smt_dump_dir if smt_dump_dir is not None else ssa_dump_dir
+        if solver_mode == "pool":
+            self.solver_backend = IncrementalSolverPool(
+                timeout_ms=timeout_ms,
+                random_seed=random_seed,
+                reuse_min_ratio=solver_reuse_min_ratio,
+                max_contexts=max_solver_contexts,
+            )
+        else:
+            self.solver_backend = FreshTraceSolver(
+                timeout_ms=timeout_ms,
+                random_seed=random_seed,
+            )
+        # Compatibility alias retained for callers that inspected this object.
+        self.solver_pool = self.solver_backend
+        self.smt_dump_dir = (
+            None if dump_dir is None else Path(dump_dir).resolve()
+        )
+        self._smt_dump_count = 0
+        if self.smt_dump_dir is not None:
+            if self.smt_dump_dir.exists() and not self.smt_dump_dir.is_dir():
                 raise ValueError(
-                    "SSA dump directory must be empty to avoid mixing or "
-                    f"overwriting runs: {self.ssa_dump_dir}"
+                    f"SMT dump path is not a directory: {self.smt_dump_dir}"
                 )
+            self.smt_dump_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def smt_dump_count(self) -> int:
+        return self._smt_dump_count
 
     @property
     def ssa_dump_count(self) -> int:
-        return self._ssa_dump_count
+        """Compatibility alias for callers using the pre-0.0.8 name."""
+        return self._smt_dump_count
+
+    @property
+    def ssa_dump_dir(self) -> Path | None:
+        """Compatibility alias for callers using the pre-0.0.8 name."""
+        return self.smt_dump_dir
 
     @property
     def solver_statistics(self) -> SolverPoolStatistics:
-        return self.solver_pool.statistics
+        return self.solver_backend.statistics
 
     @property
     def ssa_statistics(self) -> SSAConstructionStatistics:
         return self.vc_builder.statistics
 
-    def _dump_ssa(self, vc: VerificationCondition) -> Path | None:
-        if self.ssa_dump_dir is None:
+    def _dump_smt(
+        self,
+        check: TraceCheck,
+        *,
+        bound: int,
+        trace_number: int,
+        trace_count: int,
+    ) -> Path | None:
+        if self.smt_dump_dir is None:
             return None
 
-        self._ssa_dump_count += 1
-        destination = self.ssa_dump_dir / (
-            f"ssa_{self._ssa_dump_count:06d}_depth_{len(vc.trace):06d}.smt2"
-        )
+        stem = self.program.source_path.stem
+        suffix = f"{stem}_k{bound}"
+        if trace_count > 1:
+            suffix += f"_t{trace_number}"
+        suffix += f"_{check.status.value}.smt2"
+        destination = self.smt_dump_dir / suffix
         temporary = destination.with_suffix(".smt2.tmp")
-        temporary.write_text(vc.to_smt2(), encoding="utf-8")
+        temporary.write_text(
+            self.smt_dump_builder.to_smt2(
+                check.vc.trace,
+                bound=bound,
+                result=check.status.value,
+            ),
+            encoding="utf-8",
+        )
         temporary.replace(destination)
+        self._smt_dump_count += 1
         return destination
 
     def traces_of_length(self, length: int) -> Iterator[tuple[HornRule, ...]]:
@@ -191,12 +249,7 @@ class BoundedExplorer:
     def check_trace(self, trace: tuple[HornRule, ...]) -> TraceCheck:
         started = perf_counter()
         vc = self.vc_builder.build(trace)
-        # Dump immediately after SSA construction, before any solver result can
-        # influence what is written. The file therefore represents precisely
-        # the VC constructed for this candidate trace.
-        self._dump_ssa(vc)
-
-        pool_check = self.solver_pool.check(vc)
+        pool_check = self.solver_backend.check(vc)
         elapsed = perf_counter() - started
         if pool_check.result == z3.unsat:
             return TraceCheck(
@@ -245,10 +298,29 @@ class BoundedExplorer:
             # Count pruned candidates at generation time by comparing prefix-trie
             # effects indirectly is expensive; generated means yielded complete
             # traces, while pruned records newly learned infeasible prefixes.
-            for trace in self.traces_of_length(depth):
+            traces: Iterator[tuple[HornRule, ...]] | tuple[tuple[HornRule, ...], ...]
+            trace_count = 0
+            if self.smt_dump_dir is None:
+                traces = self.traces_of_length(depth)
+            else:
+                # The C++ explorer collects all traces for a bound before
+                # checking any of them. This also fixes the total trace count
+                # used by the ``_tN`` filename convention.
+                materialized = tuple(self.traces_of_length(depth))
+                traces = materialized
+                trace_count = len(materialized)
+
+            for trace_number, trace in enumerate(traces, start=1):
                 generated += 1
                 checked += 1
                 check = self.check_trace(trace)
+                if self.smt_dump_dir is not None:
+                    self._dump_smt(
+                        check,
+                        bound=depth,
+                        trace_number=trace_number,
+                        trace_count=trace_count,
+                    )
                 if check.status is CheckStatus.UNSAT:
                     assert check.unsat_prefix_length is not None
                     prefix = check.vc.rule_ids[: check.unsat_prefix_length]

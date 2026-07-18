@@ -13,6 +13,7 @@ import z3
 from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
 from .normalize import HornNormalizationError
+from .solver_pool import DEFAULT_MAX_SOLVERS
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -67,23 +68,37 @@ def _parser() -> argparse.ArgumentParser:
         help="write the decisive SAT/unknown verification condition as SMT-LIB2",
     )
     parser.add_argument(
+        "--dump-smt",
         "--dump-ssa",
         "--dump-ssa-dir",
-        dest="dump_ssa",
+        dest="dump_smt",
         type=Path,
         help=(
-            "write every constructed trace SSA to a separate SMT-LIB2 file in "
-            "an empty directory"
+            "write every checked trace as a bnd/expl-compatible SMT-LIB2 "
+            "unrolling; --dump-ssa and --dump-ssa-dir are legacy aliases"
         ),
     )
     parser.add_argument(
         "--model", action="store_true", help="print the Z3 model for a counterexample"
     )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
-    parser.add_argument(
+    solver_group = parser.add_mutually_exclusive_group()
+    solver_group.add_argument(
+        "--solver-mode",
+        choices=("pool", "fresh"),
+        default="pool",
+        help=(
+            "solver backend: 'pool' reuses SAT prefixes with push/pop; "
+            "'fresh' creates one solver per trace and never calls push/pop "
+            "(default: pool)"
+        ),
+    )
+    solver_group.add_argument(
         "--fresh-solvers",
-        action="store_true",
-        help="disable longest-common-prefix solver reuse for comparison",
+        dest="solver_mode",
+        action="store_const",
+        const="fresh",
+        help="alias for --solver-mode fresh",
     )
     parser.add_argument(
         "--solver-reuse-min-ratio",
@@ -98,9 +113,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-solvers",
         type=int,
-        default=0,
+        default=DEFAULT_MAX_SOLVERS,
         metavar="N",
-        help="maximum retained solver contexts; 0 means unlimited (default: 0)",
+        help=(
+            "maximum retained solver contexts in pool mode; 0 means unlimited "
+            f"(default: {DEFAULT_MAX_SOLVERS})"
+        ),
     )
     return parser
 
@@ -140,7 +158,9 @@ def _as_json(
             for item in result.depth_statistics
         ],
         "decisive_trace": _trace_data(result),
+        "solver_mode": explorer.solver_mode,
         "solver_pool": {
+            "max_contexts": explorer.max_solver_contexts,
             "contexts": explorer.solver_statistics.contexts,
             "solvers_created": explorer.solver_statistics.solvers_created,
             "contexts_recycled": explorer.solver_statistics.contexts_recycled,
@@ -200,8 +220,8 @@ def main(argv: list[str] | None = None) -> int:
             program,
             timeout_ms=args.timeout_ms,
             random_seed=args.random_seed,
-            ssa_dump_dir=args.dump_ssa,
-            use_solver_pool=not args.fresh_solvers,
+            smt_dump_dir=args.dump_smt,
+            solver_mode=args.solver_mode,
             solver_reuse_min_ratio=args.solver_reuse_min_ratio,
             max_solver_contexts=(None if args.max_solvers == 0 else args.max_solvers),
         )
@@ -218,9 +238,10 @@ def main(argv: list[str] | None = None) -> int:
             pool = explorer.solver_statistics
             ssa = explorer.ssa_statistics
             print(
-                "solver pool: "
-                f"contexts={pool.contexts}, created={pool.solvers_created}, "
-                f"reused={pool.traces_reused}, "
+                f"solver ({explorer.solver_mode}): "
+                f"limit={explorer.max_solver_contexts}, contexts={pool.contexts}, "
+                f"created={pool.solvers_created}, "
+                f"recycled={pool.contexts_recycled}, reused={pool.traces_reused}, "
                 f"reused-prefix-steps={pool.common_prefix_steps_reused}, "
                 f"pushes={pool.pushes}, pops={pool.pops}, checks={pool.checks}"
             )
@@ -243,13 +264,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.dump_vc.write_text(
                     result.trace_check.vc.to_smt2(), encoding="utf-8"
                 )
-
-        if args.dump_ssa is not None:
-            print(
-                f"Dumped {explorer.ssa_dump_count} SSA verification condition(s) "
-                f"to {explorer.ssa_dump_dir}",
-                file=sys.stderr,
-            )
 
         if result.status is ExplorationStatus.COUNTEREXAMPLE:
             return 1

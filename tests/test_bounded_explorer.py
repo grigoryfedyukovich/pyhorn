@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import z3
 
-from freqhorn_bnd import BoundedExplorer, ExplorationStatus, parse_chc_file
-from freqhorn_bnd.vc import build_verification_condition
+from pyhorn_bnd import BoundedExplorer, ExplorationStatus, parse_chc_file
+from pyhorn_bnd.vc import build_verification_condition
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -191,55 +191,91 @@ def test_synthetic_error_relation_name_cannot_collide(tmp_path: Path) -> None:
     assert "__chc_bnd_assertion_error_1" in query_names
 
 
-def test_every_constructed_ssa_can_be_dumped_to_separate_files(
+def test_every_checked_trace_is_dumped_in_bnd_expl_format(
     tmp_path: Path,
 ) -> None:
-    dump_dir = tmp_path / "ssa"
+    dump_dir = tmp_path / "unrollings"
     program = parse_chc_file(EXAMPLES / "assert_syntax.smt2")
     explorer = BoundedExplorer(
         program,
         timeout_ms=5_000,
-        ssa_dump_dir=dump_dir,
+        smt_dump_dir=dump_dir,
     )
 
     result = explorer.explore(upto=8)
     assert result.status is ExplorationStatus.COUNTEREXAMPLE
 
-    files = sorted(dump_dir.glob("ssa_*.smt2"))
-    assert explorer.ssa_dump_count == 3
+    files = sorted(dump_dir.glob("*.smt2"))
+    assert explorer.smt_dump_count == 3
     assert [path.name for path in files] == [
-        "ssa_000001_depth_000002.smt2",
-        "ssa_000002_depth_000003.smt2",
-        "ssa_000003_depth_000004.smt2",
+        "assert_syntax_k2_unsat.smt2",
+        "assert_syntax_k3_unsat.smt2",
+        "assert_syntax_k4_sat.smt2",
     ]
 
     for path in files:
         text = path.read_text(encoding="utf-8")
-        assert "; trace-length:" in text
-        assert "; rule-ids:" in text
-        assert "; step 0:" in text
-        assert text.count("(assert") == int(
-            next(
-                line.split(":", 1)[1]
-                for line in text.splitlines()
-                if line.startswith("; trace-length:")
-            )
-        )
+        result_name = path.stem.rsplit("_", 1)[1]
+        bound = int(path.stem.split("_k", 1)[1].split("_", 1)[0])
+        assert text.startswith("; bnd/expl SMT dump\n")
+        assert f"; bound: {bound}\n" in text
+        assert f"; result: {result_name}\n" in text
+        assert text.count("(assert") == 1
+        assert "__bnd_var_" in text
+        assert "__state_" not in text
+        assert "__rule_" not in text
+        assert "__pyhorn_" not in text
         replay = z3.Solver()
         replay.from_string(text)
-        assert replay.check() in (z3.sat, z3.unsat, z3.unknown)
+        expected = {"sat": z3.sat, "unsat": z3.unsat}[result_name]
+        assert replay.check() == expected
 
 
-def test_ssa_dump_directory_must_be_empty(tmp_path: Path) -> None:
-    dump_dir = tmp_path / "ssa"
+def test_smt_dump_directory_may_already_exist(tmp_path: Path) -> None:
+    dump_dir = tmp_path / "unrollings"
     dump_dir.mkdir()
-    (dump_dir / "keep.txt").write_text("do not overwrite", encoding="utf-8")
+    marker = dump_dir / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="must be empty"):
-        BoundedExplorer(
-            parse_chc_file(EXAMPLES / "assert_syntax.smt2"),
-            ssa_dump_dir=dump_dir,
+    explorer = BoundedExplorer(
+        parse_chc_file(EXAMPLES / "assert_syntax.smt2"),
+        smt_dump_dir=dump_dir,
+    )
+    explorer.explore(upto=2)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert (dump_dir / "assert_syntax_k2_unsat.smt2").is_file()
+
+
+def test_abdu_05_dump_matches_cpp_reference(tmp_path: Path) -> None:
+    source = EXAMPLES / "bench_horn_multiple" / "abdu_05.smt2"
+    reference_dir = ROOT / "tests" / "data" / "bnd_expl_dumps" / "abdu_05"
+    dump_dir = tmp_path / "unrollings"
+
+    explorer = BoundedExplorer(
+        parse_chc_file(source),
+        timeout_ms=5_000,
+        smt_dump_dir=dump_dir,
+    )
+    result = explorer.explore(upto=10)
+
+    assert result.status is ExplorationStatus.BOUNDED_SAFE
+    generated = {path.name: path for path in dump_dir.glob("*.smt2")}
+    reference = {path.name: path for path in reference_dir.glob("*.smt2")}
+    assert generated.keys() == reference.keys()
+    assert len(generated) == 36
+
+    for name, generated_path in generated.items():
+        generated_assertions = z3.parse_smt2_file(str(generated_path))
+        reference_assertions = z3.parse_smt2_file(str(reference[name]))
+        assert len(generated_assertions) == 1
+        assert len(reference_assertions) == 1
+
+        equivalence = z3.Solver()
+        equivalence.add(
+            z3.Xor(generated_assertions[0], reference_assertions[0])
         )
+        assert equivalence.check() == z3.unsat, name
 
 
 def test_solver_pool_reuses_longest_common_prefix(tmp_path: Path) -> None:
@@ -340,9 +376,13 @@ def test_fresh_solver_mode_disables_cross_trace_reuse(tmp_path: Path) -> None:
     assert explorer.check_trace(next(explorer.traces_of_length(4))).status.value == "sat"
 
     pool = explorer.solver_statistics
-    assert pool.contexts == 2
+    assert explorer.solver_mode == "fresh"
+    assert pool.contexts == 0
     assert pool.solvers_created == 2
     assert pool.traces_reused == 0
+    assert pool.pushes == 0
+    assert pool.pops == 0
+    assert pool.checks == 7
 
 
 def test_pooled_and_fresh_solvers_agree_on_branching_trace_set(
@@ -374,7 +414,7 @@ def test_pooled_and_fresh_solvers_agree_on_branching_trace_set(
 
     pooled = BoundedExplorer(program, timeout_ms=5_000)
     fresh = BoundedExplorer(
-        program, timeout_ms=5_000, use_solver_pool=False
+        program, timeout_ms=5_000, solver_mode="fresh"
     )
     pooled_results = [
         (check.status, check.unsat_prefix_length)
@@ -389,3 +429,42 @@ def test_pooled_and_fresh_solvers_agree_on_branching_trace_set(
 
     assert pooled_results == fresh_results
     assert pooled.solver_statistics.checks < fresh.solver_statistics.checks
+    assert fresh.solver_statistics.solvers_created == len(traces)
+    assert fresh.solver_statistics.pushes == 0
+    assert fresh.solver_statistics.pops == 0
+
+
+
+
+
+def test_solver_pool_defaults_to_sixteen_contexts_and_reuses_objects() -> None:
+    from types import SimpleNamespace
+
+    import z3
+
+    from pyhorn_bnd.solver_pool import IncrementalSolverPool
+
+    pool = IncrementalSolverPool(timeout_ms=5_000)
+    assert pool.max_contexts == 16
+
+    # Force 20 context misses with mutually unrelated one-step rule IDs. Once
+    # the pool reaches 16 contexts, LRU contexts must be reset rather than
+    # replaced by newly allocated Z3 solver objects.
+    for rule_id in range(20):
+        vc = SimpleNamespace(
+            rule_ids=(rule_id,),
+            steps=(SimpleNamespace(constraint=z3.BoolVal(True)),),
+        )
+        assert pool.check(vc).result == z3.sat
+
+    stats = pool.statistics
+    assert stats.contexts == 16
+    assert stats.solvers_created == 16
+    assert stats.contexts_recycled == 4
+
+
+def test_cli_defaults_to_sixteen_solvers() -> None:
+    from pyhorn_bnd.cli import _parser
+
+    args = _parser().parse_args(["input.smt2"])
+    assert args.max_solvers == 16
