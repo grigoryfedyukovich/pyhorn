@@ -1,5 +1,10 @@
 # `bench_horn` parser coverage
 
+> This document describes the original 352-file single-predicate inventory.
+> Version 0.0.11 also parses `bench_horn_cex` and `bench_horn_multiple`; see
+> [`freqhorn_benchmark_audit.md`](freqhorn_benchmark_audit.md) for the combined
+> 607-file audit and solver results.
+
 ## Corpus snapshot
 
 The parser was checked against the complete uploaded `bench_horn` directory:

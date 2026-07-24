@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 
 import z3
+from z3.z3util import get_vars
 
 from .normalize import (
     HornNormalizationError,
@@ -19,7 +21,7 @@ from .normalize import (
     open_outer_forall,
     split_horn_formula,
 )
-from .sexpr import declared_boolean_function_names, declared_relation_names
+from .sexpr import SExprError, declared_relation_names
 
 ENTRY: Final[None] = None
 
@@ -58,6 +60,7 @@ class HornProgram:
     relations: frozenset[z3.FuncDeclRef]
     query_relations: frozenset[z3.FuncDeclRef]
     outgoing: dict[z3.FuncDeclRef | None, tuple[HornRule, ...]]
+    symbol_names: frozenset[str]
     sliced: bool = False
 
     @property
@@ -116,13 +119,11 @@ class HornProgram:
                 if rule.dst_relation in nodes:
                     indegree[rule.dst_relation] += 1
 
-        queue: list[z3.FuncDeclRef | None] = [
-            node for node, degree in indegree.items() if degree == 0
-        ]
+        queue = deque(node for node, degree in indegree.items() if degree == 0)
         distance: dict[z3.FuncDeclRef | None, int] = {ENTRY: 0}
         processed = 0
         while queue:
-            src = queue.pop()
+            src = queue.popleft()
             processed += 1
             for rule in relevant_outgoing.get(src, []):
                 dst = rule.dst_relation
@@ -202,12 +203,20 @@ def _build_program(
             relations.add(rule.src_relation)
         relations.add(rule.dst_relation)
     outgoing = {key: tuple(value) for key, value in outgoing_lists.items()}
+    symbol_names = {str(relation.name()) for relation in relations}
+    for rule in rules:
+        symbol_names.update(str(variable.decl().name()) for variable in rule.rule_vars)
+        for expression in (rule.body, *rule.src_args, *rule.dst_args):
+            symbol_names.update(
+                str(variable.decl().name()) for variable in get_vars(expression)
+            )
     return HornProgram(
         source_path=source_path,
         rules=tuple(rules),
         relations=frozenset(relations),
         query_relations=frozenset(query_relations),
         outgoing=outgoing,
+        symbol_names=frozenset(symbol_names),
         sliced=sliced,
     )
 
@@ -229,15 +238,16 @@ def parse_chc_file(path: str | Path, *, slice_program: bool = True) -> HornProgr
     # Fixedpoint syntax declares relations with ``declare-rel``; pure SMT-LIB
     # HORN syntax uses Bool-valued ``declare-fun`` declarations.  Accept both,
     # including files that mix the command styles.
-    relation_names = declared_relation_names(text) | declared_boolean_function_names(
-        text
-    )
+    try:
+        relation_names = declared_relation_names(text)
+    except SExprError as exc:
+        raise HornParseError(f"invalid SMT-LIB command structure: {exc}") from exc
     if not relation_names:
         raise HornParseError("no CHC relation declarations found")
 
     fp = z3.Fixedpoint()
     try:
-        parsed_queries = tuple(fp.parse_file(str(source_path)))
+        parsed_queries = tuple(fp.parse_string(text))
         # Z3 stores ``rule`` commands in get_rules() and ordinary ``assert``
         # commands in get_assertions().  They are disjoint for the supported
         # inputs, so combining them makes both dialects first-class.
@@ -343,9 +353,41 @@ def parse_chc_file(path: str | Path, *, slice_program: bool = True) -> HornProgr
             )
 
     if not query_relations:
-        raise HornParseError("the CHC file contains no query or false assertion")
+        # A small number of legacy CHC files omit the explicit ``query``
+        # command but still encode an error rule whose head is a terminal
+        # nullary relation (usually ``fail``).  Infer that target only when it
+        # is unambiguous.  Requiring nullary arity and no use as a source keeps
+        # the inference conservative: ordinary state predicates are never
+        # silently reclassified as queries.
+        source_relations = {
+            rule.src_relation
+            for rule in normalized
+            if rule.src_relation is not None
+        }
+        terminal_nullary = {
+            rule.dst_relation
+            for rule in normalized
+            if rule.dst_relation.arity() == 0
+            and rule.dst_relation not in source_relations
+        }
+        if len(terminal_nullary) == 1:
+            query_relations.update(terminal_nullary)
+        elif not terminal_nullary:
+            raise HornParseError(
+                "the CHC file contains no query, false assertion, or "
+                "terminal nullary error relation"
+            )
+        else:
+            names = ", ".join(
+                sorted(str(relation.name()) for relation in terminal_nullary)
+            )
+            raise HornParseError(
+                "the CHC file omits an explicit query and has multiple "
+                f"terminal nullary relations: {names}"
+            )
 
-    # Query membership may have grown while processing interpreted heads.
+    # Query membership may have grown while processing interpreted heads or
+    # legacy terminal-nullary inference.
     normalized = [
         replace(rule, is_query=rule.dst_relation in query_relations)
         for rule in normalized

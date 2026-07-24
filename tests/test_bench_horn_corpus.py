@@ -4,8 +4,10 @@ import os
 from pathlib import Path
 
 import pytest
+import z3
+from z3.z3util import get_vars
 
-from pyhorn_bnd import parse_chc_file
+from pyhorn_bnd import SeedMiner, parse_chc_file
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tests" / "data" / "bench_horn_manifest.txt"
@@ -66,6 +68,20 @@ def test_complete_bench_horn_corpus_parses_and_has_expected_linear_shape() -> No
             assert all(relation.arity() == 0 for relation in program.query_relations)
             assert tuple(rule.rule_id for rule in program.rules) == (0, 1, 2)
             _validate_relation_arguments(program)
+
+            seeds = SeedMiner(program).mine()
+            assert seeds.statistics.rules_examined == 3
+            for relation, candidates in seeds.candidates.items():
+                variables = seeds.variables[relation]
+                assert len(variables) == relation.arity()
+                for index, variable in enumerate(variables):
+                    assert variable.sort().eq(relation.domain(index))
+                for candidate in candidates:
+                    assert z3.is_bool(candidate)
+                    assert all(
+                        any(free.eq(variable) for variable in variables)
+                        for free in get_vars(candidate)
+                    )
         except Exception as exc:  # collect the full corpus failure set
             failures.append(f"{path.name}: {type(exc).__name__}: {exc}")
 

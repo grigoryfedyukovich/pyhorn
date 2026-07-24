@@ -112,6 +112,11 @@ def unquote_symbol(symbol: str) -> str:
 
 
 def declared_relation_names(text: str) -> set[str]:
+    """Return all relation declarations in one command-parser pass.
+
+    Both Z3 fixedpoint ``declare-rel`` commands and pure SMT-LIB Bool-valued
+    ``declare-fun`` commands denote CHC predicates.
+    """
     names: set[str] = set()
     for command in parse_commands(text):
         if len(command) >= 2 and command[0] == "declare-rel":
@@ -119,19 +124,11 @@ def declared_relation_names(text: str) -> set[str]:
             if not isinstance(name, str):
                 raise SExprError("declare-rel name is not a symbol")
             names.add(unquote_symbol(name))
-    return names
-
-
-def declared_boolean_function_names(text: str) -> set[str]:
-    """Return declare-fun names whose result sort is Bool.
-
-    This covers pure SMT-LIB HORN inputs that use declare-fun/assert/check-sat
-    instead of the fixedpoint declare-rel/rule/query commands.
-    """
-
-    names: set[str] = set()
-    for command in parse_commands(text):
-        if len(command) == 4 and command[0] == "declare-fun" and command[3] == "Bool":
+        elif (
+            len(command) == 4
+            and command[0] == "declare-fun"
+            and command[3] == "Bool"
+        ):
             name = command[1]
             if not isinstance(name, str):
                 raise SExprError("declare-fun name is not a symbol")

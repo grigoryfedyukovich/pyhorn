@@ -144,6 +144,7 @@ class _SolverContext:
     solver: z3.Solver
     rule_ids: list[int]
     last_used: int
+    last_model: z3.ModelRef | None = None
 
 
 class IncrementalSolverPool:
@@ -178,6 +179,7 @@ class IncrementalSolverPool:
         self.reuse_min_ratio = reuse_min_ratio
         self.max_contexts = max_contexts
         self._contexts: list[_SolverContext] = []
+        self._contexts_by_first_rule: dict[int, list[_SolverContext]] = {}
         self._next_context_id = 0
         self._clock = 0
         self._solvers_created = 0
@@ -232,12 +234,14 @@ class IncrementalSolverPool:
             # Reuse the physical Z3 solver object so the configured limit also
             # bounds solver allocations and their native memory. ``reset()``
             # removes every assertion and backtracking scope.
+            self._remove_from_index(victim)
             victim.solver.reset()
             if self.timeout_ms:
                 victim.solver.set(timeout=self.timeout_ms)
             if self.random_seed is not None:
                 victim.solver.set(random_seed=self.random_seed)
             victim.rule_ids.clear()
+            victim.last_model = None
             victim.last_used = self._clock
             self._contexts_recycled += 1
             return victim
@@ -251,6 +255,24 @@ class IncrementalSolverPool:
         self._next_context_id += 1
         self._contexts.append(context)
         return context
+
+    def _remove_from_index(self, context: _SolverContext) -> None:
+        if not context.rule_ids:
+            return
+        first_rule = context.rule_ids[0]
+        bucket = self._contexts_by_first_rule.get(first_rule)
+        if bucket is None:
+            return
+        bucket[:] = [item for item in bucket if item is not context]
+        if not bucket:
+            del self._contexts_by_first_rule[first_rule]
+
+    def _index_context(self, context: _SolverContext) -> None:
+        if not context.rule_ids:
+            return
+        bucket = self._contexts_by_first_rule.setdefault(context.rule_ids[0], [])
+        if all(item is not context for item in bucket):
+            bucket.append(context)
 
     @staticmethod
     def _common_prefix_length(left: list[int], right: tuple[int, ...]) -> int:
@@ -268,7 +290,8 @@ class IncrementalSolverPool:
 
         best_context: _SolverContext | None = None
         best_prefix = 0
-        for context in self._contexts:
+        candidates = self._contexts_by_first_rule.get(rule_ids[0], ())
+        for context in candidates:
             prefix = self._common_prefix_length(context.rule_ids, rule_ids)
             if prefix > best_prefix:
                 best_context = context
@@ -295,9 +318,12 @@ class IncrementalSolverPool:
         if popped_steps:
             context.solver.pop(popped_steps)
             del context.rule_ids[common_prefix:]
+            context.last_model = None
             self._pops += popped_steps
 
         pushed_steps = 0
+        if common_prefix < len(vc.steps):
+            context.last_model = None
         for index in range(common_prefix, len(vc.steps)):
             step = vc.steps[index]
             context.solver.push()
@@ -309,6 +335,8 @@ class IncrementalSolverPool:
             self._checks += 1
             if result == z3.sat:
                 context.rule_ids.append(rule_ids[index])
+                if len(context.rule_ids) == 1:
+                    self._index_context(context)
                 continue
 
             reason_unknown = (
@@ -330,18 +358,21 @@ class IncrementalSolverPool:
             self._last_check = check
             return check
 
-        # An exact prefix hit has no new suffix to check. Re-solve it, matching
-        # the Aeval implementation and ensuring a current model is available.
-        if common_prefix == len(vc.steps):
+        result = z3.sat
+        if pushed_steps:
+            # The final suffix check was SAT at the current full context.
+            context.last_model = context.solver.model()
+        # Exact repeated traces can reuse the model captured when the same SAT
+        # context was first established. If the context was popped to a shorter
+        # exact prefix, its old model is invalid and one re-check is necessary.
+        if context.last_model is None:
             result = context.solver.check()
             self._checks += 1
-        else:
-            result = z3.sat
+            if result == z3.sat:
+                context.last_model = context.solver.model()
 
-        model = context.solver.model() if result == z3.sat else None
-        reason_unknown = (
-            context.solver.reason_unknown() if result == z3.unknown else None
-        )
+        model = context.last_model if result == z3.sat else None
+        reason_unknown = context.solver.reason_unknown() if result == z3.unknown else None
         check = SolverPoolCheck(
             result=result,
             checked_prefix_length=len(vc.steps),

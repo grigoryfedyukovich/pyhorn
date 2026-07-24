@@ -303,7 +303,7 @@ def test_solver_pool_reuses_longest_common_prefix(tmp_path: Path) -> None:
     assert explorer.check_trace(short_trace).status.value == "sat"
     assert explorer.check_trace(long_trace).status.value == "sat"
 
-    activity = explorer.solver_pool.last_check
+    activity = explorer.solver_backend.last_check
     assert activity is not None
     assert not activity.created_context
     assert activity.common_prefix_length == 2
@@ -344,7 +344,7 @@ def test_solver_pool_keeps_only_the_sat_prefix_after_unsat(tmp_path: Path) -> No
 
     assert check.status.value == "unsat"
     assert check.unsat_prefix_length == 3
-    assert explorer.solver_pool.context_prefixes == (
+    assert explorer.solver_backend.context_prefixes == (
         tuple(rule.rule_id for rule in trace[:2]),
     )
     assert explorer.solver_statistics.pushes == 3
@@ -370,7 +370,7 @@ def test_fresh_solver_mode_disables_cross_trace_reuse(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     explorer = BoundedExplorer(
-        parse_chc_file(source), timeout_ms=5_000, use_solver_pool=False
+        parse_chc_file(source), timeout_ms=5_000, solver_mode="fresh"
     )
     assert explorer.check_trace(next(explorer.traces_of_length(3))).status.value == "sat"
     assert explorer.check_trace(next(explorer.traces_of_length(4))).status.value == "sat"

@@ -10,20 +10,45 @@ from typing import Any
 
 import z3
 
+from . import __version__
 from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
+from .houdini import HoudiniResult, HoudiniStatus, run_seed_houdini
 from .normalize import HornNormalizationError
 from .solver_pool import DEFAULT_MAX_SOLVERS
+from .vc import DEFAULT_MAX_SSA_CACHE_STEPS
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chc-bounded-explorer",
         description=(
-            "Exhaustively enumerate increasing-size linear-CHC unrollings and "
-            "check their verification conditions with Z3."
+            "Explore bounded linear-CHC traces or run seed mining followed by "
+            "multi-predicate Houdini filtering with Z3."
         ),
     )
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "file",
         type=Path,
@@ -34,17 +59,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--from",
         dest="start",
-        type=int,
+        type=_positive_int,
         default=1,
         help="first trace length (default: 1)",
     )
     parser.add_argument(
-        "--upto", type=int, default=10_000, help="maximum trace length (default: 10000)"
+        "--upto",
+        type=_positive_int,
+        default=10_000,
+        help="maximum trace length (default: 10000)",
     )
     parser.add_argument(
         "--to",
         dest="timeout_ms",
-        type=int,
+        type=_non_negative_int,
         default=1_000,
         help="timeout for each Z3 check in ms (default: 1000)",
     )
@@ -69,21 +97,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dump-smt",
-        "--dump-ssa",
-        "--dump-ssa-dir",
         dest="dump_smt",
         type=Path,
         help=(
             "write every checked trace as a bnd/expl-compatible SMT-LIB2 "
-            "unrolling; --dump-ssa and --dump-ssa-dir are legacy aliases"
+            "unrolling"
         ),
     )
     parser.add_argument(
         "--model", action="store_true", help="print the Z3 model for a counterexample"
     )
+    parser.add_argument(
+        "--seed-houdini",
+        action="store_true",
+        help=(
+            "mine syntactic candidates for every predicate, filter them with "
+            "MultiHoudini, and report Success only if all CHCs are valid"
+        ),
+    )
+    parser.add_argument(
+        "--print-invariants",
+        action="store_true",
+        help="print retained candidates in --seed-houdini mode",
+    )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
-    solver_group = parser.add_mutually_exclusive_group()
-    solver_group.add_argument(
+    parser.add_argument(
         "--solver-mode",
         choices=("pool", "fresh"),
         default="pool",
@@ -93,16 +131,9 @@ def _parser() -> argparse.ArgumentParser:
             "(default: pool)"
         ),
     )
-    solver_group.add_argument(
-        "--fresh-solvers",
-        dest="solver_mode",
-        action="store_const",
-        const="fresh",
-        help="alias for --solver-mode fresh",
-    )
     parser.add_argument(
         "--solver-reuse-min-ratio",
-        type=float,
+        type=_ratio,
         default=1.0 / 3.0,
         metavar="RATIO",
         help=(
@@ -112,12 +143,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-solvers",
-        type=int,
+        type=_non_negative_int,
         default=DEFAULT_MAX_SOLVERS,
         metavar="N",
         help=(
             "maximum retained solver contexts in pool mode; 0 means unlimited "
             f"(default: {DEFAULT_MAX_SOLVERS})"
+        ),
+    )
+    parser.add_argument(
+        "--max-ssa-cache-steps",
+        type=_non_negative_int,
+        default=DEFAULT_MAX_SSA_CACHE_STEPS,
+        metavar="N",
+        help=(
+            "maximum cached positional SSA steps/states; 0 means unlimited "
+            f"(default: {DEFAULT_MAX_SSA_CACHE_STEPS})"
         ),
     )
     return parser
@@ -174,9 +215,12 @@ def _as_json(
             "checks": explorer.solver_statistics.checks,
         },
         "ssa_cache": {
+            "max_steps": explorer.vc_builder.max_cached_steps,
             "cached_steps": explorer.ssa_statistics.cached_steps,
+            "cached_states": explorer.ssa_statistics.cached_states,
             "cache_hits": explorer.ssa_statistics.cache_hits,
             "cache_misses": explorer.ssa_statistics.cache_misses,
+            "cache_evictions": explorer.ssa_statistics.cache_evictions,
         },
     }
     return json.dumps(data, indent=2, sort_keys=True)
@@ -184,7 +228,8 @@ def _as_json(
 
 def _print_human(result: ExplorationResult, *, show_model: bool) -> None:
     if result.status is ExplorationStatus.COUNTEREXAMPLE:
-        assert result.trace_check is not None
+        if result.trace_check is None:
+            raise RuntimeError("counterexample result has no decisive trace")
         print(f"Counterexample of length {result.explored_upto} found")
         print(
             "Trace: " + " ; ".join(rule.short() for rule in result.trace_check.vc.trace)
@@ -193,7 +238,8 @@ def _print_human(result: ExplorationResult, *, show_model: bool) -> None:
             print("Model:")
             print(result.trace_check.model)
     elif result.status is ExplorationStatus.UNKNOWN:
-        assert result.trace_check is not None
+        if result.trace_check is None:
+            raise RuntimeError("unknown result has no decisive trace")
         reason = result.trace_check.reason_unknown or "unspecified"
         print(f"unknown at length {result.explored_upto}: {reason}")
     elif result.status is ExplorationStatus.COMPLETE_SAFE:
@@ -204,10 +250,110 @@ def _print_human(result: ExplorationResult, *, show_model: bool) -> None:
         print(f"No counterexample found up to length {result.explored_upto}")
 
 
+def _relation_label(relation: z3.FuncDeclRef, variables: tuple[z3.ExprRef, ...]) -> str:
+    args = ", ".join(str(variable) for variable in variables)
+    return f"{relation.name()}({args})"
+
+
+def _houdini_json(result: HoudiniResult) -> str:
+    seeds = result.seed_result
+    data = {
+        "status": result.status.value,
+        "seed_mining": None
+        if seeds is None
+        else {
+            "predicates": seeds.predicate_count,
+            "candidates": seeds.candidate_count,
+            "rules_examined": seeds.statistics.rules_examined,
+            "boolean_nodes_seen": seeds.statistics.boolean_nodes_seen,
+            "projections_attempted": seeds.statistics.projections_attempted,
+            "projections_rejected": seeds.statistics.projections_rejected,
+            "duplicate_candidates": seeds.statistics.duplicate_candidates,
+        },
+        "houdini": {
+            "iterations": result.statistics.iterations,
+            "solver_contexts": result.statistics.solver_contexts,
+            "solver_checks": result.statistics.solver_checks,
+            "candidates_initial": result.statistics.candidates_initial,
+            "candidates_removed": result.statistics.candidates_removed,
+            "candidates_remaining": result.statistics.candidates_remaining,
+            "countermodels": result.statistics.countermodels,
+            "unknown_checks": result.statistics.unknown_checks,
+            "certification_checks": result.statistics.certification_checks,
+        },
+        "invariants": {
+            str(relation.name()): [candidate.sexpr() for candidate in candidates]
+            for relation, candidates in result.candidates.items()
+        },
+        "failures": [
+            {
+                "rule_id": failure.rule_id,
+                "rule": failure.rule,
+                "reason": failure.reason,
+                "model": failure.model,
+            }
+            for failure in result.failures
+        ],
+    }
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
+def _print_houdini(
+    result: HoudiniResult, *, debug: int, print_invariants: bool
+) -> None:
+    seeds = result.seed_result
+    if seeds is not None and debug:
+        print(
+            f"SeedMiner: predicates={seeds.predicate_count}, "
+            f"candidates={seeds.candidate_count}, "
+            f"boolean-nodes={seeds.statistics.boolean_nodes_seen}, "
+            f"rejected-projections={seeds.statistics.projections_rejected}"
+        )
+    if debug:
+        stats = result.statistics
+        print(
+            f"MultiHoudini: iterations={stats.iterations}, "
+            f"checks={stats.solver_checks}, "
+            f"certification-checks={stats.certification_checks}, "
+            f"countermodels={stats.countermodels}, "
+            f"removed={stats.candidates_removed}, "
+            f"remaining={stats.candidates_remaining}"
+        )
+    if print_invariants:
+        for relation in sorted(result.candidates, key=lambda item: str(item.name())):
+            variables = result.variables[relation]
+            candidates = result.candidates[relation]
+            print(_relation_label(relation, variables) + ":")
+            if not candidates:
+                print("  true")
+            else:
+                for candidate in candidates:
+                    print(f"  {candidate}")
+    if result.status is HoudiniStatus.SUCCESS:
+        print("Success")
+    else:
+        print("unknown")
+        if debug:
+            for failure in result.failures:
+                print(
+                    f"  r{failure.rule_id} {failure.rule}: {failure.reason}",
+                    file=sys.stderr,
+                )
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.upto < args.start:
+        parser.error("--upto must be greater than or equal to --from")
+    if args.dump_smt is not None and args.dump_smt.exists():
+        if not args.dump_smt.is_dir():
+            parser.error("--dump-smt must name a directory")
     try:
-        program = parse_chc_file(args.file, slice_program=not args.skip_elim)
+        program = parse_chc_file(
+            args.file,
+            slice_program=False if args.seed_houdini else not args.skip_elim,
+        )
         if args.debug:
             mode = "sliced" if program.sliced else "unsliced"
             print(
@@ -215,6 +361,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             for rule in program.rules:
                 print(f"  {rule.short()}: {rule.body}")
+
+        if args.seed_houdini:
+            houdini_result = run_seed_houdini(
+                program,
+                timeout_ms=args.timeout_ms,
+                random_seed=args.random_seed,
+            )
+            if args.json:
+                print(_houdini_json(houdini_result))
+            else:
+                _print_houdini(
+                    houdini_result,
+                    debug=args.debug,
+                    print_invariants=args.print_invariants,
+                )
+            return 0 if houdini_result.status is HoudiniStatus.SUCCESS else 2
 
         explorer = BoundedExplorer(
             program,
@@ -224,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
             solver_mode=args.solver_mode,
             solver_reuse_min_ratio=args.solver_reuse_min_ratio,
             max_solver_contexts=(None if args.max_solvers == 0 else args.max_solvers),
+            max_cached_ssa_steps=(
+                None if args.max_ssa_cache_steps == 0 else args.max_ssa_cache_steps
+            ),
         )
         result = explorer.explore(start=args.start, upto=args.upto)
 
@@ -234,7 +399,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"checked={item.checked}, learned-unsat-prefixes={item.pruned}, "
                     f"time={item.elapsed_seconds:.6f}s"
                 )
-        if args.debug:
             pool = explorer.solver_statistics
             ssa = explorer.ssa_statistics
             print(
@@ -247,8 +411,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(
                 "SSA cache: "
-                f"steps={ssa.cached_steps}, hits={ssa.cache_hits}, "
-                f"misses={ssa.cache_misses}"
+                f"limit={explorer.vc_builder.max_cached_steps}, "
+                f"steps={ssa.cached_steps}, states={ssa.cached_states}, "
+                f"hits={ssa.cache_hits}, misses={ssa.cache_misses}, "
+                f"evictions={ssa.cache_evictions}"
             )
         if args.json:
             print(_as_json(result, len(program.rules), explorer))
@@ -270,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         if result.status is ExplorationStatus.UNKNOWN:
             return 2
         return 0
-    except (HornParseError, HornNormalizationError, ValueError, OSError) as exc:
+    except (HornParseError, HornNormalizationError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
 

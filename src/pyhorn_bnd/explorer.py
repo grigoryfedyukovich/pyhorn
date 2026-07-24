@@ -19,6 +19,7 @@ from .solver_pool import (
 )
 from .vc import (
     BndExplSmtDumpBuilder,
+    DEFAULT_MAX_SSA_CACHE_STEPS,
     SSAConstructionStatistics,
     VerificationCondition,
     VerificationConditionBuilder,
@@ -74,11 +75,44 @@ class _PrefixNode:
     children: dict[int, "_PrefixNode"] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _TracePath:
+    parent: "_TracePath | None"
+    rule: HornRule
+    length: int
+
+    def to_tuple(self) -> tuple[HornRule, ...]:
+        items: list[HornRule | None] = [None] * self.length
+        current: _TracePath | None = self
+        index = self.length - 1
+        while current is not None:
+            items[index] = current.rule
+            current = current.parent
+            index -= 1
+        if any(item is None for item in items):
+            raise RuntimeError("incomplete internal trace path")
+        return tuple(item for item in items if item is not None)
+
+    def rule_ids(self) -> tuple[int, ...]:
+        return tuple(rule.rule_id for rule in self.to_tuple())
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefixCursor:
+    node: _PrefixNode | None
+    revision: int
+
+
 class UnsatPrefixSet:
     """Trie of rule-id prefixes proven infeasible by incremental SMT checks."""
 
     def __init__(self) -> None:
         self._root = _PrefixNode()
+        self._revision = 0
+
+    @property
+    def root_cursor(self) -> _PrefixCursor:
+        return _PrefixCursor(self._root, self._revision)
 
     def add(self, prefix: tuple[int, ...]) -> None:
         node = self._root
@@ -86,8 +120,11 @@ class UnsatPrefixSet:
             if node.terminal:
                 return
             node = node.children.setdefault(rule_id, _PrefixNode())
+        if node.terminal:
+            return
         node.terminal = True
         node.children.clear()
+        self._revision += 1
 
     def subsumes(self, trace: tuple[int, ...]) -> bool:
         node = self._root
@@ -102,6 +139,27 @@ class UnsatPrefixSet:
                 return True
         return False
 
+    def _cursor_for_path(self, path: _TracePath | None) -> _PrefixCursor:
+        node: _PrefixNode | None = self._root
+        if path is not None:
+            for rule_id in path.rule_ids():
+                if node is None:
+                    break
+                node = node.children.get(rule_id)
+        return _PrefixCursor(node, self._revision)
+
+    def advance(
+        self,
+        path: _TracePath | None,
+        cursor: _PrefixCursor,
+        rule_id: int,
+    ) -> tuple[_PrefixCursor, bool]:
+        if cursor.revision != self._revision:
+            cursor = self._cursor_for_path(path)
+        child = None if cursor.node is None else cursor.node.children.get(rule_id)
+        next_cursor = _PrefixCursor(child, self._revision)
+        return next_cursor, child is not None and child.terminal
+
 
 class BoundedExplorer:
     def __init__(
@@ -111,24 +169,15 @@ class BoundedExplorer:
         timeout_ms: int = 1000,
         random_seed: int | None = None,
         smt_dump_dir: Path | str | None = None,
-        ssa_dump_dir: Path | str | None = None,
         solver_mode: str = "pool",
-        use_solver_pool: bool | None = None,
         solver_reuse_min_ratio: float = 1.0 / 3.0,
         max_solver_contexts: int | None = DEFAULT_MAX_SOLVERS,
+        max_cached_ssa_steps: int | None = DEFAULT_MAX_SSA_CACHE_STEPS,
     ) -> None:
         if timeout_ms < 0:
             raise ValueError("timeout_ms must be non-negative")
         if solver_mode not in {"pool", "fresh"}:
             raise ValueError("solver_mode must be 'pool' or 'fresh'")
-        if use_solver_pool is not None:
-            compatibility_mode = "pool" if use_solver_pool else "fresh"
-            if solver_mode != "pool" and solver_mode != compatibility_mode:
-                raise ValueError(
-                    "solver_mode conflicts with the legacy use_solver_pool option"
-                )
-            solver_mode = compatibility_mode
-
         self.program = program
         self.timeout_ms = timeout_ms
         self.random_seed = random_seed
@@ -137,14 +186,11 @@ class BoundedExplorer:
             max_solver_contexts if solver_mode == "pool" else None
         )
         self.unsat_prefixes = UnsatPrefixSet()
-        self.vc_builder = VerificationConditionBuilder(program)
+        self.vc_builder = VerificationConditionBuilder(
+            program,
+            max_cached_steps=max_cached_ssa_steps,
+        )
         self.smt_dump_builder = BndExplSmtDumpBuilder(program)
-        if smt_dump_dir is not None and ssa_dump_dir is not None:
-            if Path(smt_dump_dir).resolve() != Path(ssa_dump_dir).resolve():
-                raise ValueError(
-                    "smt_dump_dir conflicts with the legacy ssa_dump_dir option"
-                )
-        dump_dir = smt_dump_dir if smt_dump_dir is not None else ssa_dump_dir
         if solver_mode == "pool":
             self.solver_backend = IncrementalSolverPool(
                 timeout_ms=timeout_ms,
@@ -157,15 +203,13 @@ class BoundedExplorer:
                 timeout_ms=timeout_ms,
                 random_seed=random_seed,
             )
-        # Compatibility alias retained for callers that inspected this object.
-        self.solver_pool = self.solver_backend
         self.smt_dump_dir = (
-            None if dump_dir is None else Path(dump_dir).resolve()
+            None if smt_dump_dir is None else Path(smt_dump_dir).resolve()
         )
         self._smt_dump_count = 0
         if self.smt_dump_dir is not None:
             if self.smt_dump_dir.exists() and not self.smt_dump_dir.is_dir():
-                raise ValueError(
+                raise NotADirectoryError(
                     f"SMT dump path is not a directory: {self.smt_dump_dir}"
                 )
             self.smt_dump_dir.mkdir(parents=True, exist_ok=True)
@@ -173,16 +217,6 @@ class BoundedExplorer:
     @property
     def smt_dump_count(self) -> int:
         return self._smt_dump_count
-
-    @property
-    def ssa_dump_count(self) -> int:
-        """Compatibility alias for callers using the pre-0.0.8 name."""
-        return self._smt_dump_count
-
-    @property
-    def ssa_dump_dir(self) -> Path | None:
-        """Compatibility alias for callers using the pre-0.0.8 name."""
-        return self.smt_dump_dir
 
     @property
     def solver_statistics(self) -> SolverPoolStatistics:
@@ -229,22 +263,44 @@ class BoundedExplorer:
         # Use an explicit stack: the C++ default bound is 10,000, well above
         # Python's recursion limit. Reversing outgoing rules preserves source
         # order under LIFO traversal.
-        stack: list[tuple[z3.FuncDeclRef | None, int, tuple[HornRule, ...]]] = [
-            (ENTRY, length, ())
+        stack: list[
+            tuple[
+                z3.FuncDeclRef | None,
+                int,
+                _TracePath | None,
+                _PrefixCursor,
+            ]
+        ] = [
+            (ENTRY, length, None, self.unsat_prefixes.root_cursor)
         ]
         while stack:
-            relation, remaining, trace = stack.pop()
+            relation, remaining, path, cursor = stack.pop()
             for rule in reversed(self.program.outgoing.get(relation, ())):
-                candidate = trace + (rule,)
-                ids = tuple(item.rule_id for item in candidate)
-                if self.unsat_prefixes.subsumes(ids):
+                next_cursor, subsumed = self.unsat_prefixes.advance(
+                    path,
+                    cursor,
+                    rule.rule_id,
+                )
+                if subsumed:
                     continue
+                candidate = _TracePath(
+                    parent=path,
+                    rule=rule,
+                    length=1 if path is None else path.length + 1,
+                )
                 reaches_query = rule.dst_relation in self.program.query_relations
                 if remaining == 1:
                     if reaches_query:
-                        yield candidate
+                        yield candidate.to_tuple()
                 elif not reaches_query:
-                    stack.append((rule.dst_relation, remaining - 1, candidate))
+                    stack.append(
+                        (
+                            rule.dst_relation,
+                            remaining - 1,
+                            candidate,
+                            next_cursor,
+                        )
+                    )
 
     def check_trace(self, trace: tuple[HornRule, ...]) -> TraceCheck:
         started = perf_counter()
@@ -300,6 +356,7 @@ class BoundedExplorer:
             # traces, while pruned records newly learned infeasible prefixes.
             traces: Iterator[tuple[HornRule, ...]] | tuple[tuple[HornRule, ...], ...]
             trace_count = 0
+            decisive_check: TraceCheck | None = None
             if self.smt_dump_dir is None:
                 traces = self.traces_of_length(depth)
             else:
@@ -322,36 +379,18 @@ class BoundedExplorer:
                         trace_count=trace_count,
                     )
                 if check.status is CheckStatus.UNSAT:
-                    assert check.unsat_prefix_length is not None
+                    if check.unsat_prefix_length is None:
+                        raise RuntimeError(
+                            "solver backend returned UNSAT without a prefix length"
+                        )
                     prefix = check.vc.rule_ids[: check.unsat_prefix_length]
                     self.unsat_prefixes.add(prefix)
                     pruned += 1
                     continue
 
-                stats.append(
-                    DepthStatistics(
-                        depth=depth,
-                        generated=generated,
-                        checked=checked,
-                        pruned=pruned,
-                        elapsed_seconds=perf_counter() - depth_start,
-                    )
-                )
-                status = (
-                    ExplorationStatus.COUNTEREXAMPLE
-                    if check.status is CheckStatus.SAT
-                    else ExplorationStatus.UNKNOWN
-                )
-                return ExplorationResult(
-                    status=status,
-                    requested_upto=upto,
-                    explored_upto=depth,
-                    complete=False,
-                    depth_statistics=tuple(stats),
-                    trace_check=check,
-                )
+                decisive_check = check
+                break
 
-            explored_upto = depth
             stats.append(
                 DepthStatistics(
                     depth=depth,
@@ -361,6 +400,22 @@ class BoundedExplorer:
                     elapsed_seconds=perf_counter() - depth_start,
                 )
             )
+            if decisive_check is not None:
+                status = (
+                    ExplorationStatus.COUNTEREXAMPLE
+                    if decisive_check.status is CheckStatus.SAT
+                    else ExplorationStatus.UNKNOWN
+                )
+                return ExplorationResult(
+                    status=status,
+                    requested_upto=upto,
+                    explored_upto=depth,
+                    complete=False,
+                    depth_statistics=tuple(stats),
+                    trace_check=decisive_check,
+                )
+
+            explored_upto = depth
 
         complete = (
             start == 1 and acyclic_max is not None and effective_upto >= acyclic_max

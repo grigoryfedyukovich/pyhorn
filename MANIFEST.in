@@ -1,0 +1,6 @@
+include bounded_explorer.py
+include requirements.txt
+recursive-include docs *.md
+recursive-include examples *.md *.smt2
+recursive-include tests *.py *.txt *.smt2
+recursive-include tools *.py

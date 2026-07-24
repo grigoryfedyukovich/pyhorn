@@ -1,0 +1,10 @@
+; MultiHoudini propagates predicate-local candidates through p -> q.
+(declare-var x Int)
+(declare-rel p (Int))
+(declare-rel q (Int))
+(declare-rel fail ())
+(rule (p 0))
+(rule (=> (p x) (q x)))
+(rule (=> (and (q x) (< x 3)) (q (+ x 1))))
+(rule (=> (and (q x) (> x 3)) fail))
+(query fail)

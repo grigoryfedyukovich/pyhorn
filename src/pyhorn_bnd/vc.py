@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import re
 
 import z3
 
 from .horn import HornProgram, HornRule
 from .normalize import flatten_and, mk_and, substitute_many
+
+
+DEFAULT_MAX_SSA_CACHE_STEPS = 65_536
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,10 @@ class BndExplSmtDumpBuilder:
         constraints: list[z3.BoolRef] = []
 
         for step_index, rule in enumerate(trace):
-            substitutions: dict[z3.ExprRef, z3.ExprRef] = {}
+            # Z3 expressions overload ``__eq__`` to construct formulas.  Use
+            # stable AST identifiers for Python mapping and membership rather
+            # than relying on expression-object equality.
+            substitutions: dict[int, tuple[z3.ExprRef, z3.ExprRef]] = {}
             links: list[z3.BoolRef] = []
 
             if rule.src_relation is None:
@@ -105,11 +113,14 @@ class BndExplSmtDumpBuilder:
                     rule.src_args, current_state, strict=True
                 ):
                     if _is_rule_constant(argument):
-                        previous = substitutions.get(argument)
+                        previous = substitutions.get(argument.get_id())
                         if previous is None:
-                            substitutions[argument] = state_var
+                            substitutions[argument.get_id()] = (
+                                argument,
+                                state_var,
+                            )
                         else:
-                            links.append(previous == state_var)
+                            links.append(previous[1] == state_var)
                     else:
                         links.append(argument == state_var)
 
@@ -127,24 +138,28 @@ class BndExplSmtDumpBuilder:
                 for argument, state_var in zip(
                     rule.dst_args, destination_state, strict=True
                 ):
-                    if _is_rule_constant(argument) and argument not in substitutions:
-                        substitutions[argument] = state_var
+                    if (
+                        _is_rule_constant(argument)
+                        and argument.get_id() not in substitutions
+                    ):
+                        substitutions[argument.get_id()] = (argument, state_var)
                     else:
                         # This covers unchanged source variables, expressions in
                         # relation arguments, and duplicate destination variables.
                         links.append(argument == state_var)
 
             for variable in rule.rule_vars:
-                if variable in substitutions:
+                if variable.get_id() in substitutions:
                     continue
-                substitutions[variable] = z3.Const(
-                    f"__loc_var_{local_index}", variable.sort()
+                substitutions[variable.get_id()] = (
+                    variable,
+                    z3.Const(f"__loc_var_{local_index}", variable.sort()),
                 )
                 local_index += 1
 
             for item in (*flatten_and(rule.body), *links):
                 constraints.append(
-                    substitute_many(item, substitutions.items())
+                    substitute_many(item, substitutions.values())
                 )
 
             current_state = destination_state
@@ -179,8 +194,10 @@ class BndExplSmtDumpBuilder:
 @dataclass(frozen=True)
 class SSAConstructionStatistics:
     cached_steps: int
+    cached_states: int
     cache_hits: int
     cache_misses: int
+    cache_evictions: int
 
 
 class VerificationConditionBuilder:
@@ -192,27 +209,59 @@ class VerificationConditionBuilder:
     or when increasing bounds revisit a prefix.
     """
 
-    def __init__(self, program: HornProgram) -> None:
+    def __init__(
+        self,
+        program: HornProgram,
+        *,
+        max_cached_steps: int | None = DEFAULT_MAX_SSA_CACHE_STEPS,
+    ) -> None:
+        if max_cached_steps is not None and max_cached_steps < 1:
+            raise ValueError("max_cached_steps must be positive or None")
         self.program = program
-        self._step_cache: dict[tuple[int, int], VCStep] = {}
-        self._state_cache: dict[tuple[z3.FuncDeclRef, int], StateVersion] = {}
+        self.max_cached_steps = max_cached_steps
+        self._step_cache: OrderedDict[tuple[int, int], VCStep] = OrderedDict()
+        self._state_cache: OrderedDict[tuple[int, int], StateVersion] = OrderedDict()
         self._cache_hits = 0
         self._cache_misses = 0
+        self._cache_evictions = 0
 
     @property
     def statistics(self) -> SSAConstructionStatistics:
         return SSAConstructionStatistics(
             cached_steps=len(self._step_cache),
+            cached_states=len(self._state_cache),
             cache_hits=self._cache_hits,
             cache_misses=self._cache_misses,
+            cache_evictions=self._cache_evictions,
         )
+
+    def _remember_step(self, key: tuple[int, int], step: VCStep) -> None:
+        self._step_cache[key] = step
+        self._step_cache.move_to_end(key)
+        if (
+            self.max_cached_steps is not None
+            and len(self._step_cache) > self.max_cached_steps
+        ):
+            self._step_cache.popitem(last=False)
+            self._cache_evictions += 1
+
+    def _remember_state(self, key: tuple[int, int], state: StateVersion) -> None:
+        self._state_cache[key] = state
+        self._state_cache.move_to_end(key)
+        if (
+            self.max_cached_steps is not None
+            and len(self._state_cache) > self.max_cached_steps
+        ):
+            self._state_cache.popitem(last=False)
+            self._cache_evictions += 1
 
     def _state_version(
         self, relation: z3.FuncDeclRef, step_index: int
     ) -> StateVersion:
-        key = (relation, step_index)
+        key = (relation.get_id(), step_index)
         cached = self._state_cache.get(key)
         if cached is not None:
+            self._state_cache.move_to_end(key)
             return cached
         state = StateVersion(
             step=step_index,
@@ -225,7 +274,7 @@ class VerificationConditionBuilder:
                 for i in range(relation.arity())
             ),
         )
-        self._state_cache[key] = state
+        self._remember_state(key, state)
         return state
 
     def build_step(self, rule: HornRule, step_index: int) -> VCStep:
@@ -233,6 +282,7 @@ class VerificationConditionBuilder:
         cached = self._step_cache.get(key)
         if cached is not None:
             self._cache_hits += 1
+            self._step_cache.move_to_end(key)
             return cached
 
         self._cache_misses += 1
@@ -292,7 +342,7 @@ class VerificationConditionBuilder:
             destination_state=destination_state,
             fresh_rule_vars=fresh_vars,
         )
-        self._step_cache[key] = step
+        self._remember_step(key, step)
         return step
 
     def build(self, trace: tuple[HornRule, ...]) -> VerificationCondition:
@@ -309,7 +359,7 @@ class VerificationConditionBuilder:
                     )
             elif (
                 current_state is None
-                or current_state.relation != rule.src_relation
+                or current_state.relation.get_id() != rule.src_relation.get_id()
             ):
                 raise ValueError(
                     f"trace is disconnected at step {step_index}: {rule.short()}"
@@ -355,9 +405,35 @@ def _collect_uninterpreted_declarations(
     return tuple(found[key] for key in sorted(found))
 
 
+_SIMPLE_SYMBOL = re.compile(
+    r"^[A-Za-z~!@$%^&*+=<>.?/_-][A-Za-z0-9~!@$%^&*+=<>.?/_-]*$"
+)
+_RESERVED_SYMBOLS = {
+    "!",
+    "_",
+    "as",
+    "BINARY",
+    "DECIMAL",
+    "exists",
+    "HEXADECIMAL",
+    "forall",
+    "let",
+    "match",
+    "NUMERAL",
+    "par",
+    "STRING",
+}
+
+
 def _smt_symbol(name: object) -> str:
-    # Let Z3 quote symbols according to SMT-LIB rules.
-    return z3.Const(str(name), z3.IntSort()).sexpr()
+    rendered = str(name)
+    if _SIMPLE_SYMBOL.fullmatch(rendered) and rendered not in _RESERVED_SYMBOLS:
+        return rendered
+    if "|" not in rendered and "\\" not in rendered:
+        return f"|{rendered}|"
+    # Extremely unusual names containing characters forbidden inside quoted
+    # SMT-LIB symbols fall back to Z3's canonical printer.
+    return z3.Const(rendered, z3.IntSort()).sexpr()
 
 
 def _smt_declarations(expr: z3.ExprRef) -> list[str]:
