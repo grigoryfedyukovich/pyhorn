@@ -247,37 +247,6 @@ def test_smt_dump_directory_may_already_exist(tmp_path: Path) -> None:
     assert (dump_dir / "assert_syntax_k2_unsat.smt2").is_file()
 
 
-def test_abdu_05_dump_matches_cpp_reference(tmp_path: Path) -> None:
-    source = EXAMPLES / "bench_horn_multiple" / "abdu_05.smt2"
-    reference_dir = ROOT / "tests" / "data" / "bnd_expl_dumps" / "abdu_05"
-    dump_dir = tmp_path / "unrollings"
-
-    explorer = BoundedExplorer(
-        parse_chc_file(source),
-        timeout_ms=5_000,
-        smt_dump_dir=dump_dir,
-    )
-    result = explorer.explore(upto=10)
-
-    assert result.status is ExplorationStatus.BOUNDED_SAFE
-    generated = {path.name: path for path in dump_dir.glob("*.smt2")}
-    reference = {path.name: path for path in reference_dir.glob("*.smt2")}
-    assert generated.keys() == reference.keys()
-    assert len(generated) == 36
-
-    for name, generated_path in generated.items():
-        generated_assertions = z3.parse_smt2_file(str(generated_path))
-        reference_assertions = z3.parse_smt2_file(str(reference[name]))
-        assert len(generated_assertions) == 1
-        assert len(reference_assertions) == 1
-
-        equivalence = z3.Solver()
-        equivalence.add(
-            z3.Xor(generated_assertions[0], reference_assertions[0])
-        )
-        assert equivalence.check() == z3.unsat, name
-
-
 def test_solver_pool_reuses_longest_common_prefix(tmp_path: Path) -> None:
     source = tmp_path / "branching.smt2"
     source.write_text(

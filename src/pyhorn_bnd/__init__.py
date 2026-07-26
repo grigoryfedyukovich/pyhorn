@@ -7,6 +7,7 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.11"
 
+from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
 from .explorer import (
     BoundedExplorer,
     CheckStatus,
@@ -55,6 +56,9 @@ __all__ = [
     "BndExplSmtDumpBuilder",
     "BoundedExplorer",
     "run_seed_houdini",
+    "merge_candidate_maps",
+    "parse_candidate_file",
+    "format_candidates_smt2",
     "VariableMap",
     "SeedObservation",
     "SeedMiningStatistics",

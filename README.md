@@ -192,6 +192,99 @@ UNSAT.
 Focused safe, unsafe, array, multiple-predicate, and original-corpus corner cases
 are under `examples/seed_houdini/` and `examples/freqhorn_corner_cases/`.
 
+### User-supplied candidates (`--cands`)
+
+`--seed-houdini` mines its own candidates syntactically. `--cands FILE`
+instead lets you hand MultiHoudini your own guesses, skipping (or
+supplementing) the miner entirely:
+
+```bash
+pyhorn-expl --cands mycands.smt2 --print-invariants input.smt2
+```
+
+`FILE` is an ordinary SMT-LIB2 file containing one or more `define-fun`
+commands, at most one group per uninterpreted, non-query predicate:
+
+```smt2
+(define-fun inv ((x Int) (n Int)) Bool
+  (and (>= x 0) (<= x n)))
+```
+
+Each `define-fun` is parsed by Z3, its parameters are bound directly to the
+predicate's own canonical variables (positionally -- the parameter *names* in
+the file are unrelated to any name used internally or in the target CHC
+file), and the resulting formula is split into separate conjuncts at every
+top-level `and`. MultiHoudini then removes exactly the conjuncts that are not
+inductive, the same way it treats mined candidates, and reports `Success`
+only if every retained conjunct, for every predicate, survives fresh
+certification. Multiple `define-fun`s for the same predicate are merged;
+`declare-fun`, `set-logic`, and comments are accepted and ignored, so the same
+file may double as documentation.
+
+`--cands` implies Houdini mode on its own (no `--seed-houdini` required) and
+disables slicing, exactly like `--seed-houdini`. Combine both flags to merge
+mined and user-supplied candidates before filtering:
+
+```bash
+pyhorn-expl --seed-houdini --cands mycands.smt2 --print-invariants input.smt2
+```
+
+A predicate absent from `FILE` simply starts Houdini with its default `true`
+invariant, as if you had supplied no candidates for it at all. A
+`define-fun` whose name does not match any predicate in the CHC file (a typo,
+or a query/error relation) is silently skipped, matching ordinary SMT-LIB2's
+tolerance of extraneous declarations. Parameter-count mismatches and
+non-`Bool` return sorts are hard errors.
+
+Worked examples matching the benchmarks under `examples/seed_houdini/` are in
+`examples/cands/`:
+
+```bash
+pyhorn-expl --cands examples/cands/counter_safe_candidates.smt2 \
+  --print-invariants examples/seed_houdini/counter_safe.smt2
+```
+
+#### Saving and replaying candidates (`--dump-cands`)
+
+`--print-invariants` prints Python's infix form (`__inv_0 <= 10`) for quick
+inspection; that text is not valid SMT-LIB2 and cannot be fed back through
+`--cands`. `--dump-cands FILE` instead writes the retained candidates as
+proper `define-fun` s-expressions, so a mining run's output can be replayed
+without re-mining, hand-edited, or checked into version control:
+
+```bash
+# Mine once, save what MultiHoudini kept:
+pyhorn-expl --seed-houdini --dump-cands mined.smt2 input.smt2
+
+# Replay later -- no mining, just filtering the saved candidates:
+pyhorn-expl --cands mined.smt2 input.smt2
+```
+
+`--dump-cands` requires `--seed-houdini` and/or `--cands` (there is nothing
+to dump otherwise) and writes its output regardless of the final status, so
+an `unknown` run still leaves behind whatever partial candidate set
+MultiHoudini ended up with, for inspection or as a starting point for manual
+editing. Round-tripping through `--dump-cands` then `--cands` reproduces the
+original status exactly, since nothing in the dumped file needs to be
+removed again.
+
+To check that property holds for a CHC file of your own (not just the two
+examples `tests/test_cands_roundtrip.py` ships with), either run the two
+commands above by hand and compare their output, or point the existing
+round-trip test at it:
+
+```bash
+PYHORN_ROUNDTRIP_FILE=/path/to/your.smt2 \
+  python3 -m pytest tests/test_cands_roundtrip.py -k custom_file -v
+```
+
+This asserts the `--seed-houdini` → `--dump-cands` → `--cands` status is
+stable (`Success` stays `Success`, `unknown` stays `unknown`) and that
+nothing is removed on replay. The test is skipped, not run, when
+`PYHORN_ROUNDTRIP_FILE` is unset, so it is a no-op in ordinary `pytest -q`
+runs and in CI -- the same convention `PYHORN_BENCH_HORN_DIR` uses for the
+external corpus regression.
+
 ### Corpus audit
 
 Reproduce a suite run with:
@@ -356,9 +449,11 @@ may use a more explicit cached SSA representation, but the dumped formula is
 equisatisfiable and follows the compact C++ convention. Existing files with the
 same generated name are replaced; unrelated files in the directory are kept.
 
-The regression suite includes `abdu_05.smt2` and all 36 attached C++ reference
-dumps. It checks that the generated filename set is identical and that every
-Python dump is logically equivalent to its C++ counterpart.
+`abdu_05.smt2` is included as a worked example of this format. Cross-checking
+its output against the 36 C++ reference dumps is not part of the bundled test
+suite, since those reference files are not included in this checkout; restore
+`tests/data/bnd_expl_dumps/abdu_05/` from wherever they normally live if you
+want to re-add that comparison locally.
 
 ## Incremental solver-pool reuse
 
@@ -418,6 +513,37 @@ from pyhorn_bnd import MultiHoudini, SeedMiner
 
 seeds = SeedMiner(program).mine()
 result = MultiHoudini(program, seeds.variables).run(seeds.candidates)
+```
+
+To supply your own candidates (optionally merged with mined ones) instead of
+going through the CLI:
+
+```python
+from pyhorn_bnd import (
+    MultiHoudini,
+    SeedMiner,
+    merge_candidate_maps,
+    parse_candidate_file,
+)
+
+miner = SeedMiner(program)  # miner.variables is ready without calling .mine()
+user_candidates = parse_candidate_file("mycands.smt2", miner.variables)
+result = MultiHoudini(program, miner.variables).run(user_candidates)
+
+# Or merge with mined candidates:
+seeds = miner.mine()
+merged = merge_candidate_maps(seeds.candidates, user_candidates)
+result = MultiHoudini(program, miner.variables).run(merged, seed_result=seeds)
+```
+
+`format_candidates_smt2` is the inverse of `parse_candidate_file` -- it
+renders a `CandidateMap` back as `define-fun` text (what `--dump-cands`
+writes):
+
+```python
+from pyhorn_bnd import format_candidates_smt2
+
+dump_text = format_candidates_smt2(result.candidates, miner.variables)
 ```
 
 ## Repository layout

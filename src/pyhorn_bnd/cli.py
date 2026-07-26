@@ -11,10 +11,12 @@ from typing import Any
 import z3
 
 from . import __version__
+from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
 from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
-from .houdini import HoudiniResult, HoudiniStatus, run_seed_houdini
+from .houdini import HoudiniResult, HoudiniStatus, MultiHoudini
 from .normalize import HornNormalizationError
+from .seedminer import CandidateMap, SeedMiner
 from .solver_pool import DEFAULT_MAX_SOLVERS
 from .vc import DEFAULT_MAX_SSA_CACHE_STEPS
 
@@ -116,9 +118,36 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cands",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "SMT-LIB2 file of define-fun invariant candidates, one define-fun "
+            "per uninterpreted predicate. Implies Houdini mode: each body is "
+            "parsed, its parameters are renamed to the predicate's canonical "
+            "variables, the result is split into conjuncts, and MultiHoudini "
+            "iteratively removes conjuncts until the remainder is inductive. "
+            "May be combined with --seed-houdini to merge user-supplied and "
+            "mined candidates before filtering."
+        ),
+    )
+    parser.add_argument(
         "--print-invariants",
         action="store_true",
-        help="print retained candidates in --seed-houdini mode",
+        help="print retained candidates in --seed-houdini / --cands mode",
+    )
+    parser.add_argument(
+        "--dump-cands",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "write the retained candidates from --seed-houdini / --cands "
+            "mode as an SMT-LIB2 define-fun file that --cands can read back "
+            "(unlike --print-invariants, which prints Python infix notation "
+            "and is not valid SMT-LIB2). Written regardless of the final "
+            "status, so it also captures a partial/insufficient candidate "
+            "set for later inspection. Requires --seed-houdini or --cands."
+        ),
     )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
     parser.add_argument(
@@ -255,7 +284,7 @@ def _relation_label(relation: z3.FuncDeclRef, variables: tuple[z3.ExprRef, ...])
     return f"{relation.name()}({args})"
 
 
-def _houdini_json(result: HoudiniResult) -> str:
+def _houdini_json(result: HoudiniResult, *, user_candidates: CandidateMap | None) -> str:
     seeds = result.seed_result
     data = {
         "status": result.status.value,
@@ -269,6 +298,12 @@ def _houdini_json(result: HoudiniResult) -> str:
             "projections_attempted": seeds.statistics.projections_attempted,
             "projections_rejected": seeds.statistics.projections_rejected,
             "duplicate_candidates": seeds.statistics.duplicate_candidates,
+        },
+        "user_candidates": None
+        if user_candidates is None
+        else {
+            "predicates": len(user_candidates),
+            "candidates": sum(len(items) for items in user_candidates.values()),
         },
         "houdini": {
             "iterations": result.statistics.iterations,
@@ -299,7 +334,11 @@ def _houdini_json(result: HoudiniResult) -> str:
 
 
 def _print_houdini(
-    result: HoudiniResult, *, debug: int, print_invariants: bool
+    result: HoudiniResult,
+    *,
+    debug: int,
+    print_invariants: bool,
+    user_candidates: CandidateMap | None = None,
 ) -> None:
     seeds = result.seed_result
     if seeds is not None and debug:
@@ -308,6 +347,11 @@ def _print_houdini(
             f"candidates={seeds.candidate_count}, "
             f"boolean-nodes={seeds.statistics.boolean_nodes_seen}, "
             f"rejected-projections={seeds.statistics.projections_rejected}"
+        )
+    if user_candidates is not None and debug:
+        print(
+            f"Cands: predicates={len(user_candidates)}, "
+            f"candidates={sum(len(items) for items in user_candidates.values())}"
         )
     if debug:
         stats = result.statistics
@@ -349,10 +393,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.dump_smt is not None and args.dump_smt.exists():
         if not args.dump_smt.is_dir():
             parser.error("--dump-smt must name a directory")
+    if args.dump_cands is not None and not (
+        args.seed_houdini or args.cands is not None
+    ):
+        parser.error("--dump-cands requires --seed-houdini or --cands")
     try:
+        # Disable program slicing when running in Houdini mode: the full set
+        # of relations (including any outside the ENTRY-to-query slice) may
+        # be relevant to invariants that are mined or user-supplied.
+        houdini_mode = args.seed_houdini or args.cands is not None
         program = parse_chc_file(
             args.file,
-            slice_program=False if args.seed_houdini else not args.skip_elim,
+            slice_program=False if houdini_mode else not args.skip_elim,
         )
         if args.debug:
             mode = "sliced" if program.sliced else "unsliced"
@@ -362,19 +414,60 @@ def main(argv: list[str] | None = None) -> int:
             for rule in program.rules:
                 print(f"  {rule.short()}: {rule.body}")
 
-        if args.seed_houdini:
-            houdini_result = run_seed_houdini(
+        if houdini_mode:
+            # SeedMiner allocates the canonical VariableMap in __init__,
+            # independent of the candidate-mining pass performed by .mine().
+            # Only run .mine() when --seed-houdini was requested, so a plain
+            # --cands run does not pay for syntactic candidate mining it
+            # will not use.
+            miner = SeedMiner(program)
+            seed_result = miner.mine() if args.seed_houdini else None
+            candidates: CandidateMap = (
+                {} if seed_result is None else seed_result.candidates
+            )
+
+            user_candidates: CandidateMap | None = None
+            if args.cands is not None:
+                user_candidates = parse_candidate_file(args.cands, miner.variables)
+                candidates = merge_candidate_maps(candidates, user_candidates)
+
+            houdini_result = MultiHoudini(
                 program,
+                miner.variables,
                 timeout_ms=args.timeout_ms,
                 random_seed=args.random_seed,
-            )
+            ).run(candidates, seed_result=seed_result)
+
+            if args.dump_cands is not None:
+                header = (
+                    f"Retained candidates from {args.file}\n"
+                    f"status: {houdini_result.status.value}\n"
+                    f"source: "
+                    + (
+                        "--seed-houdini"
+                        + (" + --cands " + str(args.cands) if args.cands else "")
+                        if args.seed_houdini
+                        else "--cands " + str(args.cands)
+                    )
+                    + "\n"
+                    "Machine-generated by chc-bounded-explorer --dump-cands; "
+                    "readable by --cands."
+                )
+                dump_text = format_candidates_smt2(
+                    houdini_result.candidates, houdini_result.variables, header=header
+                )
+                args.dump_cands.write_text(dump_text, encoding="utf-8")
+                if args.debug:
+                    print(f"Cands: wrote {args.dump_cands}")
+
             if args.json:
-                print(_houdini_json(houdini_result))
+                print(_houdini_json(houdini_result, user_candidates=user_candidates))
             else:
                 _print_houdini(
                     houdini_result,
                     debug=args.debug,
                     print_invariants=args.print_invariants,
+                    user_candidates=user_candidates,
                 )
             return 0 if houdini_result.status is HoudiniStatus.SUCCESS else 2
 

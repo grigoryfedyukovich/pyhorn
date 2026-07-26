@@ -37,14 +37,14 @@ def test_parser_uses_in_memory_source_not_fixedpoint_parse_file(monkeypatch) -> 
 
 def test_canonical_variable_allocator_does_not_mutate_input_names() -> None:
     relation = z3.Function("p", z3.IntSort(), z3.BoolSort())
-    used = {"p", "__inv_p_0"}
+    used = {"p", "__p_0"}
     original = set(used)
 
     variables, updated = _canonical_variables(relation, used)
 
     assert used == original
-    assert str(variables[0]) == "__inv_p_0_1"
-    assert "__inv_p_0_1" in updated
+    assert str(variables[0]) == "__p_0_1"
+    assert "__p_0_1" in updated
 
 
 def test_exact_prefix_hit_reuses_cached_model_without_another_check() -> None:
