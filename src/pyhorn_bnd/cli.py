@@ -11,14 +11,21 @@ from typing import Any
 import z3
 
 from . import __version__
+from .candidate_validation import (
+    DEFAULT_CANDIDATE_BOUND,
+    CandidateReachability,
+    CandidateValidation,
+    dump_promising_candidate_files,
+    validate_removed_candidate,
+)
 from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
 from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
-from .houdini import HoudiniResult, HoudiniStatus, MultiHoudini
+from .houdini import HoudiniResult, HoudiniStatus, MultiHoudini, RemovedCandidate
 from .normalize import HornNormalizationError
 from .seedminer import CandidateMap, SeedMiner
 from .solver_pool import DEFAULT_MAX_SOLVERS
-from .vc import DEFAULT_MAX_SSA_CACHE_STEPS
+from .vc import DEFAULT_MAX_SSA_CACHE_STEPS, VerificationConditionBuilder
 
 
 def _non_negative_int(value: str) -> int:
@@ -147,6 +154,45 @@ def _parser() -> argparse.ArgumentParser:
             "and is not valid SMT-LIB2). Written regardless of the final "
             "status, so it also captures a partial/insufficient candidate "
             "set for later inspection. Requires --seed-houdini or --cands."
+        ),
+    )
+    parser.add_argument(
+        "--validate-candidates",
+        action="store_true",
+        help=(
+            "for each candidate MultiHoudini removes, bound-check whether "
+            "it is actually falsifiable by unrolling the program from ENTRY "
+            "(see --candidate-bound). Confirms real removals and flags ones "
+            "with no falsifying state found within the bound as potentially "
+            "promising candidates that may need a helper lemma. Shown in "
+            "--debug output and always included in --json output when set. "
+            "Requires --seed-houdini or --cands."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-bound",
+        type=int,
+        default=DEFAULT_CANDIDATE_BOUND,
+        metavar="N",
+        help=(
+            f"max unrolling depth for --validate-candidates (default: "
+            f"{DEFAULT_CANDIDATE_BOUND})"
+        ),
+    )
+    parser.add_argument(
+        "--dump-promising-candidates",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "for each candidate --validate-candidates flags as potentially "
+            "promising (not-found), write a standalone SMT-LIB2 file to DIR "
+            "(created if missing) that reuses every rule of the original "
+            "program but replaces the safety property with a direct check "
+            "of whether that candidate holds for its relation -- an "
+            "independently checkable question, e.g. by re-running "
+            "chc-bounded-explorer on it with a larger --upto or "
+            "--seed-houdini, or by handing it to any other HORN-capable "
+            "solver. Requires --validate-candidates."
         ),
     )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
@@ -284,8 +330,53 @@ def _relation_label(relation: z3.FuncDeclRef, variables: tuple[z3.ExprRef, ...])
     return f"{relation.name()}({args})"
 
 
-def _houdini_json(result: HoudiniResult, *, user_candidates: CandidateMap | None) -> str:
+def _format_candidate_verdict(v: CandidateValidation) -> str:
+    if v.status is CandidateReachability.REACHABLE:
+        return f"confirmed real (falsified by a reachable state at depth {v.witness_depth})"
+    if v.status is CandidateReachability.NOT_FOUND:
+        return (
+            f"potentially promising (no falsifying state found within "
+            f"{v.checked_upto} steps -- may need a helper lemma)"
+        )
+    if v.status is CandidateReachability.UNKNOWN:
+        reason = v.reason_unknown or "unspecified"
+        return f"inconclusive (Z3 returned unknown while checking: {reason})"
+    return "confirmed real (base case, always reachable)"
+
+
+def _format_removed_candidate(
+    rc: RemovedCandidate,
+    verdict: CandidateValidation | None = None,
+    verification_file: Path | None = None,
+) -> str:
+    """Human-readable summary of one candidate dropped by Houdini filtering."""
+    lines = [f"  dropped r{rc.rule_id}[{rc.rule}] {rc.relation}: {rc.candidate}"]
+    if rc.pre_state is not None:
+        lines.append(f"    pre:  {rc.pre_state}")
+    else:
+        lines.append("    pre:  (fact -- no source predicate)")
+    lines.append(f"    post: {rc.post_state}")
+    if verdict is not None:
+        lines.append(f"    check: {_format_candidate_verdict(verdict)}")
+    if verification_file is not None:
+        lines.append(f"    file: {verification_file}")
+    return "\n".join(lines)
+
+
+def _houdini_json(
+    result: HoudiniResult,
+    *,
+    user_candidates: CandidateMap | None,
+    candidate_validations: tuple[CandidateValidation, ...] | None = None,
+    candidate_files_by_index: dict[int, Path] | None = None,
+) -> str:
     seeds = result.seed_result
+    validation_by_index: tuple[CandidateValidation | None, ...] = (
+        candidate_validations
+        if candidate_validations is not None
+        else (None,) * len(result.removed_candidates)
+    )
+    files_by_index = candidate_files_by_index or {}
     data = {
         "status": result.status.value,
         "seed_mining": None
@@ -320,6 +411,33 @@ def _houdini_json(result: HoudiniResult, *, user_candidates: CandidateMap | None
             str(relation.name()): [candidate.sexpr() for candidate in candidates]
             for relation, candidates in result.candidates.items()
         },
+        "removed_candidates": [
+            {
+                "relation": rc.relation,
+                "candidate": rc.candidate,
+                "rule_id": rc.rule_id,
+                "rule": rc.rule,
+                "pre_state": rc.pre_state,
+                "post_state": rc.post_state,
+                "full_model": rc.full_model,
+                "candidate_validation": None
+                if verdict is None
+                else {
+                    "status": verdict.status.value,
+                    "checked_upto": verdict.checked_upto,
+                    "witness_depth": verdict.witness_depth,
+                    "checks_performed": verdict.checks_performed,
+                    "elapsed_seconds": verdict.elapsed_seconds,
+                    "reason_unknown": verdict.reason_unknown,
+                },
+                "verification_file": str(files_by_index[index])
+                if index in files_by_index
+                else None,
+            }
+            for index, (rc, verdict) in enumerate(
+                zip(result.removed_candidates, validation_by_index, strict=True)
+            )
+        ],
         "failures": [
             {
                 "rule_id": failure.rule_id,
@@ -339,6 +457,8 @@ def _print_houdini(
     debug: int,
     print_invariants: bool,
     user_candidates: CandidateMap | None = None,
+    candidate_validations: tuple[CandidateValidation, ...] | None = None,
+    candidate_files_by_index: dict[int, Path] | None = None,
 ) -> None:
     seeds = result.seed_result
     if seeds is not None and debug:
@@ -363,6 +483,24 @@ def _print_houdini(
             f"removed={stats.candidates_removed}, "
             f"remaining={stats.candidates_remaining}"
         )
+    if debug and result.removed_candidates:
+        print(
+            f"Dropped candidates ({len(result.removed_candidates)}):",
+            file=sys.stderr,
+        )
+        validation_by_index: tuple[CandidateValidation | None, ...] = (
+            candidate_validations
+            if candidate_validations is not None
+            else (None,) * len(result.removed_candidates)
+        )
+        files_by_index = candidate_files_by_index or {}
+        for index, (rc, verdict) in enumerate(
+            zip(result.removed_candidates, validation_by_index, strict=True)
+        ):
+            print(
+                _format_removed_candidate(rc, verdict, files_by_index.get(index)),
+                file=sys.stderr,
+            )
     if print_invariants:
         for relation in sorted(result.candidates, key=lambda item: str(item.name())):
             variables = result.variables[relation]
@@ -397,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
         args.seed_houdini or args.cands is not None
     ):
         parser.error("--dump-cands requires --seed-houdini or --cands")
+    if args.validate_candidates and not (args.seed_houdini or args.cands is not None):
+        parser.error("--validate-candidates requires --seed-houdini or --cands")
+    if args.candidate_bound < 1:
+        parser.error("--candidate-bound must be at least 1")
+    if args.dump_promising_candidates is not None and not args.validate_candidates:
+        parser.error("--dump-promising-candidates requires --validate-candidates")
     try:
         # Disable program slicing when running in Houdini mode: the full set
         # of relations (including any outside the ENTRY-to-query slice) may
@@ -438,6 +582,39 @@ def main(argv: list[str] | None = None) -> int:
                 random_seed=args.random_seed,
             ).run(candidates, seed_result=seed_result)
 
+            candidate_validations: tuple[CandidateValidation, ...] | None = None
+            candidate_files_by_index: dict[int, Path] = {}
+            if args.validate_candidates:
+                # A shared VerificationConditionBuilder lets validations for
+                # different removed candidates reuse each other's SSA step
+                # construction for any prefixes they have in common.
+                vc_builder = VerificationConditionBuilder(program)
+                candidate_validations = tuple(
+                    validate_removed_candidate(
+                        program,
+                        houdini_result.variables,
+                        rc,
+                        upto=args.candidate_bound,
+                        timeout_ms=args.timeout_ms,
+                        builder=vc_builder,
+                    )
+                    for rc in houdini_result.removed_candidates
+                )
+                if args.dump_promising_candidates is not None:
+                    candidate_files_by_index = dump_promising_candidate_files(
+                        program,
+                        houdini_result.variables,
+                        houdini_result.removed_candidates,
+                        candidate_validations,
+                        args.dump_promising_candidates,
+                    )
+                    if args.debug:
+                        print(
+                            f"Validation: wrote {len(candidate_files_by_index)} "
+                            "potentially-promising verification file(s) to "
+                            f"{args.dump_promising_candidates}"
+                        )
+
             if args.dump_cands is not None:
                 header = (
                     f"Retained candidates from {args.file}\n"
@@ -461,13 +638,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Cands: wrote {args.dump_cands}")
 
             if args.json:
-                print(_houdini_json(houdini_result, user_candidates=user_candidates))
+                print(
+                    _houdini_json(
+                        houdini_result,
+                        user_candidates=user_candidates,
+                        candidate_validations=candidate_validations,
+                        candidate_files_by_index=candidate_files_by_index,
+                    )
+                )
             else:
                 _print_houdini(
                     houdini_result,
                     debug=args.debug,
                     print_invariants=args.print_invariants,
                     user_candidates=user_candidates,
+                    candidate_validations=candidate_validations,
+                    candidate_files_by_index=candidate_files_by_index,
                 )
             return 0 if houdini_result.status is HoudiniStatus.SUCCESS else 2
 

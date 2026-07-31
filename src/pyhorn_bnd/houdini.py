@@ -27,6 +27,53 @@ class HoudiniFailure:
 
 
 @dataclass(frozen=True)
+class RemovedCandidate:
+    """One candidate dropped during Houdini filtering, with its counterexample.
+
+    Captured at the moment a live induction check finds a concrete model
+    that falsifies the candidate (a "counterexample to induction", CTI):
+    a transition of ``rule`` from ``pre_state`` to ``post_state`` under
+    which ``candidate`` does not hold. ``pre_state``/``post_state`` express
+    the witness as ``canonical_var = value`` assignments evaluated from the
+    countermodel; ``pre_state`` is ``None`` for fact rules, which have no
+    source predicate to evaluate. ``full_model`` is the raw ``str(model)``
+    for anyone who needs the complete assignment, e.g. over array or
+    uninterpreted-sort variables that ``pre_state``/``post_state`` don't
+    otherwise surface.
+
+    ``pre_state``/``pre_values`` are one *witness* model, not necessarily a
+    faithful representation of what actually makes the candidate
+    non-inductive: any variable the active candidate set does not constrain
+    (e.g. a loop counter no retained candidate mentions) gets some
+    arbitrary, solver-chosen value, which can differ across otherwise
+    equivalent runs. ``candidate_validation.py`` therefore does not validate
+    this witness at all -- it validates ``candidate_expr`` itself (does some
+    real, bounded execution of the program falsify it?), existentially
+    quantifying over every variable except the candidate's own rather than
+    pinning any of them to values this model happened to report.
+    """
+
+    relation: str
+    candidate: str  # s-expression of the dropped formula
+    rule_id: int
+    rule: str  # rule.short()
+    pre_state: str | None  # "var = val, ..." for source relation; None for facts
+    post_state: str  # "var = val, ..." for destination relation
+    full_model: str  # complete Z3 model string
+    pre_relation: z3.FuncDeclRef | None = None  # rule.src_relation; None for facts
+    # Concrete countermodel values for pre_relation's canonical variables, in
+    # canonical order (parallel to pre_state's content, but as real z3
+    # expressions rather than formatted text). Display/debugging use only --
+    # see the class docstring for why candidate validation does not use
+    # these.
+    pre_values: tuple[z3.ExprRef, ...] | None = None
+    # The dropped formula as an actual z3 expression (not just its sexpr
+    # text in `candidate`), over `relation`'s own canonical variables. What
+    # candidate_validation.py actually checks.
+    candidate_expr: z3.BoolRef | None = None
+
+
+@dataclass(frozen=True)
 class HoudiniStatistics:
     iterations: int
     solver_contexts: int
@@ -47,6 +94,7 @@ class HoudiniResult:
     seed_result: SeedMiningResult | None
     statistics: HoudiniStatistics
     failures: tuple[HoudiniFailure, ...]
+    removed_candidates: tuple[RemovedCandidate, ...]
 
     @property
     def success(self) -> bool:
@@ -131,6 +179,7 @@ class MultiHoudini:
         removed = 0
         iterations = 0
         failures: list[HoudiniFailure] = []
+        removed_candidates: list[RemovedCandidate] = []
 
         while True:
             iterations += 1
@@ -167,6 +216,7 @@ class MultiHoudini:
                         unknown_checks,
                         certification_checks,
                         failures,
+                        removed_candidates,
                     )
                 if outcome.result == z3.unsat:
                     continue
@@ -229,6 +279,7 @@ class MultiHoudini:
                             unknown_checks,
                             certification_checks,
                             failures,
+                            removed_candidates,
                         )
                 if not bad:
                     # A combined disjunction was SAT, but neither model
@@ -261,10 +312,16 @@ class MultiHoudini:
                         unknown_checks,
                         certification_checks,
                         failures,
+                        removed_candidates,
                     )
 
                 for key in bad:
                     if key in destination:
+                        removed_candidates.append(
+                            self._make_removed_candidate(
+                                rule, key, destination[key], model
+                            )
+                        )
                         del destination[key]
                         removed += 1
                         changed = True
@@ -311,6 +368,7 @@ class MultiHoudini:
             unknown_checks,
             certification_checks,
             failures,
+            removed_candidates,
         )
 
     def _validate_candidate_sets(
@@ -503,6 +561,69 @@ class MultiHoudini:
             return candidate
         return z3.substitute(candidate, *zip(variables, arguments, strict=True))
 
+    def _format_state(
+        self,
+        relation: z3.FuncDeclRef,
+        args: tuple[z3.ExprRef, ...],
+        model: z3.ModelRef,
+    ) -> str:
+        """Evaluate *args* in *model*, labelled by *relation*'s canonical names.
+
+        *args* are the rule-instance-specific terms passed to *relation* at
+        this call site (e.g. ``x + 1``); *model* is the countermodel that
+        refuted a destination candidate. Pairing follows the same
+        ``zip(canonical, args)`` convention as :meth:`_instantiate`, so the
+        printed name always matches the variable :meth:`_instantiate` would
+        have substituted it for.
+        """
+        canonical = self.variables[relation]
+        return ", ".join(
+            f"{var} = {model.eval(arg, model_completion=True)}"
+            for var, arg in zip(canonical, args)
+        )
+
+    def _make_removed_candidate(
+        self,
+        rule: HornRule,
+        candidate_key: str,
+        candidate_expr: z3.BoolRef,
+        model: z3.ModelRef,
+    ) -> RemovedCandidate:
+        """Build a :class:`RemovedCandidate` witness from the live induction model.
+
+        Called immediately after *model* is found to falsify the candidate
+        keyed by *candidate_key* under *rule*, before that candidate is
+        dropped from the active set -- so *model* is still the exact
+        countermodel that caused the removal, not a later, unrelated one.
+        *candidate_expr* is that same candidate's actual z3 expression
+        (the dict value *candidate_key* indexes, i.e. ``destination[key]``
+        at the call site), preserved for reachability validation; see
+        :class:`RemovedCandidate`'s docstring for why the witness model
+        itself is not what that validation uses.
+        """
+        post_state = self._format_state(rule.dst_relation, rule.dst_args, model)
+        pre_state: str | None = None
+        pre_relation: z3.FuncDeclRef | None = None
+        pre_values: tuple[z3.ExprRef, ...] | None = None
+        if rule.src_relation is not None and rule.src_relation in self.variables:
+            pre_state = self._format_state(rule.src_relation, rule.src_args, model)
+            pre_relation = rule.src_relation
+            pre_values = tuple(
+                model.eval(arg, model_completion=True) for arg in rule.src_args
+            )
+        return RemovedCandidate(
+            relation=str(rule.dst_relation.name()),
+            candidate=candidate_key,
+            rule_id=rule.rule_id,
+            rule=rule.short(),
+            pre_state=pre_state,
+            post_state=post_state,
+            full_model=str(model),
+            pre_relation=pre_relation,
+            pre_values=pre_values,
+            candidate_expr=candidate_expr,
+        )
+
     def _result(
         self,
         status: HoudiniStatus,
@@ -517,6 +638,7 @@ class MultiHoudini:
         unknown_checks: int,
         certification_checks: int,
         failures: list[HoudiniFailure],
+        removed_candidates: list[RemovedCandidate],
     ) -> HoudiniResult:
         final_candidates: CandidateMap = {
             relation: tuple(
@@ -543,6 +665,7 @@ class MultiHoudini:
                 certification_checks=certification_checks,
             ),
             failures=tuple(failures),
+            removed_candidates=tuple(removed_candidates),
         )
 
 
@@ -570,4 +693,5 @@ def run_seed_houdini(
         seed_result=seeds,
         statistics=result.statistics,
         failures=result.failures,
+        removed_candidates=result.removed_candidates,
     )

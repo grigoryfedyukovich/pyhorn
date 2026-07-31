@@ -8,6 +8,13 @@ except PackageNotFoundError:
     __version__ = "0.0.11"
 
 from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
+from .candidate_validation import (
+    DEFAULT_CANDIDATE_BOUND,
+    CandidateReachability,
+    CandidateValidation,
+    validate_candidate_reachability,
+    validate_removed_candidate,
+)
 from .explorer import (
     BoundedExplorer,
     CheckStatus,
@@ -23,6 +30,7 @@ from .houdini import (
     HoudiniStatistics,
     HoudiniStatus,
     MultiHoudini,
+    RemovedCandidate,
     run_seed_houdini,
 )
 from .normalize import HornNormalizationError
@@ -69,6 +77,12 @@ __all__ = [
     "HoudiniStatistics",
     "HoudiniResult",
     "HoudiniFailure",
+    "RemovedCandidate",
+    "CandidateReachability",
+    "CandidateValidation",
+    "validate_candidate_reachability",
+    "validate_removed_candidate",
+    "DEFAULT_CANDIDATE_BOUND",
     "CandidateMap",
     "CheckStatus",
     "DEFAULT_MAX_SOLVERS",

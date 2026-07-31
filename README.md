@@ -192,6 +192,174 @@ UNSAT.
 Focused safe, unsafe, array, multiple-predicate, and original-corpus corner cases
 are under `examples/seed_houdini/` and `examples/freqhorn_corner_cases/`.
 
+### Counterexamples to induction
+
+Every candidate MultiHoudini removes is removed because some concrete model
+falsified it -- a counterexample to induction (CTI): a transition of one CHC
+rule from a pre-state to a post-state under which the candidate does not
+hold. `--debug` prints each one to stderr as it happens, separate from the
+`Success`/`unknown` result on stdout:
+
+```text
+Dropped candidates (4):
+  dropped r0[r0: ENTRY -> inv] inv: (not (<= __inv_0 10))
+    pre:  (fact -- no source predicate)
+    post: __inv_0 = 0
+  dropped r1[r1: inv -> inv] inv: (= 0 __inv_0)
+    pre:  __inv_0 = 0
+    post: __inv_0 = 1
+  ...
+```
+
+`pre` is the source predicate's canonical variables evaluated in the
+countermodel, `post` is the destination predicate's; `pre` is omitted for
+fact rules, which have no source predicate. `--json` always includes the
+full set under `removed_candidates`, each with `relation`, `candidate`
+(the dropped s-expression), `rule_id`, `rule`, `pre_state`, `post_state`,
+and `full_model` (the complete `str(z3.ModelRef)`, useful for array or
+uninterpreted-sort variables the `pre`/`post` summary doesn't otherwise
+show). This applies equally whether the candidates came from
+`--seed-houdini`, `--cands`, or both.
+
+#### Bound-checking removed candidates (`--validate-candidates`)
+
+A candidate MultiHoudini removes is refuted by a countermodel of the
+*local* transition relation -- a counterexample to induction (CTI): one
+satisfying assignment of `source_candidates(src_args) AND rule.body AND
+NOT candidate(dst_args)`, picked by whichever solver run happened to find
+it. That is real in the sense that the candidate genuinely is not inductive
+as stated, but the CTI itself says nothing about whether an actual
+unrolling of the program from the start can ever falsify the candidate --
+and any variable the active candidate set does not constrain (a loop
+counter no retained candidate mentions, say) gets an arbitrary,
+solver-chosen value in it, one that can differ across otherwise-equivalent
+runs purely because a *different* candidate set changed what the solver
+happened to explore, even though the same candidate is refuted identically
+either way. So `--validate-candidates` does not check reachability of the
+CTI -- it checks reachability of **the candidate**: does some real,
+bounded execution of the program reach the candidate's own relation in a
+state where the candidate does not hold, via any rule sequence that can
+produce it, not just whichever one rule the CTI happened to come from? That
+is a property of the candidate, existentially quantified over everything
+else, not of any one witness -- which is what keeps the verdict independent
+of which other candidates happened to be active and which specific rule the
+countermodel came from.
+
+`--validate-candidates` runs this the same way `chc-bounded-explorer`
+itself checks query reachability: incremental unrolling from the start, one
+additional step at a time, up to `--candidate-bound` steps (default 10). If
+some trace reaches a falsifying state, the removal is confirmed; if not
+within the bound, the candidate is flagged as potentially promising
+instead. This is exactly the same question `--dump-promising-candidates`'s
+generated file asks in full, unbounded generality via `forall`; this is the
+bounded version, for a quick, incremental first check.
+
+```bash
+pyhorn-expl --seed-houdini --validate-candidates --debug examples/seed_houdini/counter_safe.smt2
+```
+
+```text
+Dropped candidates (4):
+  dropped r0[r0: ENTRY -> inv] inv: (not (<= __inv_0 10))
+    pre:  (fact -- no source predicate)
+    post: __inv_0 = 0
+    check: confirmed real (base case, always reachable)
+  dropped r1[r1: inv -> inv] inv: (= 0 __inv_0)
+    pre:  __inv_0 = 0
+    post: __inv_0 = 1
+    check: confirmed real (falsified by a reachable state at depth 2)
+  ...
+```
+
+Depth counts steps to reach the candidate's relation *in the falsifying
+state itself*, not steps to reach the CTI's pre-state: `x = 0` is falsified
+once `inv` holds `x = 1`, one self-loop step after the fact that
+established `x = 0`, hence depth 2. The `pre`/`post` lines still show that
+CTI, purely for reading -- they are not what `--validate-candidates` itself
+checks (see above).
+
+A candidate that is true but not locally inductive on its own reads
+differently -- for example `y >= 1` supplied alone for a loop that keeps
+`y == 100 - x` invariant, without also supplying that correlating fact:
+
+```text
+  dropped r1[r1: inv -> inv] inv: (>= __inv_1 1)
+    pre:  __inv_0 = 0, __inv_1 = 1
+    post: __inv_0 = 1, __inv_1 = 0
+    check: potentially promising (no falsifying state found within 10 steps -- may need a helper lemma)
+```
+
+"Not found within the bound" is not a proof: a longer trace might still
+falsify the candidate, and `--candidate-bound` trades off search depth
+against how quickly the check returns -- raise it if a "promising" verdict
+might just be one or two steps short (as with any bounded check, a
+candidate genuinely requiring depth *d* to falsify reads as promising at
+any bound below *d*). `--json` includes the same verdict under each removed
+candidate's `candidate_validation` (`status`, `checked_upto`,
+`witness_depth`, `checks_performed`, `elapsed_seconds`, `reason_unknown`),
+or `null` when `--validate-candidates` was not passed.
+`--validate-candidates` requires `--seed-houdini` and/or `--cands`, same as
+`--dump-cands`.
+
+#### Externally verifying promising candidates (`--dump-promising-candidates`)
+
+A `not-found` verdict is a hint, not a proof -- confirming it one way or the
+other calls for a stronger or simply different check than the bounded
+search `--validate-candidates` itself runs. `--dump-promising-candidates DIR`
+writes one standalone SMT-LIB2 file per `not-found` candidate into `DIR`
+(created if missing): every transition rule of the original program,
+unchanged, with the original safety property replaced by a direct question
+-- does *this* candidate hold for every reachable state of its relation?
+
+```bash
+pyhorn-expl --cands weak_cands.smt2 --validate-candidates \
+  --dump-promising-candidates candidates_out --debug input.smt2
+```
+
+```text
+Dropped candidates (1):
+  dropped r1[r1: inv -> inv] inv: (>= __inv_1 1)
+    pre:  __inv_0 = 0, __inv_1 = 1
+    post: __inv_0 = 1, __inv_1 = 0
+    check: potentially promising (no falsifying state found within 10 steps -- may need a helper lemma)
+    file: candidates_out/inv__r1__61b8aafd37.smt2
+```
+
+```smt2
+; Externally-checkable verification task generated by chc-bounded-explorer --dump-promising-candidates.
+; Original program: input.smt2
+; Candidate: (>= __inv_1 1)
+; Originally proposed for relation: inv
+; Removed by rule r1 [r1: inv -> inv]
+; Not found reachable within 10 step(s) (10 check(s) tried).
+; This file reuses every transition rule from the original program verbatim, replacing the original safety property with a direct check of whether the candidate above holds for every reachable state of its relation.
+
+(set-logic HORN)
+
+(declare-fun inv (Int Int) Bool)
+
+(assert (inv 0 100))
+(assert (forall ((__pyhorn_r1_0_0_x Int) (__pyhorn_r1_0_1_y Int)) (=> (and (inv __pyhorn_r1_0_0_x __pyhorn_r1_0_1_y) (not (<= 5 __pyhorn_r1_0_0_x))) (inv (+ __pyhorn_r1_0_0_x 1) (- __pyhorn_r1_0_1_y 1)))))
+
+(assert (forall ((__inv_0 Int) (__inv_1 Int)) (=> (inv __inv_0 __inv_1) (>= __inv_1 1))))
+
+(check-sat)
+```
+
+The generated file is ordinary input this tool can read back: re-run it with
+a larger, unbounded-feeling `--upto` for a deeper BMC-style search than
+`--candidate-bound` defaults to, hand it to `--seed-houdini` for an
+independent, fresh invariant-mining attempt, or feed it to any other
+HORN-capable solver entirely outside this tool. It never references the
+original query relation -- the whole point is a clean, isolated question
+about one candidate, not the original property. `--dump-promising-candidates`
+requires `--validate-candidates` (there is nothing to classify as promising
+without it); filenames are content-derived (relation, rule, and a short hash
+of the candidate) so re-running on an unchanged program overwrites the same
+files instead of accumulating stale ones. `--json`'s `removed_candidates`
+entries include the written path under `verification_file` (`null` when not
+written).
+
 ### User-supplied candidates (`--cands`)
 
 `--seed-houdini` mines its own candidates syntactically. `--cands FILE`
