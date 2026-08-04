@@ -552,8 +552,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.debug:
             mode = "sliced" if program.sliced else "unsliced"
+            arithmetic = program.arithmetic_sorts
+            numeric = (
+                "mixed Int/Real"
+                if arithmetic.is_mixed
+                else "Real"
+                if arithmetic.uses_real
+                else "Int"
+                if arithmetic.uses_integer
+                else "non-arithmetic"
+            )
             print(
-                f"Parsed {len(program.rules)} linear CHCs ({mode}); Z3 {z3.get_version_string()}"
+                f"Parsed {len(program.rules)} linear CHCs ({mode}, {numeric}); "
+                f"Z3 {z3.get_version_string()}"
             )
             for rule in program.rules:
                 print(f"  {rule.short()}: {rule.body}")

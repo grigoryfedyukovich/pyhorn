@@ -19,6 +19,19 @@ I_P(v) = and(c(v) for c in A_P)
 
 An empty set represents `true`. Candidate sets only shrink during a run.
 
+### Numeric sorts
+
+Candidate variables and instantiated rule arguments retain their native Z3
+sorts. The same incremental protocol applies to `Int`, `Real`, and mixed
+`Int`/`Real` predicates. Decimal real literals remain exact rationals, and
+explicit or parser-inserted `to_real` coercions remain in candidate formulas.
+No Houdini step converts a real expression to a Python floating-point value.
+
+Nonlinear or quantified real checks may return Z3 `unknown` under the per-check
+timeout; such a result is propagated conservatively and can never establish
+`Success`. Fresh final certification uses the same exact real formulas. See
+[`real_arithmetic.md`](real_arithmetic.md).
+
 ## 3. CHC obligations
 
 For a fact `B(x) -> P(t)`, validity is checked by the unsatisfiability of:

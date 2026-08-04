@@ -23,8 +23,14 @@ nullary relations are rejected.
 ## 2. Normalized program representation
 
 `HornProgram` stores normalized `HornRule` objects, relation/query sets,
-outgoing graph indices, source symbol names, source path, and slicing status.
-Every relation application is checked for arity and sort consistency.
+outgoing graph indices, source symbol names, source path, slicing status, and an
+`ArithmeticSortProfile`. Every relation application is checked for arity and
+sort consistency. `Int`, `Real`, mixed `Int`/`Real`, nested quantified sorts,
+and array index/element sorts are preserved as native Z3 sorts.
+
+SMT-LIB `Real` values are exact mathematical reals. Decimal literals are never
+converted through Python floating-point values. The detailed contract is in
+[`real_arithmetic.md`](real_arithmetic.md).
 
 ## 3. Bounded exploration
 
@@ -140,7 +146,11 @@ The test suite must cover:
 - quantified query candidate generation;
 - quantified countermodel fallback;
 - fresh final CHC certification;
-- no `Success` for known unsafe regression examples.
+- no `Success` for known unsafe regression examples;
+- fixedpoint and pure-assert real arithmetic;
+- exact rational literals and mixed `Int`/`Real` coercions;
+- real-valued arrays, quantified real candidates, and nonlinear real traces;
+- real-sort preservation in SSA and replayable SMT dumps.
 
 The full benchmark evidence and remaining limitations are documented in
 [`freqhorn_benchmark_audit.md`](freqhorn_benchmark_audit.md).

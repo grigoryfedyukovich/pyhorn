@@ -52,6 +52,22 @@ class HornRule:
 
 
 @dataclass(frozen=True)
+class ArithmeticSortProfile:
+    """Numeric sorts occurring in relation signatures or CHC expressions.
+
+    SMT-LIB ``Real`` is exact mathematical real arithmetic. Decimal literals
+    are represented by Z3 as exact rationals, not IEEE floating-point values.
+    """
+
+    uses_integer: bool
+    uses_real: bool
+
+    @property
+    def is_mixed(self) -> bool:
+        return self.uses_integer and self.uses_real
+
+
+@dataclass(frozen=True)
 class HornProgram:
     """Normalized CHC database plus graph indices used by bounded exploration."""
 
@@ -61,6 +77,7 @@ class HornProgram:
     query_relations: frozenset[z3.FuncDeclRef]
     outgoing: dict[z3.FuncDeclRef | None, tuple[HornRule, ...]]
     symbol_names: frozenset[str]
+    arithmetic_sorts: ArithmeticSortProfile
     sliced: bool = False
 
     @property
@@ -188,6 +205,57 @@ def _relation_application(expr: z3.ExprRef, relations: set[z3.FuncDeclRef]) -> b
     return is_uninterpreted_bool_app(expr) and expr.decl() in relations
 
 
+def _numeric_sort_kinds(sort: z3.SortRef) -> set[int]:
+    kind = sort.kind()
+    if kind in (z3.Z3_INT_SORT, z3.Z3_REAL_SORT):
+        return {kind}
+    if kind == z3.Z3_ARRAY_SORT:
+        return _numeric_sort_kinds(sort.domain()) | _numeric_sort_kinds(sort.range())
+    if kind == z3.Z3_SEQ_SORT:
+        return _numeric_sort_kinds(sort.basis())
+    return set()
+
+
+def _expression_numeric_sort_kinds(expr: z3.ExprRef) -> set[int]:
+    found: set[int] = set()
+    stack: list[z3.ExprRef] = [expr]
+    while stack and len(found) < 2:
+        current = stack.pop()
+        found.update(_numeric_sort_kinds(current.sort()))
+        if z3.is_quantifier(current):
+            for index in range(current.num_vars()):
+                found.update(_numeric_sort_kinds(current.var_sort(index)))
+            stack.append(current.body())
+        elif z3.is_app(current):
+            stack.extend(current.children())
+    return found
+
+
+def _arithmetic_sort_profile(
+    relations: set[z3.FuncDeclRef], rules: list[HornRule]
+) -> ArithmeticSortProfile:
+    found: set[int] = set()
+    for relation in relations:
+        for index in range(relation.arity()):
+            found.update(_numeric_sort_kinds(relation.domain(index)))
+    if len(found) < 2:
+        for rule in rules:
+            for expression in (
+                rule.body,
+                *rule.src_args,
+                *rule.dst_args,
+                *rule.rule_vars,
+            ):
+                found.update(_expression_numeric_sort_kinds(expression))
+                if len(found) == 2:
+                    break
+            if len(found) == 2:
+                break
+    return ArithmeticSortProfile(
+        uses_integer=z3.Z3_INT_SORT in found,
+        uses_real=z3.Z3_REAL_SORT in found,
+    )
+
 def _build_program(
     source_path: Path,
     rules: list[HornRule],
@@ -217,6 +285,7 @@ def _build_program(
         query_relations=frozenset(query_relations),
         outgoing=outgoing,
         symbol_names=frozenset(symbol_names),
+        arithmetic_sorts=_arithmetic_sort_profile(relations, rules),
         sliced=sliced,
     )
 
@@ -227,6 +296,8 @@ def parse_chc_file(path: str | Path, *, slice_program: bool = True) -> HornProgr
     Supported command dialects are Z3 fixedpoint syntax
     (``declare-rel``/``rule``/``query``) and pure SMT-LIB HORN syntax
     (Bool-valued ``declare-fun`` plus quantified ``assert`` commands).
+    Integer and exact real arithmetic, including mixed ``Int``/``Real`` terms,
+    are preserved as native Z3 expressions.
     """
 
     source_path = Path(path)

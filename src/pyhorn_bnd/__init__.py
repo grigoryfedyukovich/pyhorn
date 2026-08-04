@@ -23,7 +23,13 @@ from .explorer import (
     ExplorationStatus,
     TraceCheck,
 )
-from .horn import HornParseError, HornProgram, HornRule, parse_chc_file
+from .horn import (
+    ArithmeticSortProfile,
+    HornParseError,
+    HornProgram,
+    HornRule,
+    parse_chc_file,
+)
 from .houdini import (
     HoudiniFailure,
     HoudiniResult,
@@ -61,6 +67,7 @@ from .vc import (
 )
 
 __all__ = [
+    "ArithmeticSortProfile",
     "BndExplSmtDumpBuilder",
     "BoundedExplorer",
     "run_seed_houdini",
