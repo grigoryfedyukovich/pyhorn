@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "file": "hornstr_token_pass_safe.smt2",
+      "origin": "HornStr Example 1",
+      "class": "regular-model-checking",
+      "expected": "safe",
+      "known_invariant": "n* r n (nn)* b n*",
+      "current_strategy": "regular-language learner required"
+    },
+    {
+      "file": "hornstr_mu_puzzle_safe.smt2",
+      "origin": "HornStr Example 2 / MU puzzle",
+      "class": "string-rewriting",
+      "expected": "safe",
+      "known_invariant": "strings beginning with M whose number of I symbols is 1 or 2 modulo 3",
+      "current_strategy": "DFA learning or modulo-count abstraction required"
+    },
+    {
+      "file": "hornstr_mu_puzzle_unsafe_miu.smt2",
+      "origin": "MU puzzle reachable-target variant",
+      "class": "string-rewriting",
+      "expected": "unsafe",
+      "minimal_trace_length": 3,
+      "current_strategy": "bounded exploration"
+    },
+    {
+      "file": "coffee_can_odd_white_safe.smt2",
+      "origin": "Gries coffee-can problem",
+      "class": "string-rewriting",
+      "expected": "safe",
+      "known_invariant": "odd number of W symbols",
+      "current_strategy": "DFA learning or parity abstraction required"
+    },
+    {
+      "file": "single_token_line_safe.smt2",
+      "origin": "parameterized token-passing pattern",
+      "class": "regular-model-checking",
+      "expected": "safe",
+      "known_invariant": "N* T N*",
+      "current_strategy": "regular-language synthesis; Z3 equivalence checks may time out"
+    },
+    {
+      "file": "regex_alphabet_closure_safe.smt2",
+      "origin": "PyHorn literature-inspired regex closure",
+      "class": "regular-language-loop",
+      "expected": "safe",
+      "known_invariant": "(a|b)*",
+      "current_strategy": "SeedMiner + MultiHoudini"
+    },
+    {
+      "file": "html_escape_stream_safe.smt2",
+      "origin": "PyHorn sanitizer model",
+      "class": "string-program",
+      "expected": "safe",
+      "known_invariant": "output contains neither < nor >",
+      "current_strategy": "SeedMiner + MultiHoudini"
+    },
+    {
+      "file": "html_escape_stream_unsafe.smt2",
+      "origin": "PyHorn buggy sanitizer model",
+      "class": "string-program",
+      "expected": "unsafe",
+      "minimal_trace_length": 3,
+      "current_strategy": "bounded exploration"
+    },
+    {
+      "file": "copy_decomposition_safe.smt2",
+      "origin": "PyHorn character-copy model",
+      "class": "string-program",
+      "expected": "safe",
+      "known_invariant": "original = output ++ remaining",
+      "current_strategy": "SeedMiner + MultiHoudini"
+    },
+    {
+      "file": "replace_sanitize_safe.smt2",
+      "origin": "string sanitizer / replace pattern",
+      "class": "program-analysis",
+      "expected": "safe",
+      "known_invariant": "dst never contains raw '<'",
+      "current_strategy": "SeedMiner + MultiHoudini (local replace fact)"
+    },
+    {
+      "file": "short_word_unsafe.smt2",
+      "origin": "minimal word-rewrite cex",
+      "class": "string-rewriting",
+      "expected": "unsafe",
+      "minimal_trace_length": 2,
+      "current_strategy": "bounded exploration"
+    },
+    {
+      "file": "prefix_closure_safe.smt2",
+      "origin": "prefix-closed regular language fragment",
+      "class": "regular-model-checking",
+      "expected": "safe",
+      "known_invariant": "s is a prefix of \"aaa\"",
+      "current_strategy": "SeedMiner + MultiHoudini"
+    }
+  ]
+}

@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("pyhorn-bounded-explorer")
 except PackageNotFoundError:
-    __version__ = "0.0.11"
+    __version__ = "0.0.14"
 
 from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
 from .candidate_validation import (
@@ -28,6 +28,7 @@ from .horn import (
     HornParseError,
     HornProgram,
     HornRule,
+    StringSortProfile,
     parse_chc_file,
 )
 from .houdini import (
@@ -107,6 +108,7 @@ __all__ = [
     "SolverPoolCheck",
     "SolverPoolStatistics",
     "StateVersion",
+    "StringSortProfile",
     "TraceCheck",
     "VCStep",
     "VerificationCondition",

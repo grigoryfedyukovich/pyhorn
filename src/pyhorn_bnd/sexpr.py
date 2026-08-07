@@ -134,3 +134,158 @@ def declared_relation_names(text: str) -> set[str]:
                 raise SExprError("declare-fun name is not a symbol")
             names.add(unquote_symbol(name))
     return names
+
+
+def requires_general_smt_parser(text: str) -> bool:
+    """Return whether the fixedpoint parser lacks a declared theory sort.
+
+    Z3's fixedpoint command parser does not currently accept the SMT-LIB
+    string/sequence sort family.  The general parser does.  String literals do
+    not trigger this check because their complete token includes quotes.
+    """
+
+    unsupported_sort_tokens = {
+        "Char",
+        "RegEx",
+        "RegLan",
+        "Seq",
+        "String",
+        "Unicode",
+    }
+    return any(
+        token.text in unsupported_sort_tokens for token in tokenize_smt2(text)
+    )
+
+
+def render_sexpr(expression: object) -> str:
+    """Render a command-parser node back to SMT-LIB syntax.
+
+    Tokens produced by :func:`tokenize_smt2` retain quoted symbols and string
+    literals verbatim, so this renderer only has to restore parentheses and
+    whitespace.  It is intentionally small and is not a semantic SMT-LIB
+    pretty-printer.
+    """
+
+    if isinstance(expression, list):
+        return "(" + " ".join(render_sexpr(item) for item in expression) + ")"
+    if not isinstance(expression, str):
+        raise SExprError(f"unsupported SMT-LIB node: {expression!r}")
+    return expression
+
+
+@dataclass(frozen=True)
+class GeneralSmt2Input:
+    """Pure SMT-LIB text plus marker assertions for fixedpoint queries."""
+
+    text: str
+    query_count: int
+
+
+def to_general_smt2(text: str) -> GeneralSmt2Input:
+    """Translate Z3 fixedpoint commands into ordinary SMT-LIB assertions.
+
+    Z3's general SMT-LIB parser supports theories, including strings and
+    sequences, that are not accepted by the fixedpoint command parser.  This
+    translation preserves the CHC formulas while converting:
+
+    - ``declare-rel`` to Bool-valued ``declare-fun``;
+    - ``declare-var`` declarations to universal binders on each rule/assert;
+    - ``rule`` to ``assert``; and
+    - ``query`` to trailing marker assertions used only to recover the queried
+      nullary relation declarations.
+
+    Pure SMT-LIB files pass through unchanged except that terminal commands
+    such as ``check-sat`` are omitted from the parser input.
+    """
+
+    commands = parse_commands(text)
+    declared_variables: list[list[object]] = []
+    output: list[list[object]] = []
+    query_markers: list[object] = []
+
+    ignored_commands = {
+        "check-sat",
+        "check-sat-assuming",
+        "get-assertions",
+        "get-assignment",
+        "get-info",
+        "get-model",
+        "get-option",
+        "get-proof",
+        "get-unsat-assumptions",
+        "get-unsat-core",
+        "get-value",
+        "exit",
+        "push",
+        "pop",
+        "reset",
+        "reset-assertions",
+    }
+
+    for command in commands:
+        if not command:
+            continue
+        operator = command[0]
+        if not isinstance(operator, str):
+            raise SExprError("SMT-LIB command name is not a symbol")
+
+        if operator == "declare-var":
+            if len(command) != 3 or not isinstance(command[1], str):
+                raise SExprError("malformed declare-var command")
+            declared_variables.append([command[1], command[2]])
+            continue
+
+        if operator == "declare-rel":
+            if (
+                len(command) != 3
+                or not isinstance(command[1], str)
+                or not isinstance(command[2], list)
+            ):
+                raise SExprError("malformed declare-rel command")
+            output.append(["declare-fun", command[1], command[2], "Bool"])
+            continue
+
+        if operator in {"rule", "assert"}:
+            if len(command) < 2:
+                raise SExprError(f"malformed {operator} command")
+            formula: object = command[1]
+            if declared_variables:
+                # Copy the binder list because command nodes are mutable lists.
+                formula = [
+                    "forall",
+                    [list(binding) for binding in declared_variables],
+                    formula,
+                ]
+            output.append(["assert", formula])
+            continue
+
+        if operator == "query":
+            if len(command) < 2:
+                raise SExprError("malformed query command")
+            query_markers.append(command[1])
+            continue
+
+        if operator == "set-option" and len(command) >= 2:
+            option = command[1]
+            if isinstance(option, str) and option.startswith(
+                (":fixedpoint.", ":fp.")
+            ):
+                # Fixedpoint-engine parameters are irrelevant after translating
+                # rules to ordinary assertions and are rejected by the general
+                # SMT parser as unknown modules.
+                continue
+
+        if operator in ignored_commands:
+            continue
+
+        output.append(command)
+
+    # Query markers are parsed as ordinary assertions and removed immediately
+    # afterward.  Queries are currently required to be nullary relation
+    # applications, so no synthetic arguments are needed.
+    output.extend(["assert", marker] for marker in query_markers)
+    rendered = "\n".join(render_sexpr(command) for command in output)
+    return GeneralSmt2Input(
+        text=rendered + ("\n" if rendered else ""),
+        query_count=len(query_markers),
+    )

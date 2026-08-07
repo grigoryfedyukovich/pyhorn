@@ -21,7 +21,12 @@ from .normalize import (
     open_outer_forall,
     split_horn_formula,
 )
-from .sexpr import SExprError, declared_relation_names
+from .sexpr import (
+    SExprError,
+    declared_relation_names,
+    requires_general_smt_parser,
+    to_general_smt2,
+)
 
 ENTRY: Final[None] = None
 
@@ -68,6 +73,19 @@ class ArithmeticSortProfile:
 
 
 @dataclass(frozen=True)
+class StringSortProfile:
+    """String/regular-expression sorts used by the normalized CHC program.
+
+    SMT-LIB ``String`` is Z3's Unicode string sort.  String constraints remain
+    native Z3 sequence expressions; PyHorn does not encode strings into arrays
+    or integers.
+    """
+
+    uses_string: bool
+    uses_regular_expressions: bool
+
+
+@dataclass(frozen=True)
 class HornProgram:
     """Normalized CHC database plus graph indices used by bounded exploration."""
 
@@ -78,6 +96,7 @@ class HornProgram:
     outgoing: dict[z3.FuncDeclRef | None, tuple[HornRule, ...]]
     symbol_names: frozenset[str]
     arithmetic_sorts: ArithmeticSortProfile
+    string_sorts: StringSortProfile
     sliced: bool = False
 
     @property
@@ -256,6 +275,80 @@ def _arithmetic_sort_profile(
         uses_real=z3.Z3_REAL_SORT in found,
     )
 
+
+def _string_sort_features(sort: z3.SortRef) -> tuple[bool, bool]:
+    kind = sort.kind()
+    if kind == z3.Z3_SEQ_SORT:
+        is_string = bool(getattr(sort, "is_string", lambda: False)())
+        nested_string, nested_regex = _string_sort_features(sort.basis())
+        return is_string or nested_string, nested_regex
+    if kind == z3.Z3_RE_SORT:
+        nested_string, _ = _string_sort_features(sort.basis())
+        return nested_string, True
+    if kind == z3.Z3_ARRAY_SORT:
+        domain_string, domain_regex = _string_sort_features(sort.domain())
+        range_string, range_regex = _string_sort_features(sort.range())
+        return (
+            domain_string or range_string,
+            domain_regex or range_regex,
+        )
+    return False, False
+
+
+def _expression_string_features(expr: z3.ExprRef) -> tuple[bool, bool]:
+    uses_string = False
+    uses_regex = False
+    stack: list[z3.ExprRef] = [expr]
+    while stack and not (uses_string and uses_regex):
+        current = stack.pop()
+        current_string, current_regex = _string_sort_features(current.sort())
+        uses_string |= current_string
+        uses_regex |= current_regex
+        if z3.is_quantifier(current):
+            for index in range(current.num_vars()):
+                bound_string, bound_regex = _string_sort_features(
+                    current.var_sort(index)
+                )
+                uses_string |= bound_string
+                uses_regex |= bound_regex
+            stack.append(current.body())
+        elif z3.is_app(current):
+            stack.extend(current.children())
+    return uses_string, uses_regex
+
+
+def _string_sort_profile(
+    relations: set[z3.FuncDeclRef], rules: list[HornRule]
+) -> StringSortProfile:
+    uses_string = False
+    uses_regex = False
+    for relation in relations:
+        for index in range(relation.arity()):
+            current_string, current_regex = _string_sort_features(
+                relation.domain(index)
+            )
+            uses_string |= current_string
+            uses_regex |= current_regex
+    if not (uses_string and uses_regex):
+        for rule in rules:
+            for expression in (
+                rule.body,
+                *rule.src_args,
+                *rule.dst_args,
+                *rule.rule_vars,
+            ):
+                current_string, current_regex = _expression_string_features(expression)
+                uses_string |= current_string
+                uses_regex |= current_regex
+                if uses_string and uses_regex:
+                    break
+            if uses_string and uses_regex:
+                break
+    return StringSortProfile(
+        uses_string=uses_string,
+        uses_regular_expressions=uses_regex,
+    )
+
 def _build_program(
     source_path: Path,
     rules: list[HornRule],
@@ -286,6 +379,7 @@ def _build_program(
         outgoing=outgoing,
         symbol_names=frozenset(symbol_names),
         arithmetic_sorts=_arithmetic_sort_profile(relations, rules),
+        string_sorts=_string_sort_profile(relations, rules),
         sliced=sliced,
     )
 
@@ -296,8 +390,9 @@ def parse_chc_file(path: str | Path, *, slice_program: bool = True) -> HornProgr
     Supported command dialects are Z3 fixedpoint syntax
     (``declare-rel``/``rule``/``query``) and pure SMT-LIB HORN syntax
     (Bool-valued ``declare-fun`` plus quantified ``assert`` commands).
-    Integer and exact real arithmetic, including mixed ``Int``/``Real`` terms,
-    are preserved as native Z3 expressions.
+    Integer and exact real arithmetic, strings, regular expressions, arrays,
+    bit-vectors, and mixed-theory terms are preserved as native Z3
+    expressions.
     """
 
     source_path = Path(path)
@@ -316,14 +411,27 @@ def parse_chc_file(path: str | Path, *, slice_program: bool = True) -> HornProgr
     if not relation_names:
         raise HornParseError("no CHC relation declarations found")
 
-    fp = z3.Fixedpoint()
     try:
-        parsed_queries = tuple(fp.parse_string(text))
-        # Z3 stores ``rule`` commands in get_rules() and ordinary ``assert``
-        # commands in get_assertions().  They are disjoint for the supported
-        # inputs, so combining them makes both dialects first-class.
-        z3_rules = tuple(fp.get_rules()) + tuple(fp.get_assertions())
-    except z3.Z3Exception as exc:
+        if requires_general_smt_parser(text):
+            general_input = to_general_smt2(text)
+            parsed_assertions = tuple(z3.parse_smt2_string(general_input.text))
+            if general_input.query_count:
+                split = len(parsed_assertions) - general_input.query_count
+                if split < 0:
+                    raise HornParseError("internal query-marker accounting failure")
+                z3_rules = parsed_assertions[:split]
+                parsed_queries = parsed_assertions[split:]
+            else:
+                z3_rules = parsed_assertions
+                parsed_queries = ()
+        else:
+            fp = z3.Fixedpoint()
+            parsed_queries = tuple(fp.parse_string(text))
+            # Z3 stores ``rule`` commands in get_rules() and ordinary ``assert``
+            # commands in get_assertions(). They are disjoint for supported
+            # inputs, so combining them makes both dialects first-class.
+            z3_rules = tuple(fp.get_rules()) + tuple(fp.get_assertions())
+    except (SExprError, z3.Z3Exception) as exc:
         raise HornParseError(f"Z3 failed to parse {source_path}: {exc}") from exc
 
     relation_decls: set[z3.FuncDeclRef] = set()

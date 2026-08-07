@@ -58,8 +58,57 @@ states satisfying `inv(x)` and the negation of the asserted property.
 
 The supported fragment is **linear CHC**: a rule body may contain at most one
 positive relation application. Nonlinear clauses are rejected with an explicit
-diagnostic. Integer, real, array, bit-vector, Boolean, and retained nested
-quantifier constraints are represented directly by Z3 expressions.
+diagnostic. Integer, real, string, regular-expression, array, bit-vector,
+Boolean, and retained nested-quantifier constraints are represented directly
+by Z3 expressions.
+
+### Real arithmetic
+
+`Real` is supported throughout parsing, SSA construction, bounded solving,
+SeedMiner, MultiHoudini, model output, and SMT dumping. SMT-LIB decimal and
+fractional literals have Z3's exact mathematical-real semantics: `0.1` is the
+exact rational `1/10`, not an IEEE floating-point approximation.
+
+Supported real-arithmetic patterns include:
+
+- linear `+`, `-`, comparisons, equality, and multiplication by constants;
+- exact division with `/`;
+- strict and non-strict real inequalities;
+- mixed `Int`/`Real` state using SMT-LIB/Z3 `to_real` coercions;
+- arrays whose index or element sorts include `Real`;
+- quantified formulas over real variables; and
+- nonlinear real formulas, which are passed to Z3 and may return `unknown`
+  under a timeout.
+
+Integer `div` and `mod` retain their SMT-LIB integer semantics; use `/` for
+real division. PyHorn does not convert mathematical reals to Python floats.
+
+Examples are under [`examples/real_arithmetic/`](examples/real_arithmetic/),
+with the precise support contract in
+[`docs/real_arithmetic.md`](docs/real_arithmetic.md).
+
+### Strings and regular expressions
+
+SMT-LIB `String` is supported in both CHC syntaxes and is preserved as Z3's
+native Unicode string/sequence theory. The tested contract includes:
+
+- string equality and disequality;
+- `str.++`, `str.len`, `str.at`, and `str.substr`;
+- `str.prefixof`, `str.suffixof`, and `str.contains`;
+- `str.indexof` and `str.replace`;
+- `str.to_int` and `str.from_int` combined with integer state;
+- regular-expression membership with `str.in_re`, `str.to_re`, and `re.*`;
+- mixed `String`/`Int` predicate signatures; and
+- arrays whose index or element sorts include `String`.
+
+String constraints are sent directly to Z3. Difficult combinations of strings,
+length arithmetic, regular expressions, and quantifiers may return conservative
+`unknown` under the configured per-check timeout. SMT-LIB Unicode escapes such
+as `"\u{3bb}"` are preserved; no byte-string encoding is introduced by
+PyHorn.
+
+Examples are under [`examples/string_theory/`](examples/string_theory/), with
+the detailed contract in [`docs/string_theory.md`](docs/string_theory.md).
 
 ## Original FreqHorn benchmark coverage
 
@@ -619,9 +668,7 @@ same generated name are replaced; unrelated files in the directory are kept.
 
 `abdu_05.smt2` is included as a worked example of this format. Cross-checking
 its output against the 36 C++ reference dumps is not part of the bundled test
-suite, since those reference files are not included in this checkout; restore
-`tests/data/bnd_expl_dumps/abdu_05/` from wherever they normally live if you
-want to re-add that comparison locally.
+suite, since those reference files are not included in this checkout.
 
 ## Incremental solver-pool reuse
 
@@ -714,6 +761,33 @@ from pyhorn_bnd import format_candidates_smt2
 dump_text = format_candidates_smt2(result.candidates, miner.variables)
 ```
 
+## Literature-derived string invariant benchmarks
+
+The repository includes nine nontrivial CHC examples under
+`examples/string_invariant_literature/`. They cover regular model checking,
+word-rewrite systems, character-parity arguments, sanitizers, and relational
+string-copy loops.
+
+Run their parser and solver regressions with:
+
+```bash
+python3 -m pytest -q tests/test_string_invariant_literature.py
+```
+
+Audit every example with both Seed-Houdini and bounded exploration:
+
+```bash
+PYTHONPATH=src python3 tools/audit_string_invariant_benchmarks.py \
+  --timeout 2000 --bounded-depth 6 --json
+```
+
+The current baseline certifies the regex-closure, sanitizer, and copy examples;
+finds bounded counterexamples in the two unsafe variants; and conservatively
+returns `unknown` on four safe regular-language problems that require DFA or
+modulo-count invariant synthesis. The benchmark origins, known invariants, and
+proposed L*/SAT-based automata-learning architecture are documented in
+[`docs/string_invariant_literature.md`](docs/string_invariant_literature.md).
+
 ## Repository layout
 
 ```text
@@ -735,9 +809,17 @@ import pyhorn_bnd
 print(pyhorn_bnd.__version__)
 ```
 
-Version `0.0.11` adds complete original-suite parsing, benchmark-driven
-SeedMiner/Houdini corner-case handling, and fresh final CHC certification.
-Version `0.0.10` removed pre-1.0 compatibility aliases from the Python API
+Version `0.0.14` adds a literature-derived string-invariant benchmark suite,
+parser/solver regressions, an audit tool, and a design specification for regular
+invariant synthesis. Version `0.0.13` added native String/regular-expression parsing and
+reasoning in both CHC syntaxes, including bounded exploration, Seed-Houdini, mixed length
+arithmetic, string-valued arrays, Unicode escapes, and SMT dumps. Version
+`0.0.12` makes real arithmetic an explicit tested contract across
+parsing, SSA construction, both bounded solver modes, SeedMiner, MultiHoudini,
+real-valued arrays, mixed `Int`/`Real` formulas, and SMT dumps. Version `0.0.11`
+added complete original-suite parsing, benchmark-driven SeedMiner/Houdini
+corner-case handling, and fresh final CHC certification. Version `0.0.10`
+removed pre-1.0 compatibility aliases from the Python API
 and CLI. Use `solver_mode="fresh"`, `smt_dump_dir=...`, `solver_backend`, and
 `--dump-smt` directly.
 
@@ -763,4 +845,6 @@ PYHORN_BENCH_HORN_DIR=/path/to/bench_horn \
 
 The ordinary test suite does not depend on the external corpus; it uses the ten
 theory/operator cases in `examples/bench_horn/`, focused Seed-Houdini examples,
-and the original benchmark edge cases in `examples/freqhorn_corner_cases/`.
+the real-arithmetic suite in `examples/real_arithmetic/`, the string-theory
+suite in `examples/string_theory/`, and the original
+benchmark edge cases in `examples/freqhorn_corner_cases/`.

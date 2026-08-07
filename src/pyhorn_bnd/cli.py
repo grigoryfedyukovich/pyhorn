@@ -562,8 +562,16 @@ def main(argv: list[str] | None = None) -> int:
                 if arithmetic.uses_integer
                 else "non-arithmetic"
             )
+            theories = [numeric]
+            if program.string_sorts.uses_string:
+                theories.append(
+                    "String+RegEx"
+                    if program.string_sorts.uses_regular_expressions
+                    else "String"
+                )
             print(
-                f"Parsed {len(program.rules)} linear CHCs ({mode}, {numeric}); "
+                f"Parsed {len(program.rules)} linear CHCs "
+                f"({mode}, {', '.join(theories)}); "
                 f"Z3 {z3.get_version_string()}"
             )
             for rule in program.rules:
