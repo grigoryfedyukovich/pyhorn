@@ -1,5 +1,4 @@
 ; Regular-expression membership remains a native Z3 string constraint.
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

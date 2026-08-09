@@ -1,6 +1,5 @@
 ; A single token T moves right through empty N positions.
 ; The safety property excludes configurations with two tokens.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 (assert (inv "TNNNN"))
 (assert

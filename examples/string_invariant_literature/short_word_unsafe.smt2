@@ -1,5 +1,4 @@
 ; Reachable bad word via a single rewrite step (bounded cex).
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert (inv "a"))

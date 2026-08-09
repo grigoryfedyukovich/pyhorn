@@ -1,5 +1,4 @@
 ; String state in Z3 fixedpoint command syntax.
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

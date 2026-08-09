@@ -1,5 +1,4 @@
 ; Bounded exploration reaches the exact string "aaa".
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

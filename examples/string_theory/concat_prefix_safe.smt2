@@ -1,5 +1,4 @@
 ; Multi-step concatenation preserves a fixed prefix.
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

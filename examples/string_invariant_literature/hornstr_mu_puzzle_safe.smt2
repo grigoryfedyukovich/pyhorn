@@ -1,6 +1,5 @@
 ; Literature-derived from HornStr Example 2 and Hofstadter's MU puzzle.
 ; MU is not reachable from MI under the four rewrite rules.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert (inv "MI"))

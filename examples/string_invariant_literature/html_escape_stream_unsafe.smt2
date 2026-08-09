@@ -1,5 +1,4 @@
 ; Buggy sanitizer: '<' is copied unchanged, so input "<" reaches a bad output.
-(set-logic HORN)
 (declare-fun inv (String String) Bool)
 (assert (forall ((input String)) (inv input "")))
 (assert

@@ -1,6 +1,5 @@
 ; Streaming HTML-angle-bracket escaping, inspired by sanitizer analyses.
 ; The first state component is the unprocessed suffix and the second is output.
-(set-logic HORN)
 (declare-fun inv (String String) Bool)
 
 (assert (forall ((input String)) (inv input "")))

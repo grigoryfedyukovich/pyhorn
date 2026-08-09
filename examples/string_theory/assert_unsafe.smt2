@@ -1,5 +1,4 @@
 ; Pure SMT-LIB HORN assertions with String operations.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert (inv ""))

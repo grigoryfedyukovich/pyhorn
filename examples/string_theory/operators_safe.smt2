@@ -1,5 +1,4 @@
 ; Representative SMT-LIB String operators in a finite acyclic CHC.
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

@@ -1,6 +1,5 @@
 ; Character-by-character copy. The inductive word equation is:
 ; original = output ++ remaining.
-(set-logic HORN)
 (declare-fun inv (String String String) Bool)
 (assert (forall ((original String)) (inv original original "")))
 (assert

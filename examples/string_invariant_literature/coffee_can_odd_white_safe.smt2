@@ -1,7 +1,6 @@
 ; Gries coffee-can rewriting over B (black) and W (white).
 ; Starting from WWWB, the final one-bean state cannot be B because the
 ; parity of the number of W symbols is invariant.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 (assert (inv "WWWB"))
 

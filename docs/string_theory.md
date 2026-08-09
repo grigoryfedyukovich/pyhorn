@@ -15,12 +15,18 @@ reported conservatively and never establishes safety.
 
 ## 2. Accepted CHC syntax
 
-Both input dialects support string-sorted predicates.
+Both input dialects support string-sorted predicates. Neither snippet
+below opens with `(set-logic HORN)`: that combination breaks parsing
+under Z3's own standalone command-line SMT-LIB2 conformance checking (the
+declared logic doesn't include String, so every String-sorted declaration
+after it is rejected) -- see
+[`docs/set_logic_horn_and_string.md`](set_logic_horn_and_string.md). This
+tool's own parsing tolerates the line if a file has it, but omit it in
+anything you intend to also hand to a standalone solver.
 
 ### Fixedpoint commands
 
 ```smt2
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())
@@ -33,7 +39,6 @@ Both input dialects support string-sorted predicates.
 ### Pure SMT-LIB assertions
 
 ```smt2
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 (assert (inv ""))
 (assert
@@ -160,8 +165,51 @@ A quote inside an SMT-LIB string is represented by doubling it:
 | `fixedpoint_regex_safe.smt2` | fixedpoint syntax + regex |
 | `disequality_unsafe.smt2` | string disequality counterexample |
 | `unicode_safe.smt2` | Unicode escape and doubled-quote preservation |
+| `bounded_append_safe.smt2` | `--cands` / `--validate-candidates` "confirmed real" path |
+| `helper_lemma_safe.smt2` | `--cands` / `--validate-candidates` "potentially promising" path |
+| `multiphase_length_transfer_safe.smt2` | two predicates sharing a length invariant across a phase transition |
+| `password_policy_safe.smt2` | regex membership combined with a length range |
+| `length_counter_desync_unsafe.smt2` | Int+String counterexample from a ghost-counter desync |
 
-## 10. Limitations
+The last five were ported from pyhorn-bounded-explorer 0.0.15's
+`examples/string_length_literature/` suite -- a divergent branch that added
+these literature-derived benchmarks but never gained this branch's `--cands`
+/ `--validate-candidates` feature.
+
+## 10. Candidate validation and external candidates
+
+`--cands` (external candidate import), `--dump-cands`, `--validate-candidates`,
+and `--dump-promising-candidates` are sort-generic by construction (see
+`candidate_validation.py` and `cands.py`: neither module ever branches on
+`IntSort`, and both build on the same SSA/canonical-variable machinery listed
+in sections 5 and 6). `bounded_append_safe.smt2` and `helper_lemma_safe.smt2`,
+together with their paired files in `examples/cands/`, exercise both
+`--validate-candidates` outcomes over `String`:
+
+- **Confirmed real**: `bounded_append_safe.smt2` pairs a correct invariant
+  (`(<= (str.len s) 8)`) with a candidate that is true only at the initial
+  fact (`s = ""`). MultiHoudini drops the latter after one transition step,
+  and `--validate-candidates` confirms it reachable at depth 2.
+- **Potentially promising**: `helper_lemma_safe.smt2` supplies, alone, a
+  candidate (`(>= (str.len t) 1)`) that is globally true but not locally
+  inductive without its correlating fact. MultiHoudini's local induction
+  check treats the uncorrelated string variable as unconstrained and finds
+  a counterexample-to-induction that no real execution can reach;
+  `--validate-candidates` correctly reports this as promising rather than
+  confirmed. `--dump-promising-candidates` on this file emits a
+  `(declare-fun inv (String String) Bool)` verification obligation with
+  native `String` sorts and `str.++` / `str.substr` terms intact, and
+  correctly omits `(set-logic HORN)` -- Z3's own SMT-LIB2 parser rejects the
+  `String` sort under that logic tag, so `render_candidate_verification_smt2`
+  only emits it for dumps that don't need String/RegLan, unlike the Int and
+  Real cases where it's present.
+
+See `tests/test_candidate_validation_theories.py`,
+`tests/test_cands_theories.py`, and `tests/test_string_length_examples.py`
+for the corresponding regression tests, and
+`docs/candidate_validation_theory_coverage.md` for the cross-theory summary.
+
+## 11. Limitations
 
 - The tested public contract is `String`; arbitrary non-string `Seq(T)` terms
   are not yet advertised as a complete SeedMiner contract.

@@ -110,6 +110,15 @@ PyHorn.
 Examples are under [`examples/string_theory/`](examples/string_theory/), with
 the detailed contract in [`docs/string_theory.md`](docs/string_theory.md).
 
+### Combining Real and String
+
+The Real and String examples above each combine with `Int`, but not with
+each other directly. [`examples/mixed_theories/`](examples/mixed_theories/)
+covers that pairing explicitly, with a Real+String example and a three-way
+Int+Real+String example -- plus one this tool cannot solve, an Int+String
+problem whose safety argument needs a modular/parity invariant that
+syntactic candidate mining cannot express (see that directory's README).
+
 ## Original FreqHorn benchmark coverage
 
 The parser and type checker have been run over all three original FreqHorn
@@ -460,6 +469,17 @@ Worked examples matching the benchmarks under `examples/seed_houdini/` are in
 pyhorn-expl --cands examples/cands/counter_safe_candidates.smt2 \
   --print-invariants examples/seed_houdini/counter_safe.smt2
 ```
+
+`examples/cands/` also has Real, String, Real+String, and Int+Real+String
+worked examples pairing a correct invariant with a deliberately too-tight
+candidate, exercising `--cands` and `--validate-candidates` (below) across
+theories -- see
+[`docs/candidate_validation_theory_coverage.md`](docs/candidate_validation_theory_coverage.md)
+for a summary and the corresponding files. If you're loading any example
+file directly with a standalone `z3` binary rather than through this
+tool, see
+[`docs/set_logic_horn_and_string.md`](docs/set_logic_horn_and_string.md)
+first -- `(set-logic HORN)` and `String` don't mix in this version of Z3.
 
 #### Saving and replaying candidates (`--dump-cands`)
 

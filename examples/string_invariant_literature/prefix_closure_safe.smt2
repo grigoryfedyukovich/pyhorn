@@ -1,5 +1,4 @@
 ; Every reachable word is a prefix of a fixed target; Seed-Houdini friendly.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert (inv ""))

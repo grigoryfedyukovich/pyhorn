@@ -1,5 +1,4 @@
 ; Regular-language closure with complement: only a and b are appended.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 (assert (inv ""))
 (assert (forall ((s String)) (=> (inv s) (inv (str.++ s "a")))))

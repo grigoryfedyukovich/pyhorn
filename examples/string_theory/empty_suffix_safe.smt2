@@ -1,5 +1,4 @@
 ; Empty string is a suffix of every reachable state.
-(set-logic HORN)
 (declare-var s String)
 (declare-rel inv (String))
 (declare-rel fail ())

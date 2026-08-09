@@ -1,6 +1,5 @@
 ; Restricted alphabet stream: only "a" is appended, so raw '<' never appears.
 ; Local safety property suitable for SeedMiner + MultiHoudini.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert (inv ""))

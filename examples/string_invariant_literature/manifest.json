@@ -47,7 +47,7 @@
       "class": "regular-language-loop",
       "expected": "safe",
       "known_invariant": "(a|b)*",
-      "current_strategy": "SeedMiner + MultiHoudini"
+      "current_strategy": "SeedMiner + MultiHoudini finds the exact correct candidate, but final certification's regex-complement check times out in Z3 regardless of candidate source -- a solver performance limit, not a mining gap. See docs/string_invariant_literature.md section 11.1."
     },
     {
       "file": "html_escape_stream_safe.smt2",

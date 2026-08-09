@@ -1,5 +1,4 @@
 ; Arrays with String elements remain sort-correct through SSA and Houdini.
-(set-logic HORN)
 (declare-var a (Array Int String))
 (declare-var a1 (Array Int String))
 (declare-var i Int)

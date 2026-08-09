@@ -1,5 +1,4 @@
 ; Reachable variant of the MU system: MI -> MIU by rule 1.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 (assert (inv "MI"))
 (assert

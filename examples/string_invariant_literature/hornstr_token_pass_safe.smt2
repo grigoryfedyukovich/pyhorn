@@ -1,7 +1,6 @@
 ; Literature-derived from HornStr Example 1 (CAV 2025).
 ; Two tokens r and b move synchronously through empty n positions.
 ; The bad language has b at the left border and r at the right border.
-(set-logic HORN)
 (declare-fun inv (String) Bool)
 
 (assert

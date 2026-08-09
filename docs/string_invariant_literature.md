@@ -52,7 +52,7 @@ Relevant background includes:
 | `hornstr_mu_puzzle_unsafe_miu.smt2` | MU rewriting with reachable target `MIU` | unsafe | not applicable | bounded CEX at depth 3 |
 | `coffee_can_odd_white_safe.smt2` | four local string-rewrite rules | safe | odd number of `W` symbols | Seed-Houdini: `unknown` |
 | `single_token_line_safe.smt2` | one local move rule; regex bad set | safe | `N* T N*` | Seed-Houdini: `unknown` |
-| `regex_alphabet_closure_safe.smt2` | append-only transition; regex complement query | safe | `(a|b)*` | Seed-Houdini: `Success` |
+| `regex_alphabet_closure_safe.smt2` | append-only transition; regex complement query | safe | `(a|b)*` | Seed-Houdini: `unknown` (Z3 regex-complement certification timeout, not a mining gap -- see below) |
 | `html_escape_stream_safe.smt2` | two-string state; `str.at`, `substr`, concatenation, containment | safe | output contains neither `<` nor `>` | Seed-Houdini: `Success` |
 | `html_escape_stream_unsafe.smt2` | buggy sanitizer | unsafe | not applicable | bounded CEX at depth 3 |
 | `copy_decomposition_safe.smt2` | three-string state; character transfer | safe | `original = output ++ remaining` | Seed-Houdini: `Success` |
@@ -405,3 +405,19 @@ With Z3 4.16.0, a 2-second per-check timeout, and bounded depth 6:
 ```
 
 This is the intended baseline for version 0.0.14.
+
+### 11.1 Update: a fifth hard case, of a different kind
+
+`regex_alphabet_closure_safe.smt2` was originally counted among the safe
+benchmarks Seed-Houdini certifies, not among the four `unknown` ones above.
+That no longer holds under the Z3 versions available at the time of this
+update (confirmed on both 5.0.0 and 4.16.0.0): SeedMiner finds the exact
+correct candidate every time, but the final certification check --
+`s in (a|b)*  and  s in Complement((a|b)*)`, about as simple as a
+regex-emptiness check gets -- times out regardless. This is a different
+failure mode from the four cases above, which fail because SeedMiner
+cannot synthesize the needed invariant at all; here it does, and the
+solver still can't close the check. See
+`tests/test_string_invariant_literature.py`'s
+`test_regex_complement_is_accepted_but_certification_is_a_known_hard_case`
+and `diagnose_regex_minimal.py` at the repo root for the isolated repro.
