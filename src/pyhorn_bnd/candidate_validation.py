@@ -436,12 +436,27 @@ def render_candidate_verification_smt2(
         if rule.src_relation is not None:
             used_relations.add(rule.src_relation)
 
+    # Z3's own SMT-LIB2 parser rejects String/RegLan sorts under an explicit
+    # `(set-logic HORN)` tag (it is not one of the base sorts that logic
+    # admits), which would make a dumped String candidate file fail to
+    # reload in exactly the external solver this file is meant to hand off
+    # to. Only emit the tag when it is safe to.
+    def _mentions_string_theory(relation: z3.FuncDeclRef) -> bool:
+        return any(
+            "String" in relation.domain(i).sexpr()
+            or "RegLan" in relation.domain(i).sexpr()
+            for i in range(relation.arity())
+        )
+
+    needs_string_theory = any(_mentions_string_theory(rel) for rel in used_relations)
+
     lines: list[str] = []
     if header is not None:
         lines.extend(f"; {line}".rstrip() for line in header.splitlines())
         lines.append("")
-    lines.append("(set-logic HORN)")
-    lines.append("")
+    if not needs_string_theory:
+        lines.append("(set-logic HORN)")
+        lines.append("")
     for relation in sorted(used_relations, key=lambda rel: str(rel.name())):
         lines.append(_declare_fun(relation))
     lines.append("")

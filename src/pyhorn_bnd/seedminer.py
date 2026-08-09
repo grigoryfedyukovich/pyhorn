@@ -477,12 +477,22 @@ def _relation_argument_shape(
 def _candidate_variants(
     candidate: z3.ExprRef,
 ) -> tuple[tuple[str, z3.ExprRef], ...]:
-    """Keep a seed and derive ordered bounds from numeric equalities.
+    """Keep a seed and derive ordered bounds from numeric equalities, plus a
+    regex-complement push for String.
 
     The original SeedMiner normalized arithmetic equality ``a = b`` into the
     conjunction ``a >= b`` and ``b >= a``.  Retaining those weaker conjuncts is
     essential for loops where equality is not inductive but one directional
-    bound is.  The original equality is kept as well.
+    bound is.  The original equality is kept as well, since the two forms can
+    genuinely differ in inductive strength.
+
+    ``Not(x in Complement(R))``, by contrast, is *replaced* by its
+    logically-equivalent but syntactically simpler push, ``x in R``, rather
+    than kept alongside it: the two forms carry identical logical content, so
+    there is nothing to gain from the original, and (see the inline comment
+    below) real harm in keeping it -- Z3's own regex-complement reasoning can
+    be too expensive to certify even when the same fact in its pushed form
+    is cheap.
     """
 
     normalized = z3.simplify(candidate)
@@ -501,6 +511,30 @@ def _candidate_variants(
         lhs, rhs = equality.children()
         if z3.is_arith(lhs) and z3.is_arith(rhs):
             variants.append((":numeric-disequality", z3.Or(lhs > rhs, rhs > lhs)))
+    elif (
+        z3.is_not(normalized)
+        and z3.is_app(normalized.arg(0))
+        and normalized.arg(0).decl().kind() == z3.Z3_OP_SEQ_IN_RE
+    ):
+        # `Not(x in Complement(R))` is logically `x in R`, but that push is a
+        # regex-algebra rewrite, not a propositional one, and z3.simplify()
+        # does not apply it by default. Unlike the numeric-equality variants
+        # above, this is not a different logical strength worth keeping
+        # alongside the original -- it is the exact same semantic content in
+        # a syntactically simpler form, and the un-pushed form is strictly
+        # worse: even when both survive MultiHoudini's per-candidate
+        # induction check on their own, the mere presence of the
+        # complement-laden term in the retained set is enough to make final
+        # certification's solver call time out (observed directly: it
+        # degrades to `canceled` rather than `unsat`/`sat`), producing
+        # `unknown` overall despite a clean, cheap equivalent being right
+        # there. So this replaces the un-pushed form rather than
+        # supplementing it.
+        membership = normalized.arg(0)
+        subject, pattern = membership.arg(0), membership.arg(1)
+        if z3.is_app(pattern) and pattern.decl().kind() == z3.Z3_OP_RE_COMPLEMENT:
+            pushed = membership.decl()(subject, pattern.arg(0))
+            variants = [(":regex-complement-pushed", pushed)]
     elif z3.is_distinct(normalized) and normalized.num_args() == 2:
         lhs, rhs = normalized.children()
         if z3.is_arith(lhs) and z3.is_arith(rhs):
