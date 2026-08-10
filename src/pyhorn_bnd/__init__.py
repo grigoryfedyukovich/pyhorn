@@ -43,11 +43,14 @@ from .houdini import (
 from .normalize import HornNormalizationError
 from .seedminer import (
     CandidateMap,
+    MutationResult,
+    MutationStatistics,
     SeedMiner,
     SeedMiningResult,
     SeedMiningStatistics,
     SeedObservation,
     VariableMap,
+    mutate_candidates,
 )
 from .solver_pool import (
     DEFAULT_MAX_SOLVERS,
@@ -92,6 +95,9 @@ __all__ = [
     "validate_removed_candidate",
     "DEFAULT_CANDIDATE_BOUND",
     "CandidateMap",
+    "MutationResult",
+    "MutationStatistics",
+    "mutate_candidates",
     "CheckStatus",
     "DEFAULT_MAX_SOLVERS",
     "DEFAULT_MAX_SSA_CACHE_STEPS",

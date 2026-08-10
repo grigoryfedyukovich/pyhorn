@@ -221,7 +221,52 @@ predicate-local; noncanonical free variables are rejected.
 This remains a syntactic candidate language. It does not yet synthesize general
 affine combinations, modular/path-sensitive invariants, polynomial templates,
 or the original implementation's full array range/access grammar. These limits
-reduce completeness but cannot make a certified answer unsound.
+reduce completeness but cannot make a certified answer unsound. `--mut` (below)
+closes part of this gap -- specifically, linear combinations of equalities and
+transitive chains of inequalities -- without attempting the rest.
+
+### Candidate mutation (`--mut`)
+
+`--mut` derives additional candidates from whatever's already in the pool --
+seed-mined, `--cands`-supplied, or both merged together -- by combining pairs
+of numeric equalities and inequalities within each relation's own candidate
+set. Ported from and extends FreqHorn's `RndLearnerV3.hpp::mutateHeuristicEq`:
+
+- **Equalities** (ported as-is): given `L1 = R1` and `L2 = R2` already in the
+  pool, both `(L1+L2) = (R1+R2)` and `(L1-L2) = (R1-R2)` hold, and so do the
+  same after swapping the second equality's sides (since `L2 = R2` iff
+  `R2 = L2`): `(L1+R2) = (R1+L2)` and `(L1-R2) = (R1-L2)`. Four derived
+  candidates per unordered pair.
+- **Inequalities** (new): given `L1 <=/< R1` and `L2 <=/< R2` (`>=`/`>` are
+  normalized to this form first), if `R1` is syntactically the same term as
+  `L2`, the chain `L1 <=/< R2` holds -- strict if either input was. This is
+  transitivity: `x <= y` and `y <= z` give `x <= z`; `x < y` and `y <= z`
+  give `x < z`.
+
+Results that simplify to `True`/`False`, or that duplicate a candidate
+already present, are dropped. Nothing here reasons across two different
+predicates' candidate sets, and it runs once (derived candidates are not
+themselves re-mutated). Requires `--seed-houdini` or `--cands`; combine
+with either or both. Not ported from the original: a narrower
+constant-multiple substitution pass (turning `x = 5` and `y = 10` into
+`y = 2*x`), left for a future extension if needed.
+
+```bash
+pyhorn-expl --cands examples/cands/transitive_bounds_candidates.smt2 --mut \
+  --debug --print-invariants \
+  examples/seed_houdini/transitive_bounds_safe.smt2
+```
+
+`--debug` reports `Mutation: equalities=N, inequalities=N, eq-pairs=N,
+ineq-chains=N, added=N`, and `--json` includes the same counts under a
+top-level `"mutation"` key. Note that Z3's own linear-arithmetic reasoning
+already combines simultaneously-retained hypotheses like `x<=y` and `y<=z`
+for free during final certification, so `--mut` is not usually *necessary*
+for a single relation's own certification to succeed -- what it adds is
+making the combined fact (`x<=z`) a first-class, independently-retained
+candidate, which matters when a later rule or a different predicate needs
+exactly that fact and not its ingredients (e.g. after a multi-predicate
+transition that carries `x` and `z` forward but drops `y`).
 
 ### MultiHoudini filtering
 

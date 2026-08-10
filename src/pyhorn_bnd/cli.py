@@ -23,7 +23,7 @@ from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
 from .houdini import HoudiniResult, HoudiniStatus, MultiHoudini, RemovedCandidate
 from .normalize import HornNormalizationError
-from .seedminer import CandidateMap, SeedMiner
+from .seedminer import CandidateMap, MutationResult, SeedMiner, mutate_candidates
 from .solver_pool import DEFAULT_MAX_SOLVERS
 from .vc import DEFAULT_MAX_SSA_CACHE_STEPS, VerificationConditionBuilder
 
@@ -142,6 +142,19 @@ def _parser() -> argparse.ArgumentParser:
         "--print-invariants",
         action="store_true",
         help="print retained candidates in --seed-houdini / --cands mode",
+    )
+    parser.add_argument(
+        "--mut",
+        action="store_true",
+        help=(
+            "before running MultiHoudini, derive additional candidates by "
+            "combining pairs of existing numeric equalities and "
+            "inequalities within each relation's pool (e.g. x<=y and "
+            "y<=z produce x<=z; x=a and y=b also produce x+y=a+b and "
+            "x-y=a-b). Applies uniformly to candidates from "
+            "--seed-houdini and/or --cands. Requires --seed-houdini or "
+            "--cands."
+        ),
     )
     parser.add_argument(
         "--dump-cands",
@@ -367,6 +380,7 @@ def _houdini_json(
     result: HoudiniResult,
     *,
     user_candidates: CandidateMap | None,
+    mutation_result: MutationResult | None = None,
     candidate_validations: tuple[CandidateValidation, ...] | None = None,
     candidate_files_by_index: dict[int, Path] | None = None,
 ) -> str:
@@ -395,6 +409,21 @@ def _houdini_json(
         else {
             "predicates": len(user_candidates),
             "candidates": sum(len(items) for items in user_candidates.values()),
+        },
+        "mutation": None
+        if mutation_result is None
+        else {
+            "equalities_considered": mutation_result.statistics.equalities_considered,
+            "inequalities_considered": (
+                mutation_result.statistics.inequalities_considered
+            ),
+            "equality_pairs_combined": (
+                mutation_result.statistics.equality_pairs_combined
+            ),
+            "inequality_chains_combined": (
+                mutation_result.statistics.inequality_chains_combined
+            ),
+            "candidates_added": mutation_result.statistics.candidates_added,
         },
         "houdini": {
             "iterations": result.statistics.iterations,
@@ -457,6 +486,7 @@ def _print_houdini(
     debug: int,
     print_invariants: bool,
     user_candidates: CandidateMap | None = None,
+    mutation_result: MutationResult | None = None,
     candidate_validations: tuple[CandidateValidation, ...] | None = None,
     candidate_files_by_index: dict[int, Path] | None = None,
 ) -> None:
@@ -472,6 +502,15 @@ def _print_houdini(
         print(
             f"Cands: predicates={len(user_candidates)}, "
             f"candidates={sum(len(items) for items in user_candidates.values())}"
+        )
+    if mutation_result is not None and debug:
+        stats = mutation_result.statistics
+        print(
+            f"Mutation: equalities={stats.equalities_considered}, "
+            f"inequalities={stats.inequalities_considered}, "
+            f"eq-pairs={stats.equality_pairs_combined}, "
+            f"ineq-chains={stats.inequality_chains_combined}, "
+            f"added={stats.candidates_added}"
         )
     if debug:
         stats = result.statistics
@@ -537,6 +576,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--dump-cands requires --seed-houdini or --cands")
     if args.validate_candidates and not (args.seed_houdini or args.cands is not None):
         parser.error("--validate-candidates requires --seed-houdini or --cands")
+    if args.mut and not (args.seed_houdini or args.cands is not None):
+        parser.error("--mut requires --seed-houdini or --cands")
     if args.candidate_bound < 1:
         parser.error("--candidate-bound must be at least 1")
     if args.dump_promising_candidates is not None and not args.validate_candidates:
@@ -593,6 +634,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.cands is not None:
                 user_candidates = parse_candidate_file(args.cands, miner.variables)
                 candidates = merge_candidate_maps(candidates, user_candidates)
+
+            mutation_result: MutationResult | None = None
+            if args.mut:
+                # Applies to whatever's in `candidates` at this point --
+                # seed-mined, user-supplied, or both merged together -- since
+                # mutate_candidates only looks at the expressions themselves.
+                mutation_result = mutate_candidates(candidates)
+                candidates = merge_candidate_maps(
+                    candidates, mutation_result.candidates
+                )
 
             houdini_result = MultiHoudini(
                 program,
@@ -661,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
                     _houdini_json(
                         houdini_result,
                         user_candidates=user_candidates,
+                        mutation_result=mutation_result,
                         candidate_validations=candidate_validations,
                         candidate_files_by_index=candidate_files_by_index,
                     )
@@ -671,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
                     debug=args.debug,
                     print_invariants=args.print_invariants,
                     user_candidates=user_candidates,
+                    mutation_result=mutation_result,
                     candidate_validations=candidate_validations,
                     candidate_files_by_index=candidate_files_by_index,
                 )

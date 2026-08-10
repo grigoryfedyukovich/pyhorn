@@ -594,3 +594,220 @@ def _boolean_seed_nodes(expression: z3.BoolRef) -> Iterable[z3.BoolRef]:
             condition = current.arg(0)
             if z3.is_bool(condition):
                 stack.append(condition)
+
+
+# ---------------------------------------------------------------------------
+# --mut: candidate mutation
+#
+# Ported from and extends FreqHorn's RndLearnerV3.hpp::mutateHeuristicEq,
+# which combines pairs of already-known numeric equalities via +/- (e.g.
+# x=a and y=b together also give x+y=a+b and x-y=a-b) to enrich the
+# candidate pool beyond what direct syntactic mining alone produces. This
+# adds the inequality analog the original didn't have: chaining pairs of
+# <=/</>=/> facts by transitivity (x<=y and y<=z give x<=z).
+#
+# Deliberately not ported: the original's constant-multiple substitution
+# pass (turning x=5 and y=10 into y=2*x because 10 is a multiple of 5) is a
+# narrower, more speculative heuristic that wasn't part of what was asked
+# for here; left for a future extension if it turns out to be needed.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MutationStatistics:
+    """Counts from one :func:`mutate_candidates` call."""
+
+    equalities_considered: int
+    inequalities_considered: int
+    equality_pairs_combined: int
+    inequality_chains_combined: int
+    candidates_added: int
+
+
+@dataclass(frozen=True)
+class MutationResult:
+    """New candidates derived by :func:`mutate_candidates`.
+
+    ``candidates`` holds only what was newly derived, keyed the same way as
+    :data:`.CandidateMap` -- callers merge it into an existing pool with
+    :func:`.merge_candidate_maps`, the same as any other candidate source
+    (seed-mined or ``--cands``-supplied).
+    """
+
+    candidates: CandidateMap
+    statistics: MutationStatistics
+
+
+def mutate_candidates(candidates: CandidateMap) -> MutationResult:
+    """Derive additional candidates from *candidates* by combining pairs of
+    existing numeric equalities and inequalities, one relation at a time.
+
+    Works the same regardless of where *candidates* came from -- a
+    :class:`.SeedMiner` result, a ``--cands`` file parsed by
+    :func:`.parse_candidate_file`, or a map already merged from both via
+    :func:`.merge_candidate_maps` -- since it only looks at the candidate
+    expressions themselves, never at how they were produced.
+
+    Equalities (ported): given ``L1 = R1`` and ``L2 = R2`` already in the
+    pool, both ``(L1+L2) = (R1+R2)`` and ``(L1-L2) = (R1-R2)`` hold, and so
+    do the same after swapping the second equality's sides (since
+    ``L2 = R2`` iff ``R2 = L2``): ``(L1+R2) = (R1+L2)`` and
+    ``(L1-R2) = (R1-L2)``. Four derived candidates per unordered pair,
+    exactly as in the original.
+
+    Inequalities (new): given ``L1 <=/< R1`` and ``L2 <=/< R2`` (``>=``/``>``
+    are normalized to this form first: ``A >= B`` becomes ``B <= A``), if
+    ``R1`` is syntactically the same term as ``L2``, the chain
+    ``L1 <=/< R2`` holds -- strict if either input was strict. This is the
+    "``x <= y`` and ``y <= z`` implies ``x <= z``" case, and its strict
+    variants (``x < y`` and ``y <= z`` implies ``x < z``, etc.). Both
+    directions of every unordered pair are tried, since chaining is not
+    symmetric the way the equality combination is: only within-relation
+    combinations are formed, and nothing here reasons across two different
+    predicates' candidate sets.
+
+    Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
+    dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
+    filter), as are results that duplicate a candidate already present.
+    """
+
+    derived_by_relation: dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]] = {}
+    equalities_considered = 0
+    inequalities_considered = 0
+    equality_pairs_combined = 0
+    inequality_chains_combined = 0
+
+    for relation, relation_candidates in candidates.items():
+        equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
+        inequalities: list[tuple[z3.ExprRef, z3.ExprRef, bool]] = []
+
+        for candidate in relation_candidates:
+            equality = _as_numeric_equality(candidate)
+            if equality is not None:
+                equalities.append(equality)
+                continue
+            inequality = _as_numeric_inequality(candidate)
+            if inequality is not None:
+                inequalities.append(inequality)
+
+        equalities_considered += len(equalities)
+        inequalities_considered += len(inequalities)
+
+        eq_derived, eq_pairs = _mutate_equalities(equalities)
+        ineq_derived, ineq_chains = _mutate_inequalities(inequalities)
+        equality_pairs_combined += eq_pairs
+        inequality_chains_combined += ineq_chains
+
+        existing = {c.sexpr() for c in relation_candidates}
+        kept: dict[str, z3.BoolRef] = {}
+        for candidate in (*eq_derived, *ineq_derived):
+            simplified = z3.simplify(candidate)
+            if z3.is_true(simplified) or z3.is_false(simplified):
+                continue
+            key = simplified.sexpr()
+            if key in existing or key in kept:
+                continue
+            kept[key] = simplified
+
+        if kept:
+            derived_by_relation[relation] = tuple(kept.values())
+
+    statistics = MutationStatistics(
+        equalities_considered=equalities_considered,
+        inequalities_considered=inequalities_considered,
+        equality_pairs_combined=equality_pairs_combined,
+        inequality_chains_combined=inequality_chains_combined,
+        candidates_added=sum(len(v) for v in derived_by_relation.values()),
+    )
+    return MutationResult(candidates=derived_by_relation, statistics=statistics)
+
+
+def _as_numeric_equality(
+    candidate: z3.BoolRef,
+) -> tuple[z3.ExprRef, z3.ExprRef] | None:
+    """Return ``(lhs, rhs)`` if *candidate* is ``lhs == rhs`` over
+    arithmetic terms, else ``None``."""
+
+    if not (z3.is_eq(candidate) and candidate.num_args() == 2):
+        return None
+    lhs, rhs = candidate.arg(0), candidate.arg(1)
+    if z3.is_arith(lhs) and z3.is_arith(rhs):
+        return (lhs, rhs)
+    return None
+
+
+# strict=False for <=/>=, strict=True for </>; >=/> are the "flipped" forms
+# (A >= B normalizes to B <= A) so they carry the same two booleans.
+_INEQUALITY_KINDS = {z3.Z3_OP_LE: False, z3.Z3_OP_LT: True}
+_FLIPPED_INEQUALITY_KINDS = {z3.Z3_OP_GE: False, z3.Z3_OP_GT: True}
+
+
+def _as_numeric_inequality(
+    candidate: z3.BoolRef,
+) -> tuple[z3.ExprRef, z3.ExprRef, bool] | None:
+    """Return ``(lhs, rhs, strict)`` such that *candidate* is equivalent to
+    ``lhs <= rhs`` (``strict=False``) or ``lhs < rhs`` (``strict=True``),
+    normalizing ``>=``/``>`` to that form (``A >= B`` becomes ``B <= A``),
+    else ``None``."""
+
+    if not z3.is_app(candidate):
+        return None
+    kind = candidate.decl().kind()
+    if kind not in _INEQUALITY_KINDS and kind not in _FLIPPED_INEQUALITY_KINDS:
+        return None
+    if candidate.num_args() != 2:
+        return None
+    lhs, rhs = candidate.arg(0), candidate.arg(1)
+    if not (z3.is_arith(lhs) and z3.is_arith(rhs)):
+        return None
+    if kind in _INEQUALITY_KINDS:
+        return (lhs, rhs, _INEQUALITY_KINDS[kind])
+    return (rhs, lhs, _FLIPPED_INEQUALITY_KINDS[kind])
+
+
+def _mutate_equalities(
+    equalities: list[tuple[z3.ExprRef, z3.ExprRef]],
+) -> tuple[list[z3.BoolRef], int]:
+    """Port of ``mutateHeuristicEq``'s equality-combination step: for every
+    unordered pair, four candidates via +/- across the two pairings (direct
+    and swapped)."""
+
+    derived: list[z3.BoolRef] = []
+    pairs_combined = 0
+    n = len(equalities)
+    for i in range(n):
+        l1, r1 = equalities[i]
+        for j in range(i + 1, n):
+            l2, r2 = equalities[j]
+            pairs_combined += 1
+            for l2p, r2p in ((l2, r2), (r2, l2)):
+                derived.append((l1 + l2p) == (r1 + r2p))
+                derived.append((l1 - l2p) == (r1 - r2p))
+    return derived, pairs_combined
+
+
+def _mutate_inequalities(
+    inequalities: list[tuple[z3.ExprRef, z3.ExprRef, bool]],
+) -> tuple[list[z3.BoolRef], int]:
+    """New: chain pairs of normalized inequalities. If ``p``'s rhs is
+    syntactically ``q``'s lhs, ``p.lhs <=/< q.rhs`` holds (strict if either
+    input was) -- e.g. ``x<=y`` and ``y<=z`` give ``x<=z``; ``x<y`` and
+    ``y<=z`` give ``x<z``. Every ordered pair is tried (not just ``i<j``,
+    unlike the equality case above): chaining reads left-to-right, so which
+    one supplies the "rhs to match" and which the "lhs to match" matters."""
+
+    derived: list[z3.BoolRef] = []
+    chains_combined = 0
+    n = len(inequalities)
+    for i in range(n):
+        l1, r1, s1 = inequalities[i]
+        for j in range(n):
+            if i == j:
+                continue
+            l2, r2, s2 = inequalities[j]
+            if not r1.eq(l2):
+                continue
+            chains_combined += 1
+            strict = s1 or s2
+            derived.append(l1 < r2 if strict else l1 <= r2)
+    return derived, chains_combined

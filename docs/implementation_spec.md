@@ -83,6 +83,30 @@ Required behavior:
 The candidate language is syntactic. It does not yet synthesize arbitrary
 affine, modular, polynomial, or array-range invariants.
 
+## 4a. Candidate mutation (`--mut`)
+
+Optional, applied after mining/`--cands` merging and before MultiHoudini
+runs. Ported from and extends FreqHorn's
+`RndLearnerV3.hpp::mutateHeuristicEq`.
+
+Required behavior:
+
+- operates per-relation; never combines candidates from two different
+  predicates;
+- equalities: for every unordered pair of numeric equalities already in a
+  relation's pool, derives four candidates via `+`/`-` across the direct
+  and swapped pairings (ported as-is from the original);
+- inequalities (new, not in the original): normalizes `>=`/`>` to
+  `<=`/`<` form first, then for every ordered pair where one's right-hand
+  side is syntactically the other's left-hand side, derives the
+  transitive chain, strict if either input was;
+- runs exactly one pass: derived candidates are not themselves re-mutated;
+- drops results that simplify to `True`/`False` or duplicate a candidate
+  already present;
+- requires `--seed-houdini` or `--cands`.
+
+Not ported: the original's constant-multiple substitution pass.
+
 ## 5. MultiHoudini
 
 Filtering contexts are created lazily for non-query rules whose destination has
