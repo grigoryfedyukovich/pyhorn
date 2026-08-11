@@ -746,6 +746,8 @@ def mutate_candidates(
     - ``str.prefixof(lit, s)`` / ``str.suffixof(lit, s)`` with a concrete
       string literal → ``str.len(s) >= len(lit)``
     - ``s_t = str.++(s_l, s_r)`` → ``str.len(s_t) = str.len(s_l) + str.len(s_r)``
+    - Literal concat propagation: ``s = "ab"``, ``t = "cd"``, ``u = str.++(s, t)``
+      → ``u = "abcd"`` (only when every operand is pinned to a literal)
 
     The concatenation bridge is especially useful together with equality
     substitution: when a concat equality and a numeric length fact on one
@@ -976,7 +978,7 @@ def _mutate_equality_substitutions(
 def _mutate_string_bridges(
     relation_candidates: tuple[z3.BoolRef, ...] | list[z3.BoolRef],
 ) -> list[z3.BoolRef]:
-    """Emit explicit String → Int length bridges (linear, sound, no pairing).
+    """Emit explicit String bridges (linear / rare, sound, no combinatorial pairing).
 
     Bridges:
 
@@ -985,9 +987,24 @@ def _mutate_string_bridges(
       string literal → ``str.len(s) >= len(lit)``
     - ``s_t = str.++(s_l, s_r)`` (or multi-arg concat) →
       ``str.len(s_t) = str.len(s_l) + str.len(s_r) + …``
+    - Literal concat propagation: when ``s = "ab"``, ``t = "cd"``, and
+      ``u = str.++(s, t)`` are all present, emit ``u = "abcd"``. Only fires
+      when every operand is pinned to a concrete literal, so it stays rare
+      rather than combinatorial.
     """
 
     derived: list[z3.BoolRef] = []
+
+    # Collect var → concrete string literal bindings from equalities.
+    # Keyed by expression id; value is the Python string content.
+    literal_bindings: dict[int, str] = {}
+    for candidate in relation_candidates:
+        if not (z3.is_eq(candidate) and candidate.num_args() == 2):
+            continue
+        lhs, rhs = candidate.arg(0), candidate.arg(1)
+        for var, lit in ((lhs, rhs), (rhs, lhs)):
+            if z3.is_string_value(lit) and _is_string_sort(var) and not z3.is_string_value(var):
+                literal_bindings[var.get_id()] = lit.as_string()
 
     for candidate in relation_candidates:
         # --- String equality → equal lengths ---
@@ -996,15 +1013,32 @@ def _mutate_string_bridges(
             if _is_string_sort(lhs) and _is_string_sort(rhs):
                 derived.append(z3.Length(lhs) == z3.Length(rhs))
 
-            # --- Concat equality → length additivity ---
+            # --- Concat equality → length additivity + literal propagation ---
             # s_t = str.++(s_l, s_r, ...)  or  str.++(...) = s_t
             for total, parts_expr in ((lhs, rhs), (rhs, lhs)):
                 parts = _as_string_concat_parts(parts_expr)
-                if parts is not None and _is_string_sort(total) and len(parts) >= 2:
-                    length_sum = z3.Length(parts[0])
-                    for part in parts[1:]:
-                        length_sum = length_sum + z3.Length(part)
-                    derived.append(z3.Length(total) == length_sum)
+                if parts is None or not _is_string_sort(total) or len(parts) < 2:
+                    continue
+                length_sum = z3.Length(parts[0])
+                for part in parts[1:]:
+                    length_sum = length_sum + z3.Length(part)
+                derived.append(z3.Length(total) == length_sum)
+
+                # Literal propagation: every part resolves to a concrete
+                # string (either a literal in the concat, or a var bound to
+                # a literal elsewhere in the pool).
+                concrete_parts: list[str] = []
+                for part in parts:
+                    if z3.is_string_value(part):
+                        concrete_parts.append(part.as_string())
+                    elif part.get_id() in literal_bindings:
+                        concrete_parts.append(literal_bindings[part.get_id()])
+                    else:
+                        concrete_parts = []
+                        break
+                if concrete_parts:
+                    combined = "".join(concrete_parts)
+                    derived.append(total == z3.StringVal(combined))
 
         if not z3.is_app(candidate):
             continue

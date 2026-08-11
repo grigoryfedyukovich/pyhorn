@@ -423,3 +423,68 @@ def test_regex_intersection_three_pairwise() -> None:
 
     assert result.statistics.regex_memberships_considered == 3
     assert result.statistics.regex_pairs_intersected == 3
+
+
+# ---------------------------------------------------------------------------
+# Literal concatenation constant propagation
+# ---------------------------------------------------------------------------
+
+
+def test_literal_concat_propagation() -> None:
+    """s="ab", t="cd", u=str.++(s,t) → u="abcd"."""
+    s, t, u = z3.Strings("s t u")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (
+            s == z3.StringVal("ab"),
+            t == z3.StringVal("cd"),
+            u == z3.Concat(s, t),
+        )
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = z3.simplify(u == z3.StringVal("abcd")).sexpr()
+    assert expected in got
+    assert result.statistics.string_bridges_emitted >= 1
+
+
+def test_literal_concat_requires_all_operands_pinned() -> None:
+    """If only one operand is a literal, do not invent a partial concrete
+    concat for the total."""
+    s, t, u = z3.Strings("s t u")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (
+            s == z3.StringVal("ab"),
+            u == z3.Concat(s, t),
+        )
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    # Must not claim u equals some concrete string.
+    for sexpr in got:
+        assert not (
+            sexpr.startswith('(= u "') or sexpr.startswith('(= "') and " u)" in sexpr
+        )
+
+
+def test_literal_concat_with_inline_literal_operand() -> None:
+    """u = str.++(s, "cd") with s="ab" also yields u="abcd"."""
+    s, u = z3.Strings("s u")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (
+            s == z3.StringVal("ab"),
+            u == z3.Concat(s, z3.StringVal("cd")),
+        )
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = z3.simplify(u == z3.StringVal("abcd")).sexpr()
+    assert expected in got
