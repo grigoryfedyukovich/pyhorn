@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import json
+from collections import Counter
 from pathlib import Path
 from time import perf_counter
 
@@ -89,7 +89,9 @@ def main() -> int:
             )
             for key in totals:
                 totals[key] += getattr(stats, key)
-        except Exception as exc:  # report the entire corpus, not just first error
+        # Must survive any single-file failure to keep scanning the
+        # rest of the corpus.
+        except Exception as exc:  # noqa: BLE001
             counts["error"] += 1
             row.update(
                 {

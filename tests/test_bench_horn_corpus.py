@@ -82,7 +82,9 @@ def test_complete_bench_horn_corpus_parses_and_has_expected_linear_shape() -> No
                         any(free.eq(variable) for variable in variables)
                         for free in get_vars(candidate)
                     )
-        except Exception as exc:  # collect the full corpus failure set
+        # Must survive any single-file failure to keep scanning the
+        # rest of the corpus.
+        except Exception as exc:  # noqa: BLE001
             failures.append(f"{path.name}: {type(exc).__name__}: {exc}")
 
     assert not failures, "\n".join(failures)

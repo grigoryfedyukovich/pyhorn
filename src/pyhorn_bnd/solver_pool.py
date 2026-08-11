@@ -8,7 +8,6 @@ import z3
 
 from .vc import VerificationCondition
 
-
 DEFAULT_MAX_SOLVERS = 16
 
 

@@ -17,7 +17,7 @@ SRC = ROOT / "src" / "pyhorn_bnd"
 
 
 def test_runtime_package_exposes_version() -> None:
-    assert pyhorn_bnd.__version__ == "0.0.14"
+    assert pyhorn_bnd.__version__ == "0.0.18"
 
 
 def test_source_package_contains_no_runtime_assert_statements() -> None:

@@ -1,0 +1,146 @@
+[
+  {
+    "applicable_features": [
+      "Boolean predicate argument b"
+    ],
+    "domain": "Bool",
+    "emission_condition": "Every retained sample evaluates b to true.",
+    "formula_schema": "b",
+    "id": "boolean.always-true"
+  },
+  {
+    "applicable_features": [
+      "Boolean predicate argument b"
+    ],
+    "domain": "Bool",
+    "emission_condition": "Every retained sample evaluates b to false.",
+    "formula_schema": "(not b)",
+    "id": "boolean.always-false"
+  },
+  {
+    "applicable_features": [
+      "numeric predicate argument",
+      "length of a string predicate argument",
+      "difference f_i - f_j of two base numeric features"
+    ],
+    "domain": "Int/Real/String length",
+    "emission_condition": "All exact sampled values of feature f are the same rational c.",
+    "formula_schema": "(= f c)",
+    "id": "numeric.constant"
+  },
+  {
+    "applicable_features": [
+      "numeric predicate argument",
+      "length of a string predicate argument",
+      "difference f_i - f_j of two base numeric features"
+    ],
+    "domain": "Int/Real/String length",
+    "emission_condition": "Feature f has at least two distinct sampled values.",
+    "formula_schema": "(>= f min(S_f))",
+    "id": "numeric.lower-bound"
+  },
+  {
+    "applicable_features": [
+      "numeric predicate argument",
+      "length of a string predicate argument",
+      "difference f_i - f_j of two base numeric features"
+    ],
+    "domain": "Int/Real/String length",
+    "emission_condition": "Feature f has at least two distinct sampled values.",
+    "formula_schema": "(<= f max(S_f))",
+    "id": "numeric.upper-bound"
+  },
+  {
+    "applicable_features": [
+      "integer predicate argument",
+      "length of a string predicate argument",
+      "difference of two integral base features"
+    ],
+    "domain": "Int/String length",
+    "emission_condition": "For each modulus 2 <= m <= max_congruence_modulus, all sampled integer values of f have the same residue r modulo m.",
+    "formula_schema": "(= (mod f m) r)",
+    "id": "integer.congruence"
+  },
+  {
+    "applicable_features": [
+      "all numeric predicate arguments",
+      "lengths of all string predicate arguments"
+    ],
+    "domain": "Int/Real/String length",
+    "emission_condition": "There are 2..8 base features and at least two samples; an exact rational nullspace basis vector of [f_1 ... f_n 1] normalizes to primitive integer coefficients whose maximum absolute value is at most max_affine_coefficient.",
+    "formula_schema": "(= (+ (* a_1 f_1) ... (* a_n f_n) a_0) 0)",
+    "id": "numeric.affine-equality"
+  },
+  {
+    "applicable_features": [
+      "string predicate argument s"
+    ],
+    "domain": "String",
+    "emission_condition": "Every sampled value of s is the same concrete string \"w\".",
+    "formula_schema": "(= s \"w\")",
+    "id": "string.constant"
+  },
+  {
+    "applicable_features": [
+      "string predicate argument s"
+    ],
+    "domain": "String",
+    "emission_condition": "The longest common prefix p of all sampled strings is nonempty.",
+    "formula_schema": "(str.prefixof \"p\" s)",
+    "id": "string.common-prefix"
+  },
+  {
+    "applicable_features": [
+      "string predicate argument s"
+    ],
+    "domain": "String",
+    "emission_condition": "The longest common suffix q of all sampled strings is nonempty.",
+    "formula_schema": "(str.suffixof \"q\" s)",
+    "id": "string.common-suffix"
+  },
+  {
+    "applicable_features": [
+      "string predicate argument s"
+    ],
+    "domain": "String/RegLan",
+    "emission_condition": "The union of Unicode characters observed in all samples has size 1..16. Empty strings contribute no character.",
+    "formula_schema": "(str.in_re s (re.* (re.union (str.to_re c_1) ... (str.to_re c_k))))",
+    "id": "string.observed-alphabet-closure"
+  },
+  {
+    "applicable_features": [
+      "two distinct string predicate arguments"
+    ],
+    "domain": "String",
+    "emission_condition": "Every sampled pair has identical concrete values.",
+    "formula_schema": "(= s_i s_j)",
+    "id": "string.equality"
+  },
+  {
+    "applicable_features": [
+      "ordered pair of distinct string predicate arguments"
+    ],
+    "domain": "String",
+    "emission_condition": "For every sample, the value of s_j starts with the value of s_i.",
+    "formula_schema": "(str.prefixof s_i s_j)",
+    "id": "string.prefix-relation"
+  },
+  {
+    "applicable_features": [
+      "ordered pair of distinct string predicate arguments"
+    ],
+    "domain": "String",
+    "emission_condition": "For every sample, the value of s_j ends with the value of s_i.",
+    "formula_schema": "(str.suffixof s_i s_j)",
+    "id": "string.suffix-relation"
+  },
+  {
+    "applicable_features": [
+      "ordered triple of three distinct string predicate arguments"
+    ],
+    "domain": "String",
+    "emission_condition": "There are at most five string arguments and every sampled triple satisfies value(s_t) = value(s_l) ++ value(s_r).",
+    "formula_schema": "(= s_t (str.++ s_l s_r))",
+    "id": "string.concatenation"
+  }
+]

@@ -21,10 +21,30 @@ from .candidate_validation import (
 from .cands import format_candidates_smt2, merge_candidate_maps, parse_candidate_file
 from .explorer import BoundedExplorer, ExplorationResult, ExplorationStatus
 from .horn import HornParseError, parse_chc_file
-from .houdini import HoudiniResult, HoudiniStatus, MultiHoudini, RemovedCandidate
+from .houdini import (
+    HoudiniResult,
+    HoudiniStatus,
+    MultiHoudini,
+    RemovedCandidate,
+    run_trace_houdini,
+)
 from .normalize import HornNormalizationError
-from .seedminer import CandidateMap, MutationResult, SeedMiner, mutate_candidates
+from .seedminer import (
+    DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+    CandidateMap,
+    MutationResult,
+    SeedMiner,
+    mutate_candidates,
+)
 from .solver_pool import DEFAULT_MAX_SOLVERS
+from .trace_miner import (
+    DEFAULT_MODELS_PER_PREFIX,
+    DEFAULT_SAMPLES_PER_RELATION,
+    DEFAULT_TRACE_CANDIDATES_PER_RELATION,
+    DEFAULT_TRACE_DEPTH,
+    DEFAULT_TRACE_LIMIT,
+    trace_template_specifications,
+)
 from .vc import DEFAULT_MAX_SSA_CACHE_STEPS, VerificationConditionBuilder
 
 
@@ -60,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "file",
+        nargs="?",
         type=Path,
         help=(
             "linear CHC file in rule/query syntax or pure SMT-LIB assert/forall syntax"
@@ -141,7 +162,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--print-invariants",
         action="store_true",
-        help="print retained candidates in --seed-houdini / --cands mode",
+        help="print retained candidates in --seed-houdini / --cands / --trace-houdini mode",
     )
     parser.add_argument(
         "--mut",
@@ -151,9 +172,9 @@ def _parser() -> argparse.ArgumentParser:
             "combining pairs of existing numeric equalities and "
             "inequalities within each relation's pool (e.g. x<=y and "
             "y<=z produce x<=z; x=a and y=b also produce x+y=a+b and "
-            "x-y=a-b). Applies uniformly to candidates from "
-            "--seed-houdini and/or --cands. Requires --seed-houdini or "
-            "--cands."
+            "x-y=a-b). Applies to the full combined candidate set from "
+            "whichever of --seed-houdini, --cands, and --trace-houdini "
+            "were used. Requires one of those three."
         ),
     )
     parser.add_argument(
@@ -206,6 +227,101 @@ def _parser() -> argparse.ArgumentParser:
             "chc-bounded-explorer on it with a larger --upto or "
             "--seed-houdini, or by handing it to any other HORN-capable "
             "solver. Requires --validate-candidates."
+        ),
+    )
+    parser.add_argument(
+        "--trace-houdini",
+        action="store_true",
+        help=(
+            "run staged trace-guided synthesis: try ordinary --seed-houdini "
+            "first, and only if that does not prove the program, sample "
+            "concrete bounded reachable-state models and generalize them "
+            "into additional invariant-candidate templates, then retry "
+            "MultiHoudini with the combined candidate set. Monotonic with "
+            "respect to plain --seed-houdini: if the syntactic baseline "
+            "already succeeds, trace sampling is skipped entirely. "
+            "--seed-houdini may be passed alongside it but has no separate "
+            "effect, since this pipeline already performs that attempt as "
+            "its own first stage. Combinable with --mut (applied at every "
+            "stage of this pipeline); a separate mode from --cands in this "
+            "release -- not yet combinable with --cands, "
+            "--validate-candidates, --dump-cands, or "
+            "--dump-promising-candidates."
+        ),
+    )
+    parser.add_argument(
+        "--trace-depth",
+        type=_positive_int,
+        default=DEFAULT_TRACE_DEPTH,
+        metavar="N",
+        help=(
+            f"maximum sampled prefix depth for --trace-houdini (default: "
+            f"{DEFAULT_TRACE_DEPTH})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-limit",
+        type=_positive_int,
+        default=DEFAULT_TRACE_LIMIT,
+        metavar="N",
+        help=(
+            f"maximum sampled prefixes for --trace-houdini (default: "
+            f"{DEFAULT_TRACE_LIMIT})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-models-per-prefix",
+        type=_positive_int,
+        default=DEFAULT_MODELS_PER_PREFIX,
+        metavar="N",
+        help=(
+            "maximum distinct destination models sampled per prefix "
+            f"(default: {DEFAULT_MODELS_PER_PREFIX})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-samples-per-predicate",
+        type=_positive_int,
+        default=DEFAULT_SAMPLES_PER_RELATION,
+        metavar="N",
+        help=(
+            "maximum concrete states retained per predicate "
+            f"(default: {DEFAULT_SAMPLES_PER_RELATION})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-candidates-per-predicate",
+        type=_positive_int,
+        default=DEFAULT_TRACE_CANDIDATES_PER_RELATION,
+        metavar="N",
+        help=(
+            "maximum trace-generalized candidates per predicate "
+            f"(default: {DEFAULT_TRACE_CANDIDATES_PER_RELATION})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-mutation-limit",
+        type=_non_negative_int,
+        default=DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+        metavar="N",
+        help=(
+            "with --trace-houdini --mut, cap how many equalities and how "
+            "many inequalities (independently) are drawn from each "
+            "predicate's candidate pool before --mut pairs them up; 0 means "
+            "unlimited. Pairing cost is quadratic in this count, and "
+            "trace-sampled pools can carry far more equalities than "
+            "syntactically-mined ones, so the default keeps --mut "
+            f"tractable on them (default: {DEFAULT_MAX_MUTATION_TERMS_PER_RELATION})"
+        ),
+    )
+    parser.add_argument(
+        "--list-trace-templates",
+        action="store_true",
+        help=(
+            "print the complete stable registry of trace-generalization "
+            "templates used by --trace-houdini and exit; does not require "
+            "the file argument. Combine with --json for machine-readable "
+            "output."
         ),
     )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
@@ -424,6 +540,38 @@ def _houdini_json(
                 mutation_result.statistics.inequality_chains_combined
             ),
             "candidates_added": mutation_result.statistics.candidates_added,
+            "terms_dropped_by_cap": (
+                mutation_result.statistics.terms_dropped_by_cap
+            ),
+        },
+        "trace_mining": None
+        if result.trace_result is None
+        else {
+            "max_depth": result.trace_result.statistics.max_depth,
+            "prefixes_checked": result.trace_result.statistics.prefixes_checked,
+            "sat_prefixes": result.trace_result.statistics.sat_prefixes,
+            "unsat_prefixes": result.trace_result.statistics.unsat_prefixes,
+            "unknown_prefixes": result.trace_result.statistics.unknown_prefixes,
+            "models_extracted": result.trace_result.statistics.models_extracted,
+            "duplicate_samples": result.trace_result.statistics.duplicate_samples,
+            "sample_limit_hits": result.trace_result.statistics.sample_limit_hits,
+            "candidate_limit_hits": (
+                result.trace_result.statistics.candidate_limit_hits
+            ),
+            "candidates": result.trace_result.statistics.candidates_mined,
+            "template_counts": {
+                template_id: sum(
+                    1
+                    for item in result.trace_result.observations
+                    if item.template_id.value == template_id
+                )
+                for template_id in sorted(
+                    {
+                        item.template_id.value
+                        for item in result.trace_result.observations
+                    }
+                )
+            },
         },
         "houdini": {
             "iterations": result.statistics.iterations,
@@ -505,12 +653,27 @@ def _print_houdini(
         )
     if mutation_result is not None and debug:
         stats = mutation_result.statistics
+        capped = (
+            f", capped={stats.terms_dropped_by_cap}"
+            if stats.terms_dropped_by_cap
+            else ""
+        )
         print(
             f"Mutation: equalities={stats.equalities_considered}, "
             f"inequalities={stats.inequalities_considered}, "
             f"eq-pairs={stats.equality_pairs_combined}, "
             f"ineq-chains={stats.inequality_chains_combined}, "
-            f"added={stats.candidates_added}"
+            f"added={stats.candidates_added}{capped}"
+        )
+    if result.trace_result is not None and debug:
+        trace_stats = result.trace_result.statistics
+        print(
+            f"TraceMiner: depth={trace_stats.max_depth}, "
+            f"prefixes={trace_stats.prefixes_checked}, "
+            f"sat={trace_stats.sat_prefixes}, "
+            f"models={trace_stats.models_extracted}, "
+            f"candidates={trace_stats.candidates_mined}, "
+            f"unknown={trace_stats.unknown_prefixes}"
         )
     if debug:
         stats = result.statistics
@@ -562,22 +725,71 @@ def _print_houdini(
                 )
 
 
+def _print_trace_template_registry(*, as_json: bool) -> None:
+    specifications = trace_template_specifications()
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": item.template_id.value,
+                        "domain": item.domain,
+                        "formula_schema": item.formula_schema,
+                        "applicable_features": list(item.applicable_features),
+                        "emission_condition": item.emission_condition,
+                    }
+                    for item in specifications
+                ],
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+    for item in specifications:
+        print(item.template_id.value)
+        print(f"  domain: {item.domain}")
+        print(f"  formula: {item.formula_schema}")
+        print("  features: " + "; ".join(item.applicable_features))
+        print(f"  emit when: {item.emission_condition}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.list_trace_templates:
+        _print_trace_template_registry(as_json=args.json)
+        return 0
+    if args.file is None:
+        parser.error("the following arguments are required: file")
     if args.upto < args.start:
         parser.error("--upto must be greater than or equal to --from")
-    if args.dump_smt is not None and args.dump_smt.exists():
-        if not args.dump_smt.is_dir():
-            parser.error("--dump-smt must name a directory")
+    if (
+        args.dump_smt is not None
+        and args.dump_smt.exists()
+        and not args.dump_smt.is_dir()
+    ):
+        parser.error("--dump-smt must name a directory")
+    # --seed-houdini is deliberately NOT rejected in combination with
+    # --trace-houdini: run_trace_houdini() already performs an ordinary
+    # seed-houdini attempt as its own first stage, so passing --seed-houdini
+    # alongside it is accepted as a (redundant but harmless) no-op rather
+    # than an error.
+    if args.trace_houdini and args.cands is not None:
+        parser.error("--trace-houdini cannot be combined with --cands")
+    if args.trace_houdini and args.validate_candidates:
+        parser.error("--trace-houdini cannot be combined with --validate-candidates")
+    if args.trace_houdini and args.dump_cands is not None:
+        parser.error("--trace-houdini cannot be combined with --dump-cands")
     if args.dump_cands is not None and not (
         args.seed_houdini or args.cands is not None
     ):
         parser.error("--dump-cands requires --seed-houdini or --cands")
     if args.validate_candidates and not (args.seed_houdini or args.cands is not None):
         parser.error("--validate-candidates requires --seed-houdini or --cands")
-    if args.mut and not (args.seed_houdini or args.cands is not None):
-        parser.error("--mut requires --seed-houdini or --cands")
+    if args.mut and not (
+        args.seed_houdini or args.cands is not None or args.trace_houdini
+    ):
+        parser.error("--mut requires --seed-houdini, --cands, or --trace-houdini")
     if args.candidate_bound < 1:
         parser.error("--candidate-bound must be at least 1")
     if args.dump_promising_candidates is not None and not args.validate_candidates:
@@ -586,7 +798,9 @@ def main(argv: list[str] | None = None) -> int:
         # Disable program slicing when running in Houdini mode: the full set
         # of relations (including any outside the ENTRY-to-query slice) may
         # be relevant to invariants that are mined or user-supplied.
-        houdini_mode = args.seed_houdini or args.cands is not None
+        houdini_mode = (
+            args.seed_houdini or args.cands is not None or args.trace_houdini
+        )
         program = parse_chc_file(
             args.file,
             slice_program=False if houdini_mode else not args.skip_elim,
@@ -605,11 +819,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             theories = [numeric]
             if program.string_sorts.uses_string:
-                theories.append(
-                    "String+RegEx"
-                    if program.string_sorts.uses_regular_expressions
-                    else "String"
-                )
+                string_features = ["String"]
+                if program.string_sorts.uses_regular_expressions:
+                    string_features.append("RegEx")
+                if program.string_sorts.uses_length_constraints:
+                    string_features.append("Length")
+                theories.append("+".join(string_features))
             print(
                 f"Parsed {len(program.rules)} linear CHCs "
                 f"({mode}, {', '.join(theories)}); "
@@ -619,38 +834,69 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {rule.short()}: {rule.body}")
 
         if houdini_mode:
-            # SeedMiner allocates the canonical VariableMap in __init__,
-            # independent of the candidate-mining pass performed by .mine().
-            # Only run .mine() when --seed-houdini was requested, so a plain
-            # --cands run does not pay for syntactic candidate mining it
-            # will not use.
-            miner = SeedMiner(program)
-            seed_result = miner.mine() if args.seed_houdini else None
-            candidates: CandidateMap = (
-                {} if seed_result is None else seed_result.candidates
-            )
-
             user_candidates: CandidateMap | None = None
-            if args.cands is not None:
-                user_candidates = parse_candidate_file(args.cands, miner.variables)
-                candidates = merge_candidate_maps(candidates, user_candidates)
-
             mutation_result: MutationResult | None = None
-            if args.mut:
-                # Applies to whatever's in `candidates` at this point --
-                # seed-mined, user-supplied, or both merged together -- since
-                # mutate_candidates only looks at the expressions themselves.
-                mutation_result = mutate_candidates(candidates)
-                candidates = merge_candidate_maps(
-                    candidates, mutation_result.candidates
+            if args.trace_houdini:
+                # A separate top-level pipeline from the accumulate-then-run
+                # flow below: run_trace_houdini stages its own baseline
+                # seed-houdini attempt internally (so a redundant
+                # --seed-houdini alongside it, permitted above, has no
+                # separate effect here) and only spends the trace-sampling
+                # budget if that fails, so there is nothing here to merge
+                # with --cands (disallowed above). --mut is supported
+                # directly by run_trace_houdini, which applies it to the
+                # candidate set live at each of its own stages.
+                houdini_result = run_trace_houdini(
+                    program,
+                    trace_depth=args.trace_depth,
+                    trace_limit=args.trace_limit,
+                    models_per_prefix=args.trace_models_per_prefix,
+                    max_samples_per_relation=args.trace_samples_per_predicate,
+                    max_trace_candidates_per_relation=(
+                        args.trace_candidates_per_predicate
+                    ),
+                    timeout_ms=args.timeout_ms,
+                    random_seed=args.random_seed,
+                    mutate=args.mut,
+                    max_mutation_terms_per_relation=(
+                        None
+                        if args.trace_mutation_limit == 0
+                        else args.trace_mutation_limit
+                    ),
+                )
+                mutation_result = houdini_result.mutation_result
+            else:
+                # SeedMiner allocates the canonical VariableMap in __init__,
+                # independent of the candidate-mining pass performed by
+                # .mine(). Only run .mine() when --seed-houdini was
+                # requested, so a plain --cands run does not pay for
+                # syntactic candidate mining it will not use.
+                miner = SeedMiner(program)
+                seed_result = miner.mine() if args.seed_houdini else None
+                candidates: CandidateMap = (
+                    {} if seed_result is None else seed_result.candidates
                 )
 
-            houdini_result = MultiHoudini(
-                program,
-                miner.variables,
-                timeout_ms=args.timeout_ms,
-                random_seed=args.random_seed,
-            ).run(candidates, seed_result=seed_result)
+                if args.cands is not None:
+                    user_candidates = parse_candidate_file(args.cands, miner.variables)
+                    candidates = merge_candidate_maps(candidates, user_candidates)
+
+                if args.mut:
+                    # Applies to whatever's in `candidates` at this point --
+                    # seed-mined, user-supplied, or both merged together --
+                    # since mutate_candidates only looks at the expressions
+                    # themselves.
+                    mutation_result = mutate_candidates(candidates)
+                    candidates = merge_candidate_maps(
+                        candidates, mutation_result.candidates
+                    )
+
+                houdini_result = MultiHoudini(
+                    program,
+                    miner.variables,
+                    timeout_ms=args.timeout_ms,
+                    random_seed=args.random_seed,
+                ).run(candidates, seed_result=seed_result)
 
             candidate_validations: tuple[CandidateValidation, ...] | None = None
             candidate_files_by_index: dict[int, Path] = {}

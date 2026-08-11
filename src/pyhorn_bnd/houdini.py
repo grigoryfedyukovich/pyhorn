@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Collection, Mapping
+from typing import TYPE_CHECKING
 
 import z3
 from z3.z3util import get_vars
 
+from .cands import merge_candidate_maps
 from .horn import HornProgram, HornRule
-from .seedminer import CandidateMap, SeedMiner, SeedMiningResult, VariableMap
+from .seedminer import (
+    DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+    CandidateMap,
+    MutationResult,
+    SeedMiner,
+    SeedMiningResult,
+    VariableMap,
+    mutate_candidates,
+)
+
+if TYPE_CHECKING:
+    from .trace_miner import TraceMiningResult
 
 
 class HoudiniStatus(Enum):
@@ -95,6 +108,18 @@ class HoudiniResult:
     statistics: HoudiniStatistics
     failures: tuple[HoudiniFailure, ...]
     removed_candidates: tuple[RemovedCandidate, ...]
+    # Populated only by run_trace_houdini() when mutate=True; None otherwise
+    # (plain run_seed_houdini() and the CLI's own --seed-houdini/--cands/
+    # --mut flow report mutation stats separately, since they build the
+    # candidate set themselves rather than through a run_*() convenience
+    # function).
+    mutation_result: MutationResult | None = None
+    # Populated only by run_trace_houdini(); None for plain run_seed_houdini()
+    # or CLI --cands runs. Kept separate from removed_candidates (which
+    # applies to whichever candidate set MultiHoudini actually filtered)
+    # since it describes the trace-sampling stage itself, not a filtering
+    # outcome.
+    trace_result: TraceMiningResult | None = None
 
     @property
     def success(self) -> bool:
@@ -694,4 +719,146 @@ def run_seed_houdini(
         statistics=result.statistics,
         failures=result.failures,
         removed_candidates=result.removed_candidates,
+    )
+
+
+def run_trace_houdini(
+    program: HornProgram,
+    *,
+    trace_depth: int = 8,
+    trace_limit: int = 1_000,
+    models_per_prefix: int = 2,
+    max_samples_per_relation: int = 64,
+    max_trace_candidates_per_relation: int = 256,
+    timeout_ms: int = 1_000,
+    random_seed: int | None = None,
+    mutate: bool = False,
+    max_mutation_terms_per_relation: int | None = (
+        DEFAULT_MAX_MUTATION_TERMS_PER_RELATION
+    ),
+) -> HoudiniResult:
+    """Run staged syntactic and trace-generalized Houdini synthesis.
+
+    The inexpensive syntactic candidate set is tried first.  Trace sampling is
+    invoked only when that baseline is insufficient.  This makes the enhanced
+    pipeline monotonic with respect to the existing Seed-Houdini successes and
+    prevents difficult speculative candidates from turning an already proved
+    benchmark into ``unknown``.
+
+    If ``mutate`` is set, :func:`.seedminer.mutate_candidates` is applied to
+    whatever candidate set is live at each stage -- the seed-mined set for
+    the baseline attempt, and the full seed-plus-trace set for the second
+    stage -- so mutation always sees the complete combined candidate pool
+    available at that point, the same guarantee the CLI's plain
+    ``--seed-houdini``/``--cands``/``--mut`` flow gives. Mutation is applied
+    at the baseline stage too (not only after trace mining) because it is
+    inexpensive relative to trace sampling, so it belongs in the "try cheap
+    things first" half of the staging, same as the syntactic seed candidates
+    themselves.
+
+    ``max_mutation_terms_per_relation`` is passed straight through to every
+    :func:`.seedminer.mutate_candidates` call this makes (see that function's
+    docstring). It defaults to a real cap here, unlike
+    ``mutate_candidates()``'s own default of unbounded: this pipeline's
+    combined seed-plus-trace pools routinely carry far more equalities than
+    the syntactically-mined pools ``mutate_candidates()`` was originally
+    sized for, and pairing cost is quadratic in that count. Pass ``None`` to
+    disable the cap and match ``mutate_candidates()``'s own default.
+    """
+
+    from .candidate_generation import CandidateBatch, merge_candidate_batches
+    from .trace_miner import TraceCandidateMiner
+
+    seeds = SeedMiner(program).mine()
+    seed_candidates: CandidateMap = seeds.candidates
+    mutation_result: MutationResult | None = None
+    if mutate:
+        mutation_result = mutate_candidates(
+            seed_candidates,
+            max_terms_per_relation=max_mutation_terms_per_relation,
+        )
+        seed_candidates = merge_candidate_maps(
+            seed_candidates, mutation_result.candidates
+        )
+
+    baseline = MultiHoudini(
+        program,
+        seeds.variables,
+        timeout_ms=timeout_ms,
+        random_seed=random_seed,
+    ).run(seed_candidates, seed_result=seeds)
+    if baseline.status is HoudiniStatus.SUCCESS:
+        return HoudiniResult(
+            status=baseline.status,
+            variables=seeds.variables,
+            candidates=baseline.candidates,
+            seed_result=seeds,
+            statistics=baseline.statistics,
+            failures=baseline.failures,
+            removed_candidates=baseline.removed_candidates,
+            mutation_result=mutation_result,
+        )
+
+    traces = TraceCandidateMiner(
+        program,
+        seeds.variables,
+        max_depth=trace_depth,
+        max_prefixes=trace_limit,
+        models_per_prefix=models_per_prefix,
+        max_samples_per_relation=max_samples_per_relation,
+        max_candidates_per_relation=max_trace_candidates_per_relation,
+        timeout_ms=timeout_ms,
+        random_seed=random_seed,
+    ).mine()
+    combined = merge_candidate_batches(
+        seeds.variables,
+        CandidateBatch(
+            generator_id="seedminer",
+            variables=seeds.variables,
+            # Already includes stage-1 mutations, if any: there is no reason
+            # to discard them just because the baseline attempt using them
+            # did not succeed on its own.
+            candidates=seed_candidates,
+        ),
+        CandidateBatch(
+            generator_id="trace-templates",
+            variables=traces.variables,
+            candidates=traces.candidates,
+            metadata={
+                "samples": traces.statistics.models_extracted,
+                "templates": len({item.template_id for item in traces.observations}),
+            },
+        ),
+    )
+    if mutate:
+        # Re-run over the enlarged combined set, not just the stage-1
+        # mutations: a trace-derived equality and a seed-derived inequality
+        # can now be combined into a candidate neither stage alone could
+        # produce. This does recompute the stage-1 pairs too, but
+        # mutate_candidates is a pure function of its input and cheap
+        # relative to the trace sampling that already ran. The same
+        # max_mutation_terms_per_relation cap applies here -- this is the
+        # stage where it actually matters, since the combined pool is where
+        # trace-sampled equalities push the term count up.
+        mutation_result = mutate_candidates(
+            combined,
+            max_terms_per_relation=max_mutation_terms_per_relation,
+        )
+        combined = merge_candidate_maps(combined, mutation_result.candidates)
+    result = MultiHoudini(
+        program,
+        seeds.variables,
+        timeout_ms=timeout_ms,
+        random_seed=random_seed,
+    ).run(combined, seed_result=seeds)
+    return HoudiniResult(
+        status=result.status,
+        variables=seeds.variables,
+        candidates=result.candidates,
+        seed_result=seeds,
+        statistics=result.statistics,
+        failures=result.failures,
+        removed_candidates=result.removed_candidates,
+        mutation_result=mutation_result,
+        trace_result=traces,
     )

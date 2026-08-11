@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
-import re
 
 import z3
 
 from .horn import HornProgram, HornRule
 from .normalize import flatten_and, mk_and, substitute_many
-
 
 DEFAULT_MAX_SSA_CACHE_STEPS = 65_536
 
@@ -345,7 +344,14 @@ class VerificationConditionBuilder:
         self._remember_step(key, step)
         return step
 
-    def build(self, trace: tuple[HornRule, ...]) -> VerificationCondition:
+    def build_prefix(self, trace: tuple[HornRule, ...]) -> VerificationCondition:
+        """Build a connected SSA prefix that may end at a non-query relation.
+
+        Used directly by trace-guided candidate mining, which needs to solve
+        prefixes that stop mid-program (at whatever relation it is sampling
+        states for) rather than only complete ENTRY-to-query traces.
+        """
+
         if not trace:
             raise ValueError("a verification condition requires a non-empty trace")
 
@@ -369,9 +375,15 @@ class VerificationConditionBuilder:
             steps.append(step)
             current_state = step.destination_state
 
+        return VerificationCondition(trace=trace, steps=tuple(steps))
+
+    def build(self, trace: tuple[HornRule, ...]) -> VerificationCondition:
+        """Build a complete ENTRY-to-query verification condition."""
+
+        vc = self.build_prefix(trace)
         if trace[-1].dst_relation not in self.program.query_relations:
             raise ValueError("trace does not end in a query relation")
-        return VerificationCondition(trace=trace, steps=tuple(steps))
+        return vc
 
 
 def _is_rule_constant(expr: z3.ExprRef) -> bool:

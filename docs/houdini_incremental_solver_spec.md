@@ -1,6 +1,6 @@
 # Incremental solver specification for PyHorn MultiHoudini
 
-**Version:** 0.0.11  
+**Version:** 0.0.18  
 **Status:** normative implementation specification
 
 ## 1. Purpose
@@ -31,6 +31,15 @@ Nonlinear or quantified real checks may return Z3 `unknown` under the per-check
 timeout; such a result is propagated conservatively and can never establish
 `Success`. Fresh final certification uses the same exact real formulas. See
 [`real_arithmetic.md`](real_arithmetic.md).
+
+### String sorts
+
+The same candidate instantiation, assumption-literal, countermodel-removal, and
+fresh-certification protocol applies to predicates containing `String` values.
+String equalities, length constraints, concatenation, containment, and regular-
+expression membership remain native Z3 formulas. No string is encoded as an
+integer or array by MultiHoudini. String-theory `unknown` results are propagated
+conservatively. See [`string_theory.md`](string_theory.md).
 
 ## 3. CHC obligations
 

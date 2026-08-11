@@ -6,10 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 SUITES = ("bench_horn", "bench_horn_cex", "bench_horn_multiple")
 

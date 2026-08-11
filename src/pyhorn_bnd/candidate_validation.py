@@ -64,11 +64,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator
 
 import z3
 

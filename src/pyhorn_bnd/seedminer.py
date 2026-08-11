@@ -7,15 +7,14 @@ variables for each predicate occurrence, and records predicate-local formulas.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
-from typing import Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 import z3
 from z3.z3util import get_vars
 
 from .horn import HornProgram, HornRule
-
 
 CandidateMap = dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]]
 VariableMap = dict[z3.FuncDeclRef, tuple[z3.ExprRef, ...]]
@@ -120,6 +119,32 @@ class SeedMiner:
             candidates=candidates,
             observations=tuple(self._observations),
             statistics=statistics,
+        )
+
+    generator_id = "seedminer"
+
+    def generate(self):
+        """Return candidates through the neutral generator extension API.
+
+        Lets :class:`SeedMiner` be used anywhere a
+        :class:`.candidate_generation.CandidateGenerator` is expected (e.g.
+        merged with other proposal engines via
+        :func:`.candidate_generation.merge_candidate_batches`) without a
+        direct import cycle between this module and
+        :mod:`.candidate_generation`.
+        """
+
+        from .candidate_generation import CandidateBatch
+
+        result = self.mine()
+        return CandidateBatch(
+            generator_id=self.generator_id,
+            variables=result.variables,
+            candidates=result.candidates,
+            metadata={
+                "rules_examined": result.statistics.rules_examined,
+                "boolean_nodes_seen": result.statistics.boolean_nodes_seen,
+            },
         )
 
     def _share_transparent_candidates(self) -> None:
@@ -612,6 +637,14 @@ def _boolean_seed_nodes(expression: z3.BoolRef) -> Iterable[z3.BoolRef]:
 # for here; left for a future extension if it turns out to be needed.
 # ---------------------------------------------------------------------------
 
+# Pairing cost in mutate_candidates() is quadratic in the number of terms
+# per relation. Syntactically-mined and --cands pools are small enough that
+# this was never an issue in practice, so mutate_candidates() itself stays
+# unbounded by default. run_trace_houdini()'s combined seed-plus-trace pools
+# can be an order of magnitude larger, so it applies this cap by default;
+# see mutate_candidates()'s max_terms_per_relation parameter.
+DEFAULT_MAX_MUTATION_TERMS_PER_RELATION = 32
+
 
 @dataclass(frozen=True)
 class MutationStatistics:
@@ -622,6 +655,13 @@ class MutationStatistics:
     equality_pairs_combined: int
     inequality_chains_combined: int
     candidates_added: int
+    # Terms dropped by max_terms_per_relation before pairing, if that cap
+    # was set and a relation's pool exceeded it. Zero whenever the cap was
+    # not set or never triggered. Reported separately from
+    # equalities_considered/inequalities_considered (which already reflect
+    # the post-cap counts) purely so callers can tell a small candidate
+    # pool apart from a large one that got truncated.
+    terms_dropped_by_cap: int = 0
 
 
 @dataclass(frozen=True)
@@ -638,7 +678,9 @@ class MutationResult:
     statistics: MutationStatistics
 
 
-def mutate_candidates(candidates: CandidateMap) -> MutationResult:
+def mutate_candidates(
+    candidates: CandidateMap, *, max_terms_per_relation: int | None = None
+) -> MutationResult:
     """Derive additional candidates from *candidates* by combining pairs of
     existing numeric equalities and inequalities, one relation at a time.
 
@@ -669,6 +711,19 @@ def mutate_candidates(candidates: CandidateMap) -> MutationResult:
     Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
     dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
     filter), as are results that duplicate a candidate already present.
+
+    *max_terms_per_relation*, if set, caps how many equalities and how many
+    inequalities (independently) are drawn from each relation's pool before
+    pairing. Pairing cost is quadratic in the number of terms, so this
+    exists for candidate pools too large for unbounded pairing to finish in
+    reasonable time -- e.g. the trace-sampled pools ``--trace-houdini --mut``
+    combines, which routinely carry an order of magnitude more equalities
+    than the syntactically-mined pools this function was originally sized
+    for. ``None`` (the default) preserves the original unbounded behavior,
+    since plain ``--seed-houdini``/``--cands`` pools are not normally large
+    enough to need it. When the cap truncates a relation's terms, the first
+    *max_terms_per_relation* as encountered are kept and the rest are
+    dropped, not resampled or prioritized by any heuristic.
     """
 
     derived_by_relation: dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]] = {}
@@ -676,6 +731,7 @@ def mutate_candidates(candidates: CandidateMap) -> MutationResult:
     inequalities_considered = 0
     equality_pairs_combined = 0
     inequality_chains_combined = 0
+    terms_dropped_by_cap = 0
 
     for relation, relation_candidates in candidates.items():
         equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
@@ -689,6 +745,14 @@ def mutate_candidates(candidates: CandidateMap) -> MutationResult:
             inequality = _as_numeric_inequality(candidate)
             if inequality is not None:
                 inequalities.append(inequality)
+
+        if max_terms_per_relation is not None:
+            if len(equalities) > max_terms_per_relation:
+                terms_dropped_by_cap += len(equalities) - max_terms_per_relation
+                equalities = equalities[:max_terms_per_relation]
+            if len(inequalities) > max_terms_per_relation:
+                terms_dropped_by_cap += len(inequalities) - max_terms_per_relation
+                inequalities = inequalities[:max_terms_per_relation]
 
         equalities_considered += len(equalities)
         inequalities_considered += len(inequalities)
@@ -718,6 +782,7 @@ def mutate_candidates(candidates: CandidateMap) -> MutationResult:
         equality_pairs_combined=equality_pairs_combined,
         inequality_chains_combined=inequality_chains_combined,
         candidates_added=sum(len(v) for v in derived_by_relation.values()),
+        terms_dropped_by_cap=terms_dropped_by_cap,
     )
     return MutationResult(candidates=derived_by_relation, statistics=statistics)
 

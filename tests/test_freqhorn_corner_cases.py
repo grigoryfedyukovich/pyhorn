@@ -8,7 +8,6 @@ import z3
 from pyhorn_bnd import HornParseError, SeedMiner, parse_chc_file, run_seed_houdini
 from pyhorn_bnd.houdini import HoudiniStatus
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples" / "freqhorn_corner_cases"
 

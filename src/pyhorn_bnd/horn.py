@@ -83,6 +83,7 @@ class StringSortProfile:
 
     uses_string: bool
     uses_regular_expressions: bool
+    uses_length_constraints: bool
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,7 @@ class HornProgram:
             else 0
         )
 
-    def slice_to_queries(self) -> "HornProgram":
+    def slice_to_queries(self) -> HornProgram:
         """Drop rules outside all ENTRY-to-query paths."""
 
         reachable: set[z3.FuncDeclRef | None] = {ENTRY}
@@ -295,15 +296,18 @@ def _string_sort_features(sort: z3.SortRef) -> tuple[bool, bool]:
     return False, False
 
 
-def _expression_string_features(expr: z3.ExprRef) -> tuple[bool, bool]:
+def _expression_string_features(expr: z3.ExprRef) -> tuple[bool, bool, bool]:
     uses_string = False
     uses_regex = False
+    uses_length = False
     stack: list[z3.ExprRef] = [expr]
-    while stack and not (uses_string and uses_regex):
+    while stack:
         current = stack.pop()
         current_string, current_regex = _string_sort_features(current.sort())
         uses_string |= current_string
         uses_regex |= current_regex
+        if z3.is_app(current) and current.decl().kind() == z3.Z3_OP_SEQ_LENGTH:
+            uses_length = True
         if z3.is_quantifier(current):
             for index in range(current.num_vars()):
                 bound_string, bound_regex = _string_sort_features(
@@ -314,7 +318,7 @@ def _expression_string_features(expr: z3.ExprRef) -> tuple[bool, bool]:
             stack.append(current.body())
         elif z3.is_app(current):
             stack.extend(current.children())
-    return uses_string, uses_regex
+    return uses_string, uses_regex, uses_length
 
 
 def _string_sort_profile(
@@ -322,6 +326,7 @@ def _string_sort_profile(
 ) -> StringSortProfile:
     uses_string = False
     uses_regex = False
+    uses_length = False
     for relation in relations:
         for index in range(relation.arity()):
             current_string, current_regex = _string_sort_features(
@@ -329,25 +334,29 @@ def _string_sort_profile(
             )
             uses_string |= current_string
             uses_regex |= current_regex
-    if not (uses_string and uses_regex):
-        for rule in rules:
-            for expression in (
-                rule.body,
-                *rule.src_args,
-                *rule.dst_args,
-                *rule.rule_vars,
-            ):
-                current_string, current_regex = _expression_string_features(expression)
-                uses_string |= current_string
-                uses_regex |= current_regex
-                if uses_string and uses_regex:
-                    break
-            if uses_string and uses_regex:
-                break
+    # Unlike uses_string/uses_regex above, uses_length is not checked as a
+    # short-circuiting early-exit condition: it is a rarer feature and
+    # scanning every rule unconditionally keeps the detection simple and
+    # correct rather than optimizing for a case that is not the bottleneck.
+    for rule in rules:
+        for expression in (
+            rule.body,
+            *rule.src_args,
+            *rule.dst_args,
+            *rule.rule_vars,
+        ):
+            current_string, current_regex, current_length = (
+                _expression_string_features(expression)
+            )
+            uses_string |= current_string
+            uses_regex |= current_regex
+            uses_length |= current_length
     return StringSortProfile(
         uses_string=uses_string,
         uses_regular_expressions=uses_regex,
+        uses_length_constraints=uses_length,
     )
+
 
 def _build_program(
     source_path: Path,

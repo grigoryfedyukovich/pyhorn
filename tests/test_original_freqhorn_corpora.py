@@ -7,7 +7,6 @@ import pytest
 
 from pyhorn_bnd import parse_chc_file
 
-
 EXPECTED = {
     "bench_horn": (352, 1_056),
     "bench_horn_cex": (79, 435),

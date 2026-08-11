@@ -15,7 +15,6 @@ from pyhorn_bnd import (
     run_seed_houdini,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples" / "string_invariant_literature"
 MANIFEST = json.loads((EXAMPLES / "manifest.json").read_text(encoding="utf-8"))
@@ -104,8 +103,8 @@ def test_regex_complement_is_accepted_but_certification_is_a_known_hard_case() -
     InRe(s, Complement(R))` check reproduces it in isolation, so it isn't
     something about how this tool builds the query. It's a genuine Z3
     regex-complement performance limit on this input. See
-    diagnose_regex_closure.py and diagnose_regex_minimal.py at the repo
-    root, and examples/cands/coffee_can_odd_white_candidates.smt2 for how
+    diagnose_regex_minimal.py at the repo root, and
+    examples/cands/coffee_can_odd_white_candidates.smt2 for how
     to route around this class of problem with --cands when you already
     know the invariant.
     """

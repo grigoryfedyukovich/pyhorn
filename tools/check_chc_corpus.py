@@ -72,7 +72,9 @@ def main() -> int:
             program = parse_chc_file(path, slice_program=False)
             _well_typed(program)
             total_rules += len(program.rules)
-        except Exception as exc:
+        # Must survive any single-file failure to keep scanning the
+        # rest of the corpus.
+        except Exception as exc:  # noqa: BLE001
             failures.append(f"{path.name}: {type(exc).__name__}: {exc}")
 
     if failures:

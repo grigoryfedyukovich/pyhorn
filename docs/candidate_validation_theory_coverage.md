@@ -164,9 +164,10 @@ Two things the hand-derivation above got wrong, both fixed:
    every other regex example in the corpus (union, range, star) budgets
    for. **Correction, found by actually testing it rather than assuming
    it would work:** raising the timeout to `30_000`ms did not fix this.
-   Diagnosed further with two standalone scripts
-   (`diagnose_regex_closure.py`, `diagnose_regex_minimal.py`, both at the
-   repo root): the *specific* check that hangs is final certification of
+   Diagnosed further with a standalone script (`diagnose_regex_minimal.py`,
+   at the repo root; `diagnose_regex_closure.py`, its earlier and more
+   elaborate counterpart, has since been removed as no longer needed): the
+   *specific* check that hangs is final certification of
    the query rule itself -- `s in (a|b)*  and  s in Complement((a|b)*)`,
    about as simple as a regex-emptiness check gets -- and it hangs
    identically in complete isolation, bypassing MultiHoudini entirely,

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator
 
 import z3
 
@@ -18,8 +18,8 @@ from .solver_pool import (
     SolverPoolStatistics,
 )
 from .vc import (
-    BndExplSmtDumpBuilder,
     DEFAULT_MAX_SSA_CACHE_STEPS,
+    BndExplSmtDumpBuilder,
     SSAConstructionStatistics,
     VerificationCondition,
     VerificationConditionBuilder,
@@ -72,12 +72,12 @@ class ExplorationResult:
 @dataclass
 class _PrefixNode:
     terminal: bool = False
-    children: dict[int, "_PrefixNode"] = field(default_factory=dict)
+    children: dict[int, _PrefixNode] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class _TracePath:
-    parent: "_TracePath | None"
+    parent: _TracePath | None
     rule: HornRule
     length: int
 

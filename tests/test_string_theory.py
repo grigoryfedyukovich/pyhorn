@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import pytest
-
 from pathlib import Path
 
+import pytest
 import z3
 
 from pyhorn_bnd import (
@@ -16,7 +15,6 @@ from pyhorn_bnd import (
     parse_chc_file,
     run_seed_houdini,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples" / "string_theory"

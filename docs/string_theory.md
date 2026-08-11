@@ -1,6 +1,6 @@
 # String and regular-expression support
 
-**Version:** 0.0.14  
+**Version:** 0.0.18  
 **Status:** implementation and regression-test contract
 
 ## 1. Semantics
@@ -219,3 +219,13 @@ for the corresponding regression tests, and
   synthesize general word equations or automata invariants.
 - The alternative Z3 string solver backend is not currently exposed as a
   PyHorn command-line option; the installed Z3 default is used.
+
+## 12. Length-constraint profile
+
+`HornProgram.string_sorts.uses_length_constraints` is true when the normalized
+program contains a `str.len` application. Length terms retain SMT-LIB integer
+semantics and may participate in linear arithmetic, ghost-state relations, and
+regex/length combinations. The dedicated benchmark and synthesis specification
+is [`string_length_constraints.md`](string_length_constraints.md). `--debug`
+reports this as a `Length` tag alongside `String`/`RegEx` in the theory
+summary line.

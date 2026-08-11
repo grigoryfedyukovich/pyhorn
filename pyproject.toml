@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyhorn-bounded-explorer"
-version = "0.0.14"
-description = "Python/Z3 bounded exploration and seed-Houdini analysis for linear CHCs"
+version = "0.0.18"
+description = "Python/Z3 bounded exploration, seed-Houdini, and trace-guided Houdini analysis for linear CHCs"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["z3-solver>=4.13.0.0,<5"]

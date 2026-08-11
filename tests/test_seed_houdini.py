@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import z3
 
@@ -9,7 +9,6 @@ from pyhorn_bnd import parse_chc_file
 from pyhorn_bnd.cli import main
 from pyhorn_bnd.houdini import HoudiniStatus, MultiHoudini, run_seed_houdini
 from pyhorn_bnd.seedminer import SeedMiner
-
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples" / "seed_houdini"

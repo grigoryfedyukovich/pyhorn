@@ -1,8 +1,10 @@
-# PyHorn: bounded CHC exploration and seed-Houdini
+# PyHorn: bounded CHC exploration, seed-Houdini, and trace-guided Houdini
 
 This repository provides Python 3/Z3Py analysis for linear constrained Horn
-clauses. It includes exhaustive bounded trace exploration and a syntactic
-SeedMiner followed by multi-predicate Houdini filtering.
+clauses. It includes exhaustive bounded trace exploration, a syntactic
+SeedMiner followed by multi-predicate Houdini filtering, and a staged
+trace-guided candidate generator that samples concrete bounded models when
+syntactic mining alone is not enough.
 
 The bounded explorer:
 
@@ -591,6 +593,85 @@ slightly with Z3 version and timeout behavior; `unknown` is always conservative.
 See [`docs/freqhorn_benchmark_audit.md`](docs/freqhorn_benchmark_audit.md) for
 bounded-exploration results and corner-case analysis.
 
+### Trace-guided candidate generation (`--trace-houdini`)
+
+`--seed-houdini`, `--cands`, and `--mut` all propose candidates from what is
+already *syntactically present* in the CHCs (or supplied by hand). Some
+invariants -- a modular length relation, an affine relation between two
+predicate arguments -- are never written down anywhere in the input, only
+implied by it. `--trace-houdini` samples concrete bounded reachable states
+along the way (the same SSA machinery bounded exploration uses) and
+generalizes them into candidates from a closed registry of 15 template
+families (constants, one- and two-sided numeric bounds, integer congruence,
+affine equality, and eight string templates):
+
+```bash
+pyhorn-expl --trace-houdini --trace-depth 8 input.smt2
+```
+
+It is staged and monotonic with respect to `--seed-houdini`: an ordinary
+Seed-Houdini attempt runs first, and trace sampling is only invoked -- and
+only spends its budget -- if that baseline does not already prove the
+program. A trace-mined candidate is exactly as untrusted as any other:
+MultiHoudini filters the combined candidate set and every original CHC is
+independently certified by a fresh solver, same as every other mode above.
+
+```bash
+pyhorn-expl \
+  --trace-houdini \
+  --trace-depth 8 \
+  --trace-limit 1000 \
+  --trace-models-per-prefix 2 \
+  --trace-samples-per-predicate 64 \
+  --trace-candidates-per-predicate 256 \
+  --debug --print-invariants --json \
+  input.smt2
+```
+
+Inspect the complete, stable template registry without an input file:
+
+```bash
+pyhorn-expl --list-trace-templates
+pyhorn-expl --list-trace-templates --json
+```
+
+This is a separate top-level mode from `--cands` in this release -- it
+cannot yet be combined with `--cands`, `--validate-candidates`,
+`--dump-cands`, or `--dump-promising-candidates`. `--mut` *is* combinable,
+and applies to the full combined seed-plus-trace candidate set at whichever
+stage the pipeline reaches. `--seed-houdini` may be passed alongside it too,
+but has no separate effect, since this pipeline already runs an ordinary
+seed-houdini attempt as its own first stage:
+
+```bash
+pyhorn-expl --trace-houdini --mut --debug --print-invariants input.smt2
+```
+
+Trace-sampled candidate pools can carry far more numeric equalities than
+the syntactically-mined pools `--mut` was originally sized for -- pairing
+cost is quadratic in that count -- so `--trace-houdini --mut` caps how many
+equalities and how many inequalities (independently, per predicate) `--mut`
+draws from the combined pool before pairing them up, defaulting to
+`--trace-mutation-limit 32`. Lower it for a faster but less thorough
+mutation pass, raise it for a more thorough but slower one, or set it to
+`0` to disable the cap entirely and match `--mut`'s own unbounded behavior
+outside `--trace-houdini`. `--debug`/`--json` report how many terms the cap
+dropped, if any.
+
+Worked examples are under
+[`examples/trace_houdini/`](examples/trace_houdini/) and
+[`examples/string_length_literature/`](examples/string_length_literature/);
+the full design, template language, and current evaluation are in
+[`docs/trace_model_generalization.md`](docs/trace_model_generalization.md)
+and [`docs/trace_candidate_templates.md`](docs/trace_candidate_templates.md).
+
+Both `SeedMiner` and `TraceCandidateMiner` implement a small, neutral
+`CandidateGenerator` extension API (`generator_id` + `generate() ->
+CandidateBatch`, merged via `merge_candidate_batches`) intended for future
+proposal engines -- statistical, learned, or otherwise -- without changing
+MultiHoudini or the certification boundary; see
+[`docs/candidate_generator_api.md`](docs/candidate_generator_api.md).
+
 ## Solver modes
 
 The default mode is a cross-trace incremental pool retaining at most 16
@@ -667,7 +748,12 @@ In fresh mode, `pushes`, `pops`, and retained `contexts` are always zero, while
 - `--model`: print a counterexample model;
 - `--seed-houdini`: run SeedMiner, MultiHoudini, and final CHC validation instead
   of bounded trace exploration;
-- `--print-invariants`: print retained candidates in `--seed-houdini` mode;
+- `--print-invariants`: print retained candidates in `--seed-houdini` /
+  `--cands` / `--trace-houdini` mode;
+- `--trace-houdini`: run staged trace-guided candidate generation (see
+  above) instead of, or as a fallback beyond, plain `--seed-houdini`;
+- `--list-trace-templates`: print the trace-generalization template
+  registry and exit, without requiring an input file;
 - `--dump-vc FILE`: save only the decisive SAT/unknown trace VC as SMT-LIB;
 - `--dump-smt DIR`: save every checked trace as a compact SMT-LIB2 unrolling
   using the original `bnd/expl` filename and file format. Existing directories
@@ -874,7 +960,14 @@ import pyhorn_bnd
 print(pyhorn_bnd.__version__)
 ```
 
-Version `0.0.14` adds a literature-derived string-invariant benchmark suite,
+Version `0.0.18` adds staged trace-guided candidate generation
+(`--trace-houdini`): sampling concrete bounded reachable states and
+generalizing them through a closed 15-template registry when syntactic
+mining alone does not prove the program, plus a neutral
+`CandidateGenerator`/`CandidateBatch` extension API that both `SeedMiner`
+and the new `TraceCandidateMiner` implement, and an expanded
+`StringSortProfile` that reports whether a program uses `str.len`. Version
+`0.0.14` adds a literature-derived string-invariant benchmark suite,
 parser/solver regressions, an audit tool, and a design specification for regular
 invariant synthesis. Version `0.0.13` added native String/regular-expression parsing and
 reasoning in both CHC syntaxes, including bounded exploration, Seed-Houdini, mixed length

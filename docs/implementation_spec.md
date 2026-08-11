@@ -1,6 +1,6 @@
 # PyHorn implementation specification
 
-**Version:** 0.0.11  
+**Version:** 0.0.18  
 **Status:** implementation contract and regression-test specification
 
 ## 1. Supported input
@@ -11,8 +11,12 @@ PyHorn accepts linear constrained Horn clauses in either form:
 - pure HORN assertions: Bool-valued `declare-fun`, quantified `assert`, and
   `check-sat`.
 
-Z3 parses expressions. PyHorn performs one lightweight command scan to discover
-relation names and passes the already-read source to `Fixedpoint.parse_string()`.
+Z3 parses expressions. PyHorn performs a lightweight command scan to discover
+relation names. Inputs using the String/sequence sort family are translated
+from fixedpoint commands to equivalent quantified SMT-LIB assertions and
+parsed with `z3.parse_smt2_string()`, because Z3's fixedpoint command parser
+does not accept those sorts. Other inputs continue to use
+`Fixedpoint.parse_string()`.
 A normalized clause may contain at most one positive relation application in
 its body. Nonlinear CHC bodies are rejected explicitly.
 
@@ -23,10 +27,14 @@ nullary relations are rejected.
 ## 2. Normalized program representation
 
 `HornProgram` stores normalized `HornRule` objects, relation/query sets,
-outgoing graph indices, source symbol names, source path, slicing status, and an
-`ArithmeticSortProfile`. Every relation application is checked for arity and
-sort consistency. `Int`, `Real`, mixed `Int`/`Real`, nested quantified sorts,
-and array index/element sorts are preserved as native Z3 sorts.
+outgoing graph indices, source symbol names, source path, slicing status, an
+`ArithmeticSortProfile`, and a `StringSortProfile`. Every relation
+application is checked for arity and sort consistency. `Int`, `Real`, mixed
+`Int`/`Real`, `String`, regular-expression, nested quantified, and array
+index/element sorts are preserved as native Z3 sorts. The string profile
+reports `uses_string`, `uses_regular_expressions`, and
+`uses_length_constraints`; the last flag is set when a normalized expression
+contains `str.len`.
 
 SMT-LIB `Real` values are exact mathematical reals. Decimal literals are never
 converted through Python floating-point values. The detailed contract is in
@@ -130,17 +138,76 @@ new solver. `Success` is returned only if all certification checks are UNSAT.
 Detailed solver semantics are specified in
 [`houdini_incremental_solver_spec.md`](houdini_incremental_solver_spec.md).
 
-## 6. Error handling
+## 6. Trace-template candidate generation (`--trace-houdini`)
+
+`TraceCandidateMiner` samples satisfiable bounded prefixes and instantiates a
+closed registry of 15 template families. Every observation carries a stable
+`TraceTemplateId`; instance-specific `kind` labels are diagnostic only. The
+complete formula schemas, feature construction, orientation rules, parameter
+limits, and emission conditions are specified in
+[`trace_candidate_templates.md`](trace_candidate_templates.md) and exposed by
+`trace_template_specifications()` / `--list-trace-templates --json`.
+
+`run_trace_houdini()` is staged: ordinary SeedMiner + MultiHoudini runs
+first, and trace sampling is invoked only when that baseline does not prove
+the program, so it is monotonic with respect to plain `--seed-houdini`
+successes. See [`trace_model_generalization.md`](trace_model_generalization.md)
+for the full design and current evaluation. No trace-derived candidate has
+proof authority: candidates are merged with syntactic seeds, filtered by
+MultiHoudini, and certified with fresh solvers, exactly as in section 5.
+
+`run_trace_houdini()` also accepts `mutate=True` (wired to `--mut`), applying
+`mutate_candidates()` to the candidate set live at each of its own stages --
+the seed-mined set for the baseline attempt, and the full seed-plus-trace
+set for the second stage -- so `--mut` sees the complete combined pool
+available at that point, whichever sources contributed to it.
+
+`mutate_candidates()`'s pairing cost is quadratic in the number of
+equalities/inequalities per relation, and trace-sampled pools routinely
+carry far more of those than the syntactically-mined pools it was
+originally sized for -- unbounded, this made `--trace-houdini --mut` take
+on the order of tens of minutes on array-heavy benchmarks with large
+combined candidate pools (see `test_trace_houdini_mut_bounds_large_pools`
+in `tests/test_trace_houdini.py` for a concrete case, reduced from 30+
+minutes to under 30 seconds). `run_trace_houdini()` therefore passes
+`max_terms_per_relation=DEFAULT_MAX_MUTATION_TERMS_PER_RELATION` (32) to
+every `mutate_candidates()` call it makes, wired to `--trace-mutation-limit`
+(`0` disables the cap). `mutate_candidates()`'s own default stays unbounded,
+since plain `--seed-houdini`/`--cands` pools are not normally large enough
+to need the cap.
+
+A separate mode from `--cands` in this release (`--mut` and a redundant
+`--seed-houdini` are both accepted directly, as above); not yet combinable
+with `--cands` or `--validate-candidates` (see the migration notes
+referenced from this repository's history for the planned unification).
+
+## 7. Candidate-generator extension boundary
+
+`CandidateGenerator` and `CandidateBatch` (see
+[`candidate_generator_api.md`](candidate_generator_api.md)) define a neutral
+proposal interface. `SeedMiner` and `TraceCandidateMiner` both implement it
+today; a future machine-learning component could use the same canonical
+predicate variables and produce finite Boolean Z3 formulas without changing
+MultiHoudini or the certification boundary. `merge_candidate_batches()`
+verifies variable compatibility, simplifies and deduplicates formulas, and
+returns a normal `CandidateMap`. A generator's output is always untrusted
+until Houdini filtering and fresh certification succeed.
+
+User-supplied `--cands` files and `--mut` mutation predate this API and are
+merged through `cands.merge_candidate_maps` instead; adapting them to the
+same protocol is a natural follow-up, not yet done.
+
+## 8. Error handling
 
 Expected parse, normalization, and filesystem errors map to CLI exit code 3.
 Unexpected internal exceptions are not hidden. Z3 `unknown` maps to analysis
 status `unknown` and exit code 2.
 
-## 7. Version and API
+## 9. Version and API
 
 ```python
 import pyhorn_bnd
-assert pyhorn_bnd.__version__ == "0.0.11"
+assert pyhorn_bnd.__version__ == "0.0.18"
 ```
 
 Primary APIs:
@@ -151,9 +218,13 @@ BoundedExplorer(...).explore(...)
 SeedMiner(...).mine()
 MultiHoudini(...).run(...)
 run_seed_houdini(...)
+run_trace_houdini(...)
+TraceCandidateMiner(...).mine()
+trace_template_specifications()
+merge_candidate_batches(...)
 ```
 
-## 8. Required regressions
+## 10. Required regressions
 
 The test suite must cover:
 
@@ -174,7 +245,18 @@ The test suite must cover:
 - fixedpoint and pure-assert real arithmetic;
 - exact rational literals and mixed `Int`/`Real` coercions;
 - real-valued arrays, quantified real candidates, and nonlinear real traces;
-- real-sort preservation in SSA and replayable SMT dumps.
+- real-sort preservation in SSA and replayable SMT dumps;
+- fixedpoint and pure-assert String CHCs;
+- string equality, concatenation, length, search, replacement, conversion,
+  and regex operators;
+- mixed String/Int invariants and string-valued arrays;
+- string-length equalities, inequalities, regex/length combinations, substring
+  windows, and multi-predicate ghost-length relations;
+- String-sort preservation in SSA and replayable SMT dumps;
+- stable trace-template registry and JSON snapshot;
+- stable template IDs on generated observations;
+- bidirectional string prefix/suffix relation generation;
+- neutral candidate-generator batch compatibility and merging.
 
 The full benchmark evidence and remaining limitations are documented in
 [`freqhorn_benchmark_audit.md`](freqhorn_benchmark_audit.md).
