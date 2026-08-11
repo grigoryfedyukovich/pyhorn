@@ -645,6 +645,11 @@ def _boolean_seed_nodes(expression: z3.BoolRef) -> Iterable[z3.BoolRef]:
 # see mutate_candidates()'s max_terms_per_relation parameter.
 DEFAULT_MAX_MUTATION_TERMS_PER_RELATION = 32
 
+# Sort-agnostic equality substitution is linear in |candidates| × |equalities|
+# (each equality is applied as a rewrite to every other candidate, both
+# orientations). Still needs a bound for large trace-sampled pools.
+DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION = 256
+
 
 @dataclass(frozen=True)
 class MutationStatistics:
@@ -662,6 +667,11 @@ class MutationStatistics:
     # the post-cap counts) purely so callers can tell a small candidate
     # pool apart from a large one that got truncated.
     terms_dropped_by_cap: int = 0
+    # Sort-agnostic equality substitution (any sort, not just arithmetic).
+    general_equalities_considered: int = 0
+    substitution_rewrites_attempted: int = 0
+    substitution_candidates_added: int = 0
+    substitutions_dropped_by_cap: int = 0
 
 
 @dataclass(frozen=True)
@@ -679,10 +689,14 @@ class MutationResult:
 
 
 def mutate_candidates(
-    candidates: CandidateMap, *, max_terms_per_relation: int | None = None
+    candidates: CandidateMap,
+    *,
+    max_terms_per_relation: int | None = None,
+    max_equality_substitutions_per_relation: int | None = DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
 ) -> MutationResult:
     """Derive additional candidates from *candidates* by combining pairs of
-    existing numeric equalities and inequalities, one relation at a time.
+    existing numeric equalities and inequalities, and by sort-agnostic
+    equality substitution, one relation at a time.
 
     Works the same regardless of where *candidates* came from -- a
     :class:`.SeedMiner` result, a ``--cands`` file parsed by
@@ -695,7 +709,7 @@ def mutate_candidates(
     do the same after swapping the second equality's sides (since
     ``L2 = R2`` iff ``R2 = L2``): ``(L1+R2) = (R1+L2)`` and
     ``(L1-R2) = (R1-L2)``. Four derived candidates per unordered pair,
-    exactly as in the original.
+    exactly as in the original. Restricted to arithmetic terms.
 
     Inequalities (new): given ``L1 <=/< R1`` and ``L2 <=/< R2`` (``>=``/``>``
     are normalized to this form first: ``A >= B`` becomes ``B <= A``), if
@@ -707,6 +721,18 @@ def mutate_candidates(
     symmetric the way the equality combination is: only within-relation
     combinations are formed, and nothing here reasons across two different
     predicates' candidate sets.
+
+    Sort-agnostic equality substitution (new): given any equality ``a = b``
+    (any sort: Int, Real, String, Array, Bool, BitVec, …) already in the
+    pool, every other candidate ``c`` is rewritten by substituting ``b`` for
+    ``a`` and ``a`` for ``b``. The resulting formulas are valid under the
+    invariant ``a = b``, so the rewrite is sound for free. This subsumes
+    many per-theory “bridge” rules (e.g. length facts under string equality,
+    select facts under array equality) as special cases. Cost is linear in
+    |candidates| × |equalities|; *max_equality_substitutions_per_relation*
+    bounds the number of rewrite attempts per relation (default
+    :data:`DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION`). Pass ``None``
+    to disable the bound.
 
     Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
     dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
@@ -732,15 +758,26 @@ def mutate_candidates(
     equality_pairs_combined = 0
     inequality_chains_combined = 0
     terms_dropped_by_cap = 0
+    general_equalities_considered = 0
+    substitution_rewrites_attempted = 0
+    substitution_candidates_added = 0
+    substitutions_dropped_by_cap = 0
 
     for relation, relation_candidates in candidates.items():
         equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
         inequalities: list[tuple[z3.ExprRef, z3.ExprRef, bool]] = []
+        general_equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
 
         for candidate in relation_candidates:
-            equality = _as_numeric_equality(candidate)
-            if equality is not None:
-                equalities.append(equality)
+            numeric_eq = _as_numeric_equality(candidate)
+            if numeric_eq is not None:
+                equalities.append(numeric_eq)
+                # Numeric equalities are also general equalities.
+                general_equalities.append(numeric_eq)
+                continue
+            general_eq = _as_any_equality(candidate)
+            if general_eq is not None:
+                general_equalities.append(general_eq)
                 continue
             inequality = _as_numeric_inequality(candidate)
             if inequality is not None:
@@ -756,15 +793,24 @@ def mutate_candidates(
 
         equalities_considered += len(equalities)
         inequalities_considered += len(inequalities)
+        general_equalities_considered += len(general_equalities)
 
         eq_derived, eq_pairs = _mutate_equalities(equalities)
         ineq_derived, ineq_chains = _mutate_inequalities(inequalities)
         equality_pairs_combined += eq_pairs
         inequality_chains_combined += ineq_chains
 
+        sub_derived, sub_attempted, sub_dropped = _mutate_equality_substitutions(
+            relation_candidates,
+            general_equalities,
+            max_rewrites=max_equality_substitutions_per_relation,
+        )
+        substitution_rewrites_attempted += sub_attempted
+        substitutions_dropped_by_cap += sub_dropped
+
         existing = {c.sexpr() for c in relation_candidates}
         kept: dict[str, z3.BoolRef] = {}
-        for candidate in (*eq_derived, *ineq_derived):
+        for candidate in (*eq_derived, *ineq_derived, *sub_derived):
             simplified = z3.simplify(candidate)
             if z3.is_true(simplified) or z3.is_false(simplified):
                 continue
@@ -772,6 +818,15 @@ def mutate_candidates(
             if key in existing or key in kept:
                 continue
             kept[key] = simplified
+
+        sub_added = sum(
+            1
+            for c in sub_derived
+            if not z3.is_true(z3.simplify(c))
+            and not z3.is_false(z3.simplify(c))
+            and z3.simplify(c).sexpr() in kept
+        )
+        substitution_candidates_added += sub_added
 
         if kept:
             derived_by_relation[relation] = tuple(kept.values())
@@ -783,6 +838,10 @@ def mutate_candidates(
         inequality_chains_combined=inequality_chains_combined,
         candidates_added=sum(len(v) for v in derived_by_relation.values()),
         terms_dropped_by_cap=terms_dropped_by_cap,
+        general_equalities_considered=general_equalities_considered,
+        substitution_rewrites_attempted=substitution_rewrites_attempted,
+        substitution_candidates_added=substitution_candidates_added,
+        substitutions_dropped_by_cap=substitutions_dropped_by_cap,
     )
     return MutationResult(candidates=derived_by_relation, statistics=statistics)
 
@@ -799,6 +858,66 @@ def _as_numeric_equality(
     if z3.is_arith(lhs) and z3.is_arith(rhs):
         return (lhs, rhs)
     return None
+
+
+def _as_any_equality(
+    candidate: z3.BoolRef,
+) -> tuple[z3.ExprRef, z3.ExprRef] | None:
+    """Return ``(lhs, rhs)`` if *candidate* is ``lhs == rhs`` of any sort,
+    else ``None``. Used by sort-agnostic equality substitution."""
+
+    if not (z3.is_eq(candidate) and candidate.num_args() == 2):
+        return None
+    return (candidate.arg(0), candidate.arg(1))
+
+
+def _mutate_equality_substitutions(
+    relation_candidates: tuple[z3.BoolRef, ...] | list[z3.BoolRef],
+    equalities: list[tuple[z3.ExprRef, z3.ExprRef]],
+    *,
+    max_rewrites: int | None,
+) -> tuple[list[z3.BoolRef], int, int]:
+    """Rewrite other candidates by substituting under any equality ``a = b``.
+
+    For every equality ``(a, b)`` and every candidate ``c`` that is not that
+    equality itself, emit ``c[b/a]`` and ``c[a/b]``. Sound because any model
+    of the invariant set that satisfies ``a = b`` also satisfies the
+    rewritten formula. Linear in |candidates| × |equalities|; *max_rewrites*
+    caps the number of rewrite attempts (both orientations count) and any
+    excess is reported as dropped.
+
+    Returns ``(derived, attempted, dropped_by_cap)``.
+    """
+
+    derived: list[z3.BoolRef] = []
+    attempted = 0
+    dropped = 0
+    if not equalities or not relation_candidates:
+        return derived, attempted, dropped
+
+    for lhs, rhs in equalities:
+        # Skip trivial a = a.
+        if lhs.eq(rhs):
+            continue
+        # Sexr of this particular equality so we skip rewriting it by itself
+        # (only produces tautologies / the same fact). Other equalities are
+        # still rewritten under this one.
+        this_eq_sexpr = z3.simplify(lhs == rhs).sexpr()
+        for candidate in relation_candidates:
+            if candidate.sexpr() == this_eq_sexpr:
+                continue
+            for src, dst in ((lhs, rhs), (rhs, lhs)):
+                if max_rewrites is not None and attempted >= max_rewrites:
+                    dropped += 1
+                    continue
+                attempted += 1
+                rewritten = z3.substitute(candidate, (src, dst))
+                if rewritten.eq(candidate):
+                    # No occurrence of src; skip.
+                    continue
+                derived.append(rewritten)
+
+    return derived, attempted, dropped
 
 
 # strict=False for <=/>=, strict=True for </>; >=/> are the "flipped" forms

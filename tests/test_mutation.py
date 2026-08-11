@@ -213,3 +213,85 @@ def test_boolean_candidate_is_ignored() -> None:
     assert rel not in result.candidates
     assert result.statistics.equalities_considered == 0
     assert result.statistics.inequalities_considered == 0
+
+
+# ---------------------------------------------------------------------------
+# Sort-agnostic equality substitution
+# ---------------------------------------------------------------------------
+
+
+def test_string_equality_substitutes_into_length() -> None:
+    """s = t together with str.len(s) == n yields str.len(t) == n (and the
+    symmetric rewrite). Sound under the equality invariant."""
+    s = z3.String("s")
+    t = z3.String("t")
+    n = z3.Int("n")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.IntSort())
+    candidates: CandidateMap = {
+        rel: (s == t, z3.Length(s) == n),
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = {
+        z3.simplify(z3.Length(t) == n).sexpr(),
+        # also the length equality rewritten the other way is the same form
+    }
+    assert expected <= got
+    # Both the String equality and the arithmetic length equality are
+    # general equalities.
+    assert result.statistics.general_equalities_considered == 2
+    assert result.statistics.substitution_candidates_added >= 1
+
+
+def test_array_equality_substitutes_into_select() -> None:
+    """a = b and Select(a, i) == v yield Select(b, i) == v."""
+    a = z3.Array("a", z3.IntSort(), z3.IntSort())
+    b = z3.Array("b", z3.IntSort(), z3.IntSort())
+    i = z3.Int("i")
+    v = z3.Int("v")
+    rel = _rel("inv", a.sort(), b.sort(), z3.IntSort(), z3.IntSort())
+    candidates: CandidateMap = {
+        rel: (a == b, z3.Select(a, i) == v),
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = {z3.simplify(z3.Select(b, i) == v).sexpr()}
+    assert expected <= got
+    # Array equality + arithmetic select equality.
+    assert result.statistics.general_equalities_considered == 2
+
+
+def test_arithmetic_equality_also_feeds_substitution() -> None:
+    """Numeric equalities still participate in the general substitution pass
+    in addition to the +/- combination pass."""
+    x, y, a = z3.Ints("x y a")
+    rel = _rel("inv", z3.IntSort(), z3.IntSort())
+    # x == a and y >= x  →  substitution yields y >= a
+    candidates: CandidateMap = {rel: (x == a, y >= x)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = {z3.simplify(y >= a).sexpr()}
+    assert expected <= got
+    assert result.statistics.general_equalities_considered == 1
+    assert result.statistics.substitution_candidates_added >= 1
+
+
+def test_substitution_cap_is_respected() -> None:
+    """max_equality_substitutions_per_relation bounds rewrite attempts."""
+    x, y, a, b = z3.Ints("x y a b")
+    rel = _rel("inv", z3.IntSort(), z3.IntSort())
+    candidates: CandidateMap = {
+        rel: (x == a, y == b, x + y > 0, x - y < 10),
+    }
+
+    result = mutate_candidates(
+        candidates, max_equality_substitutions_per_relation=2
+    )
+    assert result.statistics.substitution_rewrites_attempted <= 2
+    assert result.statistics.substitutions_dropped_by_cap >= 0
