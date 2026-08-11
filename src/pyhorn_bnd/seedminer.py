@@ -672,6 +672,8 @@ class MutationStatistics:
     substitution_rewrites_attempted: int = 0
     substitution_candidates_added: int = 0
     substitutions_dropped_by_cap: int = 0
+    # Explicit string-theory bridge rules (linear, not quadratic).
+    string_bridges_emitted: int = 0
 
 
 @dataclass(frozen=True)
@@ -734,6 +736,19 @@ def mutate_candidates(
     :data:`DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION`). Pass ``None``
     to disable the bound.
 
+    Explicit string bridges (new, linear): cheap, sound consequences that
+    connect the String world to Int length templates without pairing:
+
+    - ``s1 = s2`` → ``str.len(s1) = str.len(s2)``
+    - ``str.prefixof(lit, s)`` / ``str.suffixof(lit, s)`` with a concrete
+      string literal → ``str.len(s) >= len(lit)``
+    - ``s_t = str.++(s_l, s_r)`` → ``str.len(s_t) = str.len(s_l) + str.len(s_r)``
+
+    The concatenation bridge is especially useful together with equality
+    substitution: when a concat equality and a numeric length fact on one
+    operand both survive, substitution + this bridge connect the numeric
+    side to concrete integer templates.
+
     Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
     dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
     filter), as are results that duplicate a candidate already present.
@@ -762,6 +777,7 @@ def mutate_candidates(
     substitution_rewrites_attempted = 0
     substitution_candidates_added = 0
     substitutions_dropped_by_cap = 0
+    string_bridges_emitted = 0
 
     for relation, relation_candidates in candidates.items():
         equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
@@ -800,8 +816,15 @@ def mutate_candidates(
         equality_pairs_combined += eq_pairs
         inequality_chains_combined += ineq_chains
 
+        # String bridges first so equality substitution can rewrite them
+        # under existing equalities (e.g. len(st)=len(sl)+len(sr) under
+        # len(sl)=3 → len(st)=3+len(sr)).
+        string_derived = _mutate_string_bridges(relation_candidates)
+        string_bridges_emitted += len(string_derived)
+
+        sub_pool: list[z3.BoolRef] = list(relation_candidates) + list(string_derived)
         sub_derived, sub_attempted, sub_dropped = _mutate_equality_substitutions(
-            relation_candidates,
+            sub_pool,
             general_equalities,
             max_rewrites=max_equality_substitutions_per_relation,
         )
@@ -810,7 +833,7 @@ def mutate_candidates(
 
         existing = {c.sexpr() for c in relation_candidates}
         kept: dict[str, z3.BoolRef] = {}
-        for candidate in (*eq_derived, *ineq_derived, *sub_derived):
+        for candidate in (*eq_derived, *ineq_derived, *sub_derived, *string_derived):
             simplified = z3.simplify(candidate)
             if z3.is_true(simplified) or z3.is_false(simplified):
                 continue
@@ -842,6 +865,7 @@ def mutate_candidates(
         substitution_rewrites_attempted=substitution_rewrites_attempted,
         substitution_candidates_added=substitution_candidates_added,
         substitutions_dropped_by_cap=substitutions_dropped_by_cap,
+        string_bridges_emitted=string_bridges_emitted,
     )
     return MutationResult(candidates=derived_by_relation, statistics=statistics)
 
@@ -918,6 +942,97 @@ def _mutate_equality_substitutions(
                 derived.append(rewritten)
 
     return derived, attempted, dropped
+
+
+def _mutate_string_bridges(
+    relation_candidates: tuple[z3.BoolRef, ...] | list[z3.BoolRef],
+) -> list[z3.BoolRef]:
+    """Emit explicit String → Int length bridges (linear, sound, no pairing).
+
+    Bridges:
+
+    - ``s1 = s2`` (both String) → ``str.len(s1) = str.len(s2)``
+    - ``str.prefixof(lit, s)`` / ``str.suffixof(lit, s)`` with a concrete
+      string literal → ``str.len(s) >= len(lit)``
+    - ``s_t = str.++(s_l, s_r)`` (or multi-arg concat) →
+      ``str.len(s_t) = str.len(s_l) + str.len(s_r) + …``
+    """
+
+    derived: list[z3.BoolRef] = []
+
+    for candidate in relation_candidates:
+        # --- String equality → equal lengths ---
+        if z3.is_eq(candidate) and candidate.num_args() == 2:
+            lhs, rhs = candidate.arg(0), candidate.arg(1)
+            if _is_string_sort(lhs) and _is_string_sort(rhs):
+                derived.append(z3.Length(lhs) == z3.Length(rhs))
+
+            # --- Concat equality → length additivity ---
+            # s_t = str.++(s_l, s_r, ...)  or  str.++(...) = s_t
+            for total, parts_expr in ((lhs, rhs), (rhs, lhs)):
+                parts = _as_string_concat_parts(parts_expr)
+                if parts is not None and _is_string_sort(total) and len(parts) >= 2:
+                    length_sum = z3.Length(parts[0])
+                    for part in parts[1:]:
+                        length_sum = length_sum + z3.Length(part)
+                    derived.append(z3.Length(total) == length_sum)
+
+        if not z3.is_app(candidate):
+            continue
+        kind = candidate.decl().kind()
+
+        # --- prefixof / suffixof with concrete literal → length lower bound ---
+        if kind in (z3.Z3_OP_SEQ_PREFIX, z3.Z3_OP_SEQ_SUFFIX) and candidate.num_args() == 2:
+            # SMT-LIB: (str.prefixof s t) means s is a prefix of t.
+            # Z3 PrefixOf(prefix, string) same argument order.
+            prefix_or_suffix, subject = candidate.arg(0), candidate.arg(1)
+            lit_len = _concrete_string_length(prefix_or_suffix)
+            if lit_len is not None and _is_string_sort(subject):
+                derived.append(z3.Length(subject) >= lit_len)
+
+    return derived
+
+
+def _is_string_sort(expr: z3.ExprRef) -> bool:
+    """True if *expr* has Z3's Unicode string/sequence sort."""
+    try:
+        if hasattr(z3, "is_string") and z3.is_string(expr):
+            return True
+        return bool(expr.sort().is_string())
+    except Exception:
+        return False
+
+
+def _as_string_concat_parts(
+    expr: z3.ExprRef,
+) -> list[z3.ExprRef] | None:
+    """If *expr* is ``str.++(a, b, ...)`` (possibly nested), return the flat
+    list of string parts; else ``None``."""
+    if not z3.is_app(expr):
+        return None
+    if expr.decl().kind() != z3.Z3_OP_SEQ_CONCAT:
+        return None
+    parts: list[z3.ExprRef] = []
+    stack = list(reversed(expr.children()))
+    while stack:
+        current = stack.pop()
+        if z3.is_app(current) and current.decl().kind() == z3.Z3_OP_SEQ_CONCAT:
+            stack.extend(reversed(current.children()))
+        else:
+            parts.append(current)
+    return parts if len(parts) >= 2 else None
+
+
+def _concrete_string_length(expr: z3.ExprRef) -> int | None:
+    """Return the character length if *expr* is a concrete string literal,
+    else ``None``."""
+    if not z3.is_string_value(expr):
+        return None
+    # z3.StringVal / is_string_value: .as_string() gives the Python str.
+    try:
+        return len(expr.as_string())
+    except Exception:
+        return None
 
 
 # strict=False for <=/>=, strict=True for </>; >=/> are the "flipped" forms

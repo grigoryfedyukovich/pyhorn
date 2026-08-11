@@ -187,8 +187,8 @@ def test_chain_already_present_is_not_reported_as_new() -> None:
 
 
 def test_non_arithmetic_candidates_are_ignored() -> None:
-    """A String equality/comparison-shaped candidate must not be treated as
-    numeric -- str.<= doesn't exist, but guard against ever trying to."""
+    """A String equality must not be treated as *numeric* (+/- mutation),
+    but the explicit string bridge still emits equal lengths."""
     s = z3.String("s")
     t = z3.String("t")
     rel = _rel("inv", z3.StringSort(), z3.StringSort())
@@ -196,9 +196,12 @@ def test_non_arithmetic_candidates_are_ignored() -> None:
 
     result = mutate_candidates(candidates)
 
-    assert rel not in result.candidates
     assert result.statistics.equalities_considered == 0
     assert result.statistics.inequalities_considered == 0
+    # String bridge: s=t → len(s)=len(t)
+    got = _sexprs(result.candidates.get(rel, ()))
+    assert z3.simplify(z3.Length(s) == z3.Length(t)).sexpr() in got
+    assert result.statistics.string_bridges_emitted >= 1
 
 
 def test_boolean_candidate_is_ignored() -> None:
@@ -295,3 +298,74 @@ def test_substitution_cap_is_respected() -> None:
     )
     assert result.statistics.substitution_rewrites_attempted <= 2
     assert result.statistics.substitutions_dropped_by_cap >= 0
+
+
+# ---------------------------------------------------------------------------
+# Explicit string-theory bridges
+# ---------------------------------------------------------------------------
+
+
+def test_string_equality_emits_equal_lengths() -> None:
+    s1, s2 = z3.Strings("s1 s2")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {rel: (s1 == s2,)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    assert z3.simplify(z3.Length(s1) == z3.Length(s2)).sexpr() in got
+    assert result.statistics.string_bridges_emitted >= 1
+
+
+def test_prefixof_literal_emits_length_lower_bound() -> None:
+    s = z3.String("s")
+    rel = _rel("inv", z3.StringSort())
+    candidates: CandidateMap = {rel: (z3.PrefixOf(z3.StringVal("ab"), s),)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    assert z3.simplify(z3.Length(s) >= 2).sexpr() in got
+    assert result.statistics.string_bridges_emitted >= 1
+
+
+def test_suffixof_literal_emits_length_lower_bound() -> None:
+    s = z3.String("s")
+    rel = _rel("inv", z3.StringSort())
+    candidates: CandidateMap = {rel: (z3.SuffixOf(z3.StringVal("xyz"), s),)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    assert z3.simplify(z3.Length(s) >= 3).sexpr() in got
+
+
+def test_concat_equality_emits_length_additivity() -> None:
+    st, sl, sr = z3.Strings("st sl sr")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {rel: (st == z3.Concat(sl, sr),)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = z3.simplify(z3.Length(st) == z3.Length(sl) + z3.Length(sr)).sexpr()
+    assert expected in got
+    assert result.statistics.string_bridges_emitted >= 1
+
+
+def test_concat_with_equality_substitution_connects_numeric() -> None:
+    """Concat bridge + equality substitution: st = sl ++ sr and str.len(sl) = 3
+    should yield (via substitution) str.len(st) = 3 + str.len(sr)."""
+    st, sl, sr = z3.Strings("st sl sr")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (st == z3.Concat(sl, sr), z3.Length(sl) == 3),
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    # Concat bridge: len(st) = len(sl) + len(sr)
+    # Substitution under len(sl)=3: len(st) = 3 + len(sr)
+    expected = z3.simplify(z3.Length(st) == 3 + z3.Length(sr)).sexpr()
+    assert expected in got
