@@ -369,3 +369,57 @@ def test_concat_with_equality_substitution_connects_numeric() -> None:
     # Substitution under len(sl)=3: len(st) = 3 + len(sr)
     expected = z3.simplify(z3.Length(st) == 3 + z3.Length(sr)).sexpr()
     assert expected in got
+
+
+# ---------------------------------------------------------------------------
+# Regex intersection
+# ---------------------------------------------------------------------------
+
+
+def test_regex_intersection_on_same_subject() -> None:
+    """InRe(s, R1) and InRe(s, R2) → InRe(s, Intersect(R1, R2))."""
+    s = z3.String("s")
+    r1 = z3.Plus(z3.Re("a"))
+    r2 = z3.Star(z3.Range("a", "z"))
+    rel = _rel("inv", z3.StringSort())
+    candidates: CandidateMap = {rel: (z3.InRe(s, r1), z3.InRe(s, r2))}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    expected = z3.simplify(z3.InRe(s, z3.Intersect(r1, r2))).sexpr()
+    assert expected in got
+    assert result.statistics.regex_memberships_considered == 2
+    assert result.statistics.regex_pairs_intersected == 1
+
+
+def test_regex_intersection_requires_same_subject() -> None:
+    """Memberships on different strings do not combine."""
+    s, t = z3.Strings("s t")
+    r = z3.Star(z3.Re("a"))
+    rel = _rel("inv", z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {rel: (z3.InRe(s, r), z3.InRe(t, r))}
+
+    result = mutate_candidates(candidates)
+
+    assert result.statistics.regex_pairs_intersected == 0
+    # May still have string bridges if any, but no intersect-derived membership
+    for c in result.candidates.get(rel, ()):
+        assert "re.inter" not in c.sexpr()
+
+
+def test_regex_intersection_three_pairwise() -> None:
+    """Three memberships on one subject give C(3,2)=3 pairs."""
+    s = z3.String("s")
+    r1 = z3.Re("a")
+    r2 = z3.Re("b")
+    r3 = z3.Re("c")
+    rel = _rel("inv", z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (z3.InRe(s, r1), z3.InRe(s, r2), z3.InRe(s, r3))
+    }
+
+    result = mutate_candidates(candidates)
+
+    assert result.statistics.regex_memberships_considered == 3
+    assert result.statistics.regex_pairs_intersected == 3

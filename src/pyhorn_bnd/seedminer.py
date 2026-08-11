@@ -674,6 +674,9 @@ class MutationStatistics:
     substitutions_dropped_by_cap: int = 0
     # Explicit string-theory bridge rules (linear, not quadratic).
     string_bridges_emitted: int = 0
+    # Regex intersection: pair InRe(s,R1) / InRe(s,R2) → InRe(s, Intersect(R1,R2)).
+    regex_memberships_considered: int = 0
+    regex_pairs_intersected: int = 0
 
 
 @dataclass(frozen=True)
@@ -749,6 +752,15 @@ def mutate_candidates(
     operand both survive, substitution + this bridge connect the numeric
     side to concrete integer templates.
 
+    Regex intersection (new): given two membership facts ``InRe(s, R1)`` and
+    ``InRe(s, R2)`` on the same subject, emit ``InRe(s, Intersect(R1, R2))``.
+    Z3's own regex simplifier decides whether the intersection collapses to
+    something tighter (or to unsatisfiable, which the existing true/false
+    filter drops). Same spirit as numeric combination — propose the tighter
+    fact and let the solver do the theory work. Pairing is per subject within
+    a relation; *max_terms_per_relation*, when set, also caps how many
+    membership facts per subject are paired.
+
     Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
     dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
     filter), as are results that duplicate a candidate already present.
@@ -778,6 +790,8 @@ def mutate_candidates(
     substitution_candidates_added = 0
     substitutions_dropped_by_cap = 0
     string_bridges_emitted = 0
+    regex_memberships_considered = 0
+    regex_pairs_intersected = 0
 
     for relation, relation_candidates in candidates.items():
         equalities: list[tuple[z3.ExprRef, z3.ExprRef]] = []
@@ -831,9 +845,22 @@ def mutate_candidates(
         substitution_rewrites_attempted += sub_attempted
         substitutions_dropped_by_cap += sub_dropped
 
+        regex_derived, regex_membs, regex_pairs = _mutate_regex_intersections(
+            relation_candidates,
+            max_memberships_per_subject=max_terms_per_relation,
+        )
+        regex_memberships_considered += regex_membs
+        regex_pairs_intersected += regex_pairs
+
         existing = {c.sexpr() for c in relation_candidates}
         kept: dict[str, z3.BoolRef] = {}
-        for candidate in (*eq_derived, *ineq_derived, *sub_derived, *string_derived):
+        for candidate in (
+            *eq_derived,
+            *ineq_derived,
+            *sub_derived,
+            *string_derived,
+            *regex_derived,
+        ):
             simplified = z3.simplify(candidate)
             if z3.is_true(simplified) or z3.is_false(simplified):
                 continue
@@ -866,6 +893,8 @@ def mutate_candidates(
         substitution_candidates_added=substitution_candidates_added,
         substitutions_dropped_by_cap=substitutions_dropped_by_cap,
         string_bridges_emitted=string_bridges_emitted,
+        regex_memberships_considered=regex_memberships_considered,
+        regex_pairs_intersected=regex_pairs_intersected,
     )
     return MutationResult(candidates=derived_by_relation, statistics=statistics)
 
@@ -1033,6 +1062,68 @@ def _concrete_string_length(expr: z3.ExprRef) -> int | None:
         return len(expr.as_string())
     except Exception:
         return None
+
+
+
+def _mutate_regex_intersections(
+    relation_candidates: tuple[z3.BoolRef, ...] | list[z3.BoolRef],
+    *,
+    max_memberships_per_subject: int | None = None,
+) -> tuple[list[z3.BoolRef], int, int]:
+    """Pair ``InRe(s, R1)`` / ``InRe(s, R2)`` on the same subject into
+    ``InRe(s, Intersect(R1, R2))``.
+
+    Group membership facts by subject expression identity. For every
+    unordered pair of distinct regexes on one subject, emit the intersection
+    membership. Z3's regex simplifier tightens (or refutes) the combined
+    pattern; the caller drops True/False results. Returns
+    ``(derived, memberships_considered, pairs_combined)``.
+    """
+
+    # subject_id -> list of (subject_expr, regex_expr)
+    by_subject: dict[int, list[tuple[z3.ExprRef, z3.ExprRef]]] = {}
+    for candidate in relation_candidates:
+        parsed = _as_in_re(candidate)
+        if parsed is None:
+            continue
+        subject, regex = parsed
+        by_subject.setdefault(subject.get_id(), []).append((subject, regex))
+
+    derived: list[z3.BoolRef] = []
+    memberships_considered = 0
+    pairs_combined = 0
+
+    for entries in by_subject.values():
+        if max_memberships_per_subject is not None and len(entries) > max_memberships_per_subject:
+            entries = entries[:max_memberships_per_subject]
+        memberships_considered += len(entries)
+        n = len(entries)
+        for i in range(n):
+            subject, r1 = entries[i]
+            for j in range(i + 1, n):
+                _, r2 = entries[j]
+                # Skip if the two regexes are already identical.
+                if r1.eq(r2):
+                    continue
+                pairs_combined += 1
+                derived.append(z3.InRe(subject, z3.Intersect(r1, r2)))
+
+    return derived, memberships_considered, pairs_combined
+
+
+def _as_in_re(
+    candidate: z3.BoolRef,
+) -> tuple[z3.ExprRef, z3.ExprRef] | None:
+    """Return ``(subject, regex)`` if *candidate* is ``str.in_re subject regex``,
+    else ``None``."""
+
+    if not z3.is_app(candidate):
+        return None
+    if candidate.decl().kind() != z3.Z3_OP_SEQ_IN_RE:
+        return None
+    if candidate.num_args() != 2:
+        return None
+    return (candidate.arg(0), candidate.arg(1))
 
 
 # strict=False for <=/>=, strict=True for </>; >=/> are the "flipped" forms
