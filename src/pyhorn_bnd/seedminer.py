@@ -745,9 +745,15 @@ def mutate_candidates(
     - ``s1 = s2`` → ``str.len(s1) = str.len(s2)``
     - ``str.prefixof(lit, s)`` / ``str.suffixof(lit, s)`` with a concrete
       string literal → ``str.len(s) >= len(lit)``
+    - ``str.contains(s, lit)`` with a concrete string literal → same bound,
+      ``str.len(s) >= len(lit)`` (argument order is reversed from
+      prefixof/suffixof: haystack first, needle second)
     - ``s_t = str.++(s_l, s_r)`` → ``str.len(s_t) = str.len(s_l) + str.len(s_r)``
     - Literal concat propagation: ``s = "ab"``, ``t = "cd"``, ``u = str.++(s, t)``
-      → ``u = "abcd"`` (only when every operand is pinned to a literal)
+      → ``u = "abcd"`` when every operand is pinned to a literal; when only
+      a leading and/or trailing *run* of operands is pinned (not all of
+      them), emit the weaker ``str.prefixof("ab", u)`` /
+      ``str.suffixof(...)`` instead of nothing.
 
     The concatenation bridge is especially useful together with equality
     substitution: when a concat equality and a numeric length fact on one
@@ -763,22 +769,35 @@ def mutate_candidates(
     a relation; *max_terms_per_relation*, when set, also caps how many
     membership facts per subject are paired.
 
+    Deliberately not added: combining a regex membership with its
+    complement (``InRe(s, Complement(R))``) the way intersection combines
+    two positive memberships. Z3's regex complement has a documented
+    history of pathological slowness on this codebase's own benchmarks
+    (see ``docs/candidate_validation_theory_coverage.md``); proposing more
+    complement-shaped candidates would risk reintroducing exactly that.
+
     Results that :func:`z3.simplify` collapses to ``True`` or ``False`` are
     dropped (matching the original's ``!u.isFalse(a) && !u.isTrue(a)``
     filter), as are results that duplicate a candidate already present.
 
-    *max_terms_per_relation*, if set, caps how many equalities and how many
-    inequalities (independently) are drawn from each relation's pool before
-    pairing. Pairing cost is quadratic in the number of terms, so this
-    exists for candidate pools too large for unbounded pairing to finish in
-    reasonable time -- e.g. the trace-sampled pools ``--trace-houdini --mut``
-    combines, which routinely carry an order of magnitude more equalities
-    than the syntactically-mined pools this function was originally sized
-    for. ``None`` (the default) preserves the original unbounded behavior,
-    since plain ``--seed-houdini``/``--cands`` pools are not normally large
-    enough to need it. When the cap truncates a relation's terms, the first
+    *max_terms_per_relation*, if set, caps how many equalities, how many
+    inequalities, and how many general (sort-agnostic) equalities are drawn
+    from each relation's pool -- independently, but all to the same limit --
+    before pairing/substitution. Pairing cost is quadratic in the number of
+    terms, and substitution is linear in equalities × candidates, so this
+    exists for candidate pools too large for either to finish in reasonable
+    time -- e.g. the trace-sampled pools ``--trace-houdini --mut`` combines,
+    which routinely carry an order of magnitude more equalities than the
+    syntactically-mined pools this function was originally sized for.
+    ``None`` (the default) preserves the original unbounded behavior, since
+    plain ``--seed-houdini``/``--cands`` pools are not normally large enough
+    to need it. When the cap truncates a relation's terms, the first
     *max_terms_per_relation* as encountered are kept and the rest are
-    dropped, not resampled or prioritized by any heuristic.
+    dropped, not resampled or prioritized by any heuristic. Capping the
+    equality lists this way is what actually bounds substitution's cost;
+    *max_equality_substitutions_per_relation* only bounds it from the other
+    side (total attempts), as defense in depth against a *relation_candidates*
+    pool that's independently large even after this cap.
     """
 
     derived_by_relation: dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]] = {}
@@ -822,6 +841,24 @@ def mutate_candidates(
             if len(inequalities) > max_terms_per_relation:
                 terms_dropped_by_cap += len(inequalities) - max_terms_per_relation
                 inequalities = inequalities[:max_terms_per_relation]
+            # BUG FIX: general_equalities previously bypassed this cap
+            # entirely, even though it feeds _mutate_equality_substitutions
+            # below -- on a relation with hundreds of equalities (exactly
+            # the scenario max_terms_per_relation exists to guard against,
+            # see run_trace_houdini's docstring), substitution's own
+            # max_equality_substitutions_per_relation cap only bounds the
+            # number of *rewrites attempted*, not the cost of the
+            # candidate x equality iteration that decides whether to
+            # attempt one -- that iteration ran in full regardless,
+            # measured at several seconds of pure loop/sexpr overhead on a
+            # 400 x 400 synthetic pool with the substitution cap already
+            # engaged. Capping the input here is what actually bounds that
+            # iteration, the same way it already bounds numeric pairing.
+            if len(general_equalities) > max_terms_per_relation:
+                terms_dropped_by_cap += (
+                    len(general_equalities) - max_terms_per_relation
+                )
+                general_equalities = general_equalities[:max_terms_per_relation]
 
         equalities_considered += len(equalities)
         inequalities_considered += len(inequalities)
@@ -938,40 +975,65 @@ def _mutate_equality_substitutions(
     equality itself, emit ``c[b/a]`` and ``c[a/b]``. Sound because any model
     of the invariant set that satisfies ``a = b`` also satisfies the
     rewritten formula. Linear in |candidates| × |equalities|; *max_rewrites*
-    caps the number of rewrite attempts (both orientations count) and any
-    excess is reported as dropped.
+    caps the number of rewrite attempts (both orientations count).
 
-    Returns ``(derived, attempted, dropped_by_cap)``.
+    Stops iterating entirely once *max_rewrites* is reached, rather than
+    continuing to loop with the cap merely suppressing the substitute call:
+    on a 400-equality x 400-candidate synthetic pool this iteration alone
+    (candidate.sexpr() comparisons and loop overhead, no solver calls) took
+    several seconds even with the substitution cap already engaged, purely
+    from finishing the outer loops -- caller is expected to also bound
+    *equalities* via ``mutate_candidates()``'s max_terms_per_relation, but
+    this bails out early regardless, as defense in depth against a caller
+    that doesn't (or a *relation_candidates* pool that's independently
+    large).
+
+    Returns ``(derived, attempted, dropped_by_cap)``. *dropped_by_cap* is an
+    upper bound on the rewrite attempts skipped by stopping early, not an
+    exact count (computing the exact count would require doing the
+    iteration this function exists to avoid).
     """
 
     derived: list[z3.BoolRef] = []
     attempted = 0
-    dropped = 0
     if not equalities or not relation_candidates:
-        return derived, attempted, dropped
+        return derived, attempted, 0
+
+    total_possible = len(equalities) * len(relation_candidates) * 2
+    capped_out = False
 
     for lhs, rhs in equalities:
+        if capped_out:
+            break
         # Skip trivial a = a.
         if lhs.eq(rhs):
             continue
-        # Sexr of this particular equality so we skip rewriting it by itself
-        # (only produces tautologies / the same fact). Other equalities are
-        # still rewritten under this one.
-        this_eq_sexpr = z3.simplify(lhs == rhs).sexpr()
+        # Sexpr of this particular equality's own *unsimplified* forms so
+        # we skip rewriting it by itself (only produces tautologies / the
+        # same fact already in the pool). Compared against each candidate's
+        # own (also unsimplified) sexpr -- matching representations, unlike
+        # comparing a simplified equality against raw candidates, which can
+        # fail to recognize the self-match and waste a substitution
+        # attempt on a candidate that was always going to collapse to a
+        # tautology anyway.
+        this_eq_sexprs = {(lhs == rhs).sexpr(), (rhs == lhs).sexpr()}
         for candidate in relation_candidates:
-            if candidate.sexpr() == this_eq_sexpr:
+            if candidate.sexpr() in this_eq_sexprs:
                 continue
             for src, dst in ((lhs, rhs), (rhs, lhs)):
                 if max_rewrites is not None and attempted >= max_rewrites:
-                    dropped += 1
-                    continue
+                    capped_out = True
+                    break
                 attempted += 1
                 rewritten = z3.substitute(candidate, (src, dst))
                 if rewritten.eq(candidate):
                     # No occurrence of src; skip.
                     continue
                 derived.append(rewritten)
+            if capped_out:
+                break
 
+    dropped = max(0, total_possible - attempted) if capped_out else 0
     return derived, attempted, dropped
 
 
@@ -985,12 +1047,21 @@ def _mutate_string_bridges(
     - ``s1 = s2`` (both String) → ``str.len(s1) = str.len(s2)``
     - ``str.prefixof(lit, s)`` / ``str.suffixof(lit, s)`` with a concrete
       string literal → ``str.len(s) >= len(lit)``
-    - ``s_t = str.++(s_l, s_r)`` (or multi-arg concat) →
+    - ``str.contains(s, lit)`` with a concrete string literal → same bound,
+      ``str.len(s) >= len(lit)`` (a contained substring can be no longer
+      than the string containing it)
+    - ``s_t = str.++(s_l, s_r, …)`` (or multi-arg concat) →
       ``str.len(s_t) = str.len(s_l) + str.len(s_r) + …``
-    - Literal concat propagation: when ``s = "ab"``, ``t = "cd"``, and
-      ``u = str.++(s, t)`` are all present, emit ``u = "abcd"``. Only fires
-      when every operand is pinned to a concrete literal, so it stays rare
-      rather than combinatorial.
+    - Literal concat propagation: when every operand resolves to a
+      concrete literal (directly, or via a var bound to one elsewhere in
+      the pool), emit the fully-resolved equality, e.g. ``s = "ab"``,
+      ``t = "cd"``, ``u = str.++(s, t)`` present → emit ``u = "abcd"``.
+      When only a leading or trailing *run* of operands resolves (not all
+      of them -- e.g. ``s = "ab"`` known but ``t`` isn't, with
+      ``u = str.++(s, t)``), emit the weaker ``str.prefixof("ab", u)`` (or
+      ``str.suffixof(...)`` for a trailing run) instead of emitting
+      nothing. Still one-shot per concat candidate, so still linear, not
+      combinatorial.
     """
 
     derived: list[z3.BoolRef] = []
@@ -1005,6 +1076,11 @@ def _mutate_string_bridges(
         for var, lit in ((lhs, rhs), (rhs, lhs)):
             if z3.is_string_value(lit) and _is_string_sort(var) and not z3.is_string_value(var):
                 literal_bindings[var.get_id()] = lit.as_string()
+
+    def _resolved_literal(part: z3.ExprRef) -> str | None:
+        if z3.is_string_value(part):
+            return part.as_string()
+        return literal_bindings.get(part.get_id())
 
     for candidate in relation_candidates:
         # --- String equality → equal lengths ---
@@ -1024,21 +1100,36 @@ def _mutate_string_bridges(
                     length_sum = length_sum + z3.Length(part)
                 derived.append(z3.Length(total) == length_sum)
 
-                # Literal propagation: every part resolves to a concrete
-                # string (either a literal in the concat, or a var bound to
-                # a literal elsewhere in the pool).
-                concrete_parts: list[str] = []
-                for part in parts:
-                    if z3.is_string_value(part):
-                        concrete_parts.append(part.as_string())
-                    elif part.get_id() in literal_bindings:
-                        concrete_parts.append(literal_bindings[part.get_id()])
-                    else:
-                        concrete_parts = []
-                        break
-                if concrete_parts:
-                    combined = "".join(concrete_parts)
+                resolved = [_resolved_literal(part) for part in parts]
+                if all(value is not None for value in resolved):
+                    # Every part is pinned: the whole thing is a literal.
+                    combined = "".join(resolved)  # type: ignore[arg-type]
                     derived.append(total == z3.StringVal(combined))
+                else:
+                    # Not every part is pinned, but a leading and/or
+                    # trailing run might be -- still enough to bound the
+                    # result, just with prefixof/suffixof instead of a
+                    # full equality.
+                    prefix_run: list[str] = []
+                    for value in resolved:
+                        if value is None:
+                            break
+                        prefix_run.append(value)
+                    if prefix_run and len(prefix_run) < len(resolved):
+                        derived.append(
+                            z3.PrefixOf(z3.StringVal("".join(prefix_run)), total)
+                        )
+                    suffix_run: list[str] = []
+                    for value in reversed(resolved):
+                        if value is None:
+                            break
+                        suffix_run.append(value)
+                    if suffix_run and len(suffix_run) < len(resolved):
+                        derived.append(
+                            z3.SuffixOf(
+                                z3.StringVal("".join(reversed(suffix_run))), total
+                            )
+                        )
 
         if not z3.is_app(candidate):
             continue
@@ -1053,17 +1144,22 @@ def _mutate_string_bridges(
             if lit_len is not None and _is_string_sort(subject):
                 derived.append(z3.Length(subject) >= lit_len)
 
+        # --- contains with concrete literal → length lower bound ---
+        elif kind == z3.Z3_OP_SEQ_CONTAINS and candidate.num_args() == 2:
+            # SMT-LIB: (str.contains s t) means s contains t as a
+            # substring -- s is the haystack (arg 0), t the needle
+            # (arg 1). Reversed from prefixof/suffixof's argument order.
+            subject, needle = candidate.arg(0), candidate.arg(1)
+            lit_len = _concrete_string_length(needle)
+            if lit_len is not None and _is_string_sort(subject):
+                derived.append(z3.Length(subject) >= lit_len)
+
     return derived
 
 
 def _is_string_sort(expr: z3.ExprRef) -> bool:
     """True if *expr* has Z3's Unicode string/sequence sort."""
-    try:
-        if hasattr(z3, "is_string") and z3.is_string(expr):
-            return True
-        return bool(expr.sort().is_string())
-    except Exception:
-        return False
+    return z3.is_string(expr)
 
 
 def _as_string_concat_parts(
@@ -1092,10 +1188,10 @@ def _concrete_string_length(expr: z3.ExprRef) -> int | None:
     if not z3.is_string_value(expr):
         return None
     # z3.StringVal / is_string_value: .as_string() gives the Python str.
-    try:
-        return len(expr.as_string())
-    except Exception:
-        return None
+    # Confirmed safe (no exception) across empty, unicode, emoji, and very
+    # long literals -- no try/except needed for a value already confirmed
+    # by is_string_value().
+    return len(expr.as_string())
 
 
 

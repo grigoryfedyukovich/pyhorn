@@ -340,6 +340,20 @@ def test_suffixof_literal_emits_length_lower_bound() -> None:
     assert z3.simplify(z3.Length(s) >= 3).sexpr() in got
 
 
+def test_contains_literal_emits_length_lower_bound() -> None:
+    """str.contains(s, lit) means lit is a substring of s -- the argument
+    order is reversed from prefixof/suffixof (haystack first, needle
+    second), so this exercises that the bridge reads the right argument."""
+    s = z3.String("s")
+    rel = _rel("inv", z3.StringSort())
+    candidates: CandidateMap = {rel: (z3.Contains(s, z3.StringVal("needle")),)}
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    assert z3.simplify(z3.Length(s) >= 6).sexpr() in got
+
+
 def test_concat_equality_emits_length_additivity() -> None:
     st, sl, sr = z3.Strings("st sl sr")
     rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
@@ -451,8 +465,9 @@ def test_literal_concat_propagation() -> None:
 
 
 def test_literal_concat_requires_all_operands_pinned() -> None:
-    """If only one operand is a literal, do not invent a partial concrete
-    concat for the total."""
+    """If only one operand is a literal, do not invent a full concrete
+    value for the total -- but do emit the weaker prefix/suffix bound the
+    pinned leading/trailing run actually supports."""
     s, t, u = z3.Strings("s t u")
     rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
     candidates: CandidateMap = {
@@ -470,6 +485,35 @@ def test_literal_concat_requires_all_operands_pinned() -> None:
         assert not (
             sexpr.startswith('(= u "') or sexpr.startswith('(= "') and " u)" in sexpr
         )
+
+    # Must still claim the weaker, actually-sound prefix bound: only the
+    # leading operand (s) is pinned, so u is known to start with "ab" even
+    # though its full value depends on the unpinned t.
+    expected_prefix = z3.simplify(z3.PrefixOf(z3.StringVal("ab"), u)).sexpr()
+    assert expected_prefix in got
+
+
+def test_literal_concat_partial_suffix_propagation() -> None:
+    """Symmetric to the prefix case: when only a trailing run of concat
+    operands is pinned, emit str.suffixof instead of nothing."""
+    s, t, u = z3.Strings("s t u")
+    rel = _rel("inv", z3.StringSort(), z3.StringSort(), z3.StringSort())
+    candidates: CandidateMap = {
+        rel: (
+            t == z3.StringVal("cd"),
+            u == z3.Concat(s, t),
+        )
+    }
+
+    result = mutate_candidates(candidates)
+    got = _sexprs(result.candidates.get(rel, ()))
+
+    for sexpr in got:
+        assert not (
+            sexpr.startswith('(= u "') or sexpr.startswith('(= "') and " u)" in sexpr
+        )
+    expected_suffix = z3.simplify(z3.SuffixOf(z3.StringVal("cd"), u)).sexpr()
+    assert expected_suffix in got
 
 
 def test_literal_concat_with_inline_literal_operand() -> None:

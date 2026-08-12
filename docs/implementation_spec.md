@@ -176,6 +176,34 @@ every `mutate_candidates()` call it makes, wired to `--trace-mutation-limit`
 since plain `--seed-houdini`/`--cands` pools are not normally large enough
 to need the cap.
 
+`mutate_candidates()` also derives candidates through mechanisms beyond
+numeric pairing, all subject to the same cost discipline:
+
+- **Sort-agnostic equality substitution**: any equality `a = b` (not just
+  arithmetic) rewrites every other candidate by substituting `b` for `a`
+  and vice versa. Cost is linear in candidates × equalities, bounded from
+  both sides -- `max_terms_per_relation` caps the equalities considered
+  (this is what actually keeps the iteration itself bounded: an earlier
+  version of this cap only applied to the numeric-pairing equality list,
+  not the general one substitution draws from, which independently cost
+  several seconds of pure loop overhead on a 400-equality synthetic pool
+  even with the attempt cap below already engaged) and
+  `max_equality_substitutions_per_relation` (default
+  `DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION`, 256; wired to
+  `--trace-mutation-substitution-limit`, `0` disables it) caps the total
+  rewrite attempts, independent of how many equalities fed it.
+- **Explicit String bridges** (linear, not paired): string equality → equal
+  lengths; `prefixof`/`suffixof`/`contains` against a literal → a length
+  lower bound; concat equality → length additivity, plus literal
+  propagation through the concatenation (full equality when every operand
+  is pinned, a `prefixof`/`suffixof` bound when only a leading/trailing
+  run is).
+- **Regex intersection**: two membership facts on the same subject combine
+  into membership in their intersection, letting Z3's own regex simplifier
+  do the theory work. Deliberately not extended to regex complement, given
+  this codebase's own documented history of Z3 hanging on complement-heavy
+  checks (`docs/candidate_validation_theory_coverage.md`).
+
 A separate mode from `--cands` in this release (`--mut` and a redundant
 `--seed-houdini` are both accepted directly, as above); not yet combinable
 with `--cands` or `--validate-candidates` (see the migration notes
@@ -256,7 +284,14 @@ The test suite must cover:
 - stable trace-template registry and JSON snapshot;
 - stable template IDs on generated observations;
 - bidirectional string prefix/suffix relation generation;
-- neutral candidate-generator batch compatibility and merging.
+- neutral candidate-generator batch compatibility and merging;
+- sort-agnostic equality substitution across Int/String/Array/Bool;
+- explicit String↔Int bridges (equal-length, prefix/suffix/contains length
+  bounds, concat length additivity, full and partial literal propagation);
+- regex-membership intersection on a shared subject;
+- mutation cost caps (`max_terms_per_relation`,
+  `max_equality_substitutions_per_relation`) actually bounding iteration,
+  not merely the reported counts.
 
 The full benchmark evidence and remaining limitations are documented in
 [`freqhorn_benchmark_audit.md`](freqhorn_benchmark_audit.md).

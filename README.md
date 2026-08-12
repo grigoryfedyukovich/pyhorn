@@ -248,10 +248,11 @@ set. Ported from and extends FreqHorn's `RndLearnerV3.hpp::mutateHeuristicEq`:
 Results that simplify to `True`/`False`, or that duplicate a candidate
 already present, are dropped. Nothing here reasons across two different
 predicates' candidate sets, and it runs once (derived candidates are not
-themselves re-mutated). Requires `--seed-houdini` or `--cands`; combine
-with either or both. Not ported from the original: a narrower
-constant-multiple substitution pass (turning `x = 5` and `y = 10` into
-`y = 2*x`), left for a future extension if needed.
+themselves re-mutated). Requires `--seed-houdini` or `--cands` (or, with
+`--trace-houdini`, is supported directly there instead); combine with any
+of those. Not ported from the original: a narrower constant-multiple
+substitution pass (turning `x = 5` and `y = 10` into `y = 2*x`), left for a
+future extension if needed.
 
 ```bash
 pyhorn-expl --cands examples/cands/transitive_bounds_candidates.smt2 --mut \
@@ -269,6 +270,39 @@ making the combined fact (`x<=z`) a first-class, independently-retained
 candidate, which matters when a later rule or a different predicate needs
 exactly that fact and not its ingredients (e.g. after a multi-predicate
 transition that carries `x` and `z` forward but drops `y`).
+
+`--mut` also derives candidates beyond the numeric pairing above, none of
+it limited to arithmetic:
+
+- **Sort-agnostic equality substitution.** Given any equality `a = b`
+  already in the pool -- Int, Real, String, Array, Bool, BitVec, anything
+  -- every other candidate `c` is rewritten by substituting `b` for `a`
+  and `a` for `b`. Sound for free (any model satisfying `a = b` and `c`
+  also satisfies the rewritten formula), and it subsumes many per-theory
+  bridge rules (length facts under string equality, select facts under
+  array equality) as special cases rather than needing one hand-written
+  rule per theory pair.
+- **Explicit String bridges.** `s1 = s2` → `str.len(s1) = str.len(s2)`;
+  `str.prefixof`/`str.suffixof`/`str.contains` against a concrete literal →
+  a length lower bound; `u = str.++(s, t)` → `str.len(u) = str.len(s) +
+  str.len(t)`, plus literal propagation through the concatenation --
+  `u = "abcd"` when every operand resolves to a literal, or the weaker
+  `str.prefixof("ab", u)` when only a leading run does.
+- **Regex intersection.** Two membership facts `InRe(s, R1)` and
+  `InRe(s, R2)` on the same subject become `InRe(s, Intersect(R1, R2))`;
+  Z3's own regex simplifier decides whether that's tighter than either
+  input. Deliberately *not* extended to regex complement -- this
+  codebase's own benchmarks have a documented history of Z3 hanging on
+  complement-heavy checks (see
+  [`docs/candidate_validation_theory_coverage.md`](docs/candidate_validation_theory_coverage.md)),
+  so proposing more complement-shaped candidates isn't worth the risk.
+
+`--debug` prints a second `Mutation (bridges): ...` line covering these
+(only when at least one of them found something to do), and `--json`'s
+`"mutation"` key gains `general_equalities_considered`,
+`substitution_rewrites_attempted`, `substitution_candidates_added`,
+`string_bridges_emitted`, `regex_memberships_considered`, and
+`regex_pairs_intersected` alongside the existing numeric-pairing counts.
 
 ### MultiHoudini filtering
 
@@ -649,14 +683,19 @@ pyhorn-expl --trace-houdini --mut --debug --print-invariants input.smt2
 
 Trace-sampled candidate pools can carry far more numeric equalities than
 the syntactically-mined pools `--mut` was originally sized for -- pairing
-cost is quadratic in that count -- so `--trace-houdini --mut` caps how many
-equalities and how many inequalities (independently, per predicate) `--mut`
-draws from the combined pool before pairing them up, defaulting to
-`--trace-mutation-limit 32`. Lower it for a faster but less thorough
-mutation pass, raise it for a more thorough but slower one, or set it to
-`0` to disable the cap entirely and match `--mut`'s own unbounded behavior
-outside `--trace-houdini`. `--debug`/`--json` report how many terms the cap
-dropped, if any.
+cost is quadratic in that count, and substitution's is linear in
+candidates × equalities -- so `--trace-houdini --mut` caps how many
+equalities and how many inequalities (independently, per predicate) are
+drawn from the combined pool before numeric pairing *and* how many feed
+equality substitution, all via `--trace-mutation-limit`, defaulting to 32.
+A separate `--trace-mutation-substitution-limit` (default 256) caps
+substitution's own rewrite-attempt budget, independent of how many
+equalities fed it -- the two together bound cost from both sides. Lower
+either for a faster but less thorough mutation pass, raise for more
+thorough but slower, or set to `0` to disable that particular cap and
+match `--mut`'s own unbounded behavior outside `--trace-houdini`.
+`--debug`/`--json` report how many terms and how many substitution
+attempts each cap dropped, if any.
 
 Worked examples are under
 [`examples/trace_houdini/`](examples/trace_houdini/) and

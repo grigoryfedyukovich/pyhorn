@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -323,7 +324,13 @@ def test_mutate_candidates_max_terms_per_relation_bounds_pair_count() -> None:
     assert uncapped.statistics.equalities_considered == 40
     assert uncapped.statistics.terms_dropped_by_cap == 0
     assert capped.statistics.equalities_considered == 10
-    assert capped.statistics.terms_dropped_by_cap == 30
+    # 30 dropped from the numeric-pairing list, and (since every one of
+    # these 40 candidates is also a general/sort-agnostic equality, feeding
+    # the separate equality-substitution mechanism) another 30 dropped from
+    # that list too -- both lists draw from the same input here, so the
+    # same 30-candidate truncation is counted once per list it applies to.
+    assert capped.statistics.terms_dropped_by_cap == 60
+    assert capped.statistics.general_equalities_considered == 10
     # C(10, 2) = 45 pairs vs C(40, 2) = 780: the cap must actually reduce
     # the pairing work, not just the reported count.
     assert capped.statistics.equality_pairs_combined == 45
@@ -369,3 +376,92 @@ def test_trace_houdini_mut_bounds_large_pools() -> None:
         line for line in result.stdout.splitlines() if line.startswith("Mutation:")
     )
     assert "capped=" in mutation_line
+
+
+def test_mutate_candidates_general_equalities_respects_the_same_cap() -> None:
+    """Regression test: general_equalities (which feeds sort-agnostic
+    equality substitution) must be truncated by max_terms_per_relation the
+    same way equalities/inequalities (which feed numeric pairing) already
+    are. It previously wasn't -- substitution silently saw every equality
+    in the pool regardless of the cap, which on a large synthetic pool
+    (400 equalities x 400 other candidates) cost several seconds of pure
+    Python loop overhead even with substitution's own attempt-count cap
+    already engaged, since nothing broke out of the outer loops early."""
+
+    relation = z3.Function("cap_test_rel", z3.IntSort(), z3.BoolSort())
+    x = z3.Int("x")
+    candidates: CandidateMap = {relation: tuple(x == 3**n for n in range(40))}
+
+    result = mutate_candidates(candidates, max_terms_per_relation=5)
+    assert result.statistics.general_equalities_considered == 5
+
+
+def test_run_trace_houdini_mutate_stress_pool_is_fast() -> None:
+    """The same regression at the run_trace_houdini() level, with a large
+    enough synthetic pool that the pre-fix outer-loop overhead alone would
+    have taken multiple seconds even with every cap correctly engaged
+    everywhere else. Wall-clock bounded generously (5s, the fixed version
+    should take well under 1s) so a real regression fails fast."""
+
+    relation = z3.Function("stress_rel", z3.IntSort(), z3.StringSort(), z3.BoolSort())
+    x = z3.Int("x")
+    s = z3.String("s")
+    eqs = tuple(x == 7**i for i in range(200)) + tuple(
+        z3.Length(s) == 11**i for i in range(200)
+    )
+    other = tuple(x + i >= 0 for i in range(200)) + tuple(
+        z3.Length(s) + i >= 0 for i in range(200)
+    )
+    candidates: CandidateMap = {relation: eqs + other}
+
+    start = time.monotonic()
+    result = mutate_candidates(candidates, max_terms_per_relation=3)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"mutate_candidates took {elapsed:.2f}s, expected < 5s"
+    assert result.statistics.general_equalities_considered == 3
+
+
+def test_cli_trace_mutation_substitution_limit_is_wired_through(capsys) -> None:
+    """Regression test: max_equality_substitutions_per_relation previously
+    had no CLI flag and was never passed from run_trace_houdini() to
+    mutate_candidates() at all, so it silently always used its hardcoded
+    default regardless of anything the user set. This checks the flag
+    exists, is accepted, and actually changes the reported statistics --
+    not just that the process exits 0."""
+
+    path = TRACE_EXAMPLES / "integer_affine_safe.smt2"
+    assert (
+        main(
+            [
+                "--trace-houdini",
+                "--mut",
+                "--trace-mutation-substitution-limit",
+                "1",
+                "--json",
+                str(path),
+            ]
+        )
+        == 0
+    )
+    tight = json.loads(capsys.readouterr().out)
+
+    assert (
+        main(
+            [
+                "--trace-houdini",
+                "--mut",
+                "--trace-mutation-substitution-limit",
+                "0",
+                "--json",
+                str(path),
+            ]
+        )
+        == 0
+    )
+    unlimited = json.loads(capsys.readouterr().out)
+
+    assert (
+        tight["mutation"]["substitution_rewrites_attempted"]
+        <= unlimited["mutation"]["substitution_rewrites_attempted"]
+    )
+    assert tight["mutation"]["substitution_rewrites_attempted"] <= 1

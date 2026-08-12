@@ -13,6 +13,7 @@ from z3.z3util import get_vars
 from .cands import merge_candidate_maps
 from .horn import HornProgram, HornRule
 from .seedminer import (
+    DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
     DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
     CandidateMap,
     MutationResult,
@@ -736,6 +737,9 @@ def run_trace_houdini(
     max_mutation_terms_per_relation: int | None = (
         DEFAULT_MAX_MUTATION_TERMS_PER_RELATION
     ),
+    max_mutation_substitutions_per_relation: int | None = (
+        DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
+    ),
 ) -> HoudiniResult:
     """Run staged syntactic and trace-generalized Houdini synthesis.
 
@@ -764,6 +768,13 @@ def run_trace_houdini(
     the syntactically-mined pools ``mutate_candidates()`` was originally
     sized for, and pairing cost is quadratic in that count. Pass ``None`` to
     disable the cap and match ``mutate_candidates()``'s own default.
+
+    ``max_mutation_substitutions_per_relation`` is likewise passed straight
+    through as ``mutate_candidates()``'s ``max_equality_substitutions_per_relation``.
+    It bounds a different mechanism (sort-agnostic equality substitution,
+    not the numeric pairing ``max_mutation_terms_per_relation`` bounds) with
+    its own, independent cost profile, so it gets its own knob rather than
+    reusing the same one.
     """
 
     from .candidate_generation import CandidateBatch, merge_candidate_batches
@@ -776,6 +787,9 @@ def run_trace_houdini(
         mutation_result = mutate_candidates(
             seed_candidates,
             max_terms_per_relation=max_mutation_terms_per_relation,
+            max_equality_substitutions_per_relation=(
+                max_mutation_substitutions_per_relation
+            ),
         )
         seed_candidates = merge_candidate_maps(
             seed_candidates, mutation_result.candidates
@@ -843,6 +857,9 @@ def run_trace_houdini(
         mutation_result = mutate_candidates(
             combined,
             max_terms_per_relation=max_mutation_terms_per_relation,
+            max_equality_substitutions_per_relation=(
+                max_mutation_substitutions_per_relation
+            ),
         )
         combined = merge_candidate_maps(combined, mutation_result.candidates)
     result = MultiHoudini(

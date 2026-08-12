@@ -30,6 +30,7 @@ from .houdini import (
 )
 from .normalize import HornNormalizationError
 from .seedminer import (
+    DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
     DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
     CandidateMap,
     MutationResult,
@@ -307,11 +308,29 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "with --trace-houdini --mut, cap how many equalities and how "
             "many inequalities (independently) are drawn from each "
-            "predicate's candidate pool before --mut pairs them up; 0 means "
-            "unlimited. Pairing cost is quadratic in this count, and "
-            "trace-sampled pools can carry far more equalities than "
-            "syntactically-mined ones, so the default keeps --mut "
-            f"tractable on them (default: {DEFAULT_MAX_MUTATION_TERMS_PER_RELATION})"
+            "predicate's candidate pool before --mut pairs them up "
+            "(numeric +/- combination and inequality chaining), and how "
+            "many equalities of any sort feed sort-agnostic equality "
+            "substitution; 0 means unlimited. Pairing cost is quadratic in "
+            "this count, and trace-sampled pools can carry far more "
+            "equalities than syntactically-mined ones, so the default "
+            f"keeps --mut tractable on them (default: "
+            f"{DEFAULT_MAX_MUTATION_TERMS_PER_RELATION})"
+        ),
+    )
+    parser.add_argument(
+        "--trace-mutation-substitution-limit",
+        type=_non_negative_int,
+        default=DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
+        metavar="N",
+        help=(
+            "with --trace-houdini --mut, cap how many equality-substitution "
+            "rewrite attempts (any sort -- String, Array, Bool, not just "
+            "arithmetic) are made per predicate; 0 means unlimited. A "
+            "separate knob from --trace-mutation-limit: substitution's cost "
+            "profile (candidates rewritten x equalities used as rewrite "
+            "rules) is independent of numeric pairing's "
+            f"(default: {DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION})"
         ),
     )
     parser.add_argument(
@@ -543,6 +562,27 @@ def _houdini_json(
             "terms_dropped_by_cap": (
                 mutation_result.statistics.terms_dropped_by_cap
             ),
+            "general_equalities_considered": (
+                mutation_result.statistics.general_equalities_considered
+            ),
+            "substitution_rewrites_attempted": (
+                mutation_result.statistics.substitution_rewrites_attempted
+            ),
+            "substitution_candidates_added": (
+                mutation_result.statistics.substitution_candidates_added
+            ),
+            "substitutions_dropped_by_cap": (
+                mutation_result.statistics.substitutions_dropped_by_cap
+            ),
+            "string_bridges_emitted": (
+                mutation_result.statistics.string_bridges_emitted
+            ),
+            "regex_memberships_considered": (
+                mutation_result.statistics.regex_memberships_considered
+            ),
+            "regex_pairs_intersected": (
+                mutation_result.statistics.regex_pairs_intersected
+            ),
         },
         "trace_mining": None
         if result.trace_result is None
@@ -665,6 +705,30 @@ def _print_houdini(
             f"ineq-chains={stats.inequality_chains_combined}, "
             f"added={stats.candidates_added}{capped}"
         )
+        # Sort-agnostic substitution, explicit String bridges, and regex
+        # intersection are separate mechanisms from the numeric pairing
+        # above (see mutate_candidates()'s docstring); only printed when
+        # at least one actually had something to do, so a purely-numeric
+        # benchmark's --debug output doesn't grow a second line of zeros.
+        if (
+            stats.general_equalities_considered
+            or stats.string_bridges_emitted
+            or stats.regex_memberships_considered
+        ):
+            sub_capped = (
+                f", sub-capped={stats.substitutions_dropped_by_cap}"
+                if stats.substitutions_dropped_by_cap
+                else ""
+            )
+            print(
+                f"Mutation (bridges): general-equalities="
+                f"{stats.general_equalities_considered}, "
+                f"substitutions-attempted={stats.substitution_rewrites_attempted}, "
+                f"substitutions-added={stats.substitution_candidates_added}, "
+                f"string-bridges={stats.string_bridges_emitted}, "
+                f"regex-memberships={stats.regex_memberships_considered}, "
+                f"regex-pairs={stats.regex_pairs_intersected}{sub_capped}"
+            )
     if result.trace_result is not None and debug:
         trace_stats = result.trace_result.statistics
         print(
@@ -862,6 +926,11 @@ def main(argv: list[str] | None = None) -> int:
                         None
                         if args.trace_mutation_limit == 0
                         else args.trace_mutation_limit
+                    ),
+                    max_mutation_substitutions_per_relation=(
+                        None
+                        if args.trace_mutation_substitution_limit == 0
+                        else args.trace_mutation_substitution_limit
                     ),
                 )
                 mutation_result = houdini_result.mutation_result
