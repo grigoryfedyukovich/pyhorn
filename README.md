@@ -1,24 +1,38 @@
-# PyHorn: bounded CHC exploration, seed-Houdini, and trace-guided Houdini
+# PyHorn: inductive invariants for linear CHCs
 
 This repository provides Python 3/Z3Py analysis for linear constrained Horn
-clauses. It includes exhaustive bounded trace exploration, a syntactic
-SeedMiner followed by multi-predicate Houdini filtering, and a staged
-trace-guided candidate generator that samples concrete bounded models when
-syntactic mining alone is not enough.
+clauses. Its main strength is **inductive invariant discovery**: a syntactic
+SeedMiner followed by multi-predicate Houdini filtering, candidate mutation,
+optional user-supplied seeds, and a staged trace-guided candidate generator
+that samples concrete bounded models when syntactic mining alone is not
+enough. Bounded trace exploration is supporting infrastructure—it powers
+reachability checks for candidate validation, supplies models for
+trace-guided mining, and remains available as a standalone BMC-style checker.
 
-The bounded explorer:
+The primary workflow is Seed-Houdini (and its extensions):
 
-1. parses a linear constrained Horn-clause system with Z3;
-2. normalizes every clause into a typed `HornProgram` / `HornRule` database;
-3. enumerates all ENTRY-to-error traces exhaustively in increasing length;
-4. converts each trace to an SSA verification condition using native Z3 ASTs;
-5. caches deterministic `(rule_id, step_index)` SSA instances in a bounded LRU cache;
-6. optionally dumps every checked trace as a compact, replayable
-   `bnd/expl`-compatible SMT-LIB2 unrolling;
-7. checks traces either with a cross-trace incremental solver pool or with the
-   original fresh-solver-per-trace baseline; and
-8. caches infeasible rule prefixes to prune every longer trace that begins with
-   one of them.
+```bash
+pyhorn-expl --seed-houdini --print-invariants input.smt2
+pyhorn-expl --trace-houdini --trace-depth 8 --print-invariants input.smt2
+```
+
+`Success` is reported only when the conjunction of candidates retained for each
+predicate makes **every** normalized fact, transition, and query CHC valid under
+independent, fresh-solver certification. `unknown` means either that a query
+remains satisfiable under the retained candidates or that Z3 returned
+`unknown`; it is not a claim that the input is unsafe.
+
+When invariant search returns `unknown`, or when you want a concrete
+counterexample rather than an inductive certificate, the same binary runs
+**bounded verification**: exhaustive ENTRY-to-error trace exploration up to a
+chosen depth (`--upto`), with optional models and SMT dumps. That path is
+described briefly under [Installation](#installation) and in full under
+[Bounded exploration](#bounded-exploration-supporting-engine).
+
+```bash
+# Search for a counterexample within a bound (BMC-style)
+pyhorn-expl --upto 20 --model input.smt2
+```
 
 ## Supported input formats
 
@@ -121,31 +135,6 @@ Int+Real+String example -- plus one this tool cannot solve, an Int+String
 problem whose safety argument needs a modular/parity invariant that
 syntactic candidate mining cannot express (see that directory's README).
 
-## Original FreqHorn benchmark coverage
-
-The parser and type checker have been run over all three original FreqHorn
-benchmark suites:
-
-| Suite | Files | Normalized CHCs |
-|---|---:|---:|
-| `bench_horn` | 352 | 1,056 |
-| `bench_horn_cex` | 79 | 435 |
-| `bench_horn_multiple` | 176 | 953 |
-| **Total** | **607** | **2,444** |
-
-All files parse successfully. Legacy files that omit `(query fail)` are accepted
-only when there is exactly one terminal nullary relation; ambiguous implicit
-queries are rejected.
-
-The corpus exercises integer, real, Boolean, array, and bit-vector expressions;
-constants and expressions in relation arguments; `ite`, arithmetic, `div`,
-`mod`, nonlinear multiplication, `select`, `store`, constant arrays,
-`define-fun`, `distinct`, annotations, and quantified constraints.
-
-Ten theory/operator examples live in `examples/bench_horn/`. Additional
-benchmark-driven edge cases live in `examples/freqhorn_corner_cases/`. The full
-audit, solve counts, fixes, and remaining candidate-language gaps are documented
-in [`docs/freqhorn_benchmark_audit.md`](docs/freqhorn_benchmark_audit.md).
 
 ## Installation
 
@@ -153,18 +142,26 @@ in [`docs/freqhorn_benchmark_audit.md`](docs/freqhorn_benchmark_audit.md).
 python3 -m pip install .
 ```
 
-This installs both command names:
+This installs both command names (`pyhorn-expl` and `chc-bounded-explorer`).
+Typical invocations:
 
 ```bash
+# Inductive invariants (main strength)
+pyhorn-expl --seed-houdini --print-invariants input.smt2
+pyhorn-expl --trace-houdini --trace-depth 8 --print-invariants input.smt2
+
+# Bounded verification / counterexample search (when invariants return unknown)
+pyhorn-expl --upto 20 --model input.smt2
 chc-bounded-explorer --upto 20 input.smt2
-pyhorn-expl --upto 20 input.smt2
 ```
 
 It can also be run directly without installation:
 
 ```bash
+python3 bounded_explorer.py --seed-houdini examples/seed_houdini/counter_safe.smt2
 python3 bounded_explorer.py --upto 20 examples/assert_syntax.smt2
 ```
+
 
 ## SeedMiner and MultiHoudini
 
@@ -603,30 +600,6 @@ nothing is removed on replay. The test is skipped, not run, when
 runs and in CI -- the same convention `PYHORN_BENCH_HORN_DIR` uses for the
 external corpus regression.
 
-### Corpus audit
-
-Reproduce a suite run with:
-
-```bash
-PYTHONPATH=src python3 tools/check_seed_houdini_corpus.py \
-  /path/to/bench_horn \
-  --timeout 1000 \
-  --random-seed 1
-```
-
-With a 1,000 ms per-check timeout and seed 1, version 0.0.11 produced:
-
-| Suite | Success | Unknown | Errors |
-|---|---:|---:|---:|
-| `bench_horn` | 115 | 237 | 0 |
-| `bench_horn_cex` | 0 | 79 | 0 |
-| `bench_horn_multiple` | 29 | 147 | 0 |
-
-No known counterexample benchmark was reported as `Success`. Results may vary
-slightly with Z3 version and timeout behavior; `unknown` is always conservative.
-See [`docs/freqhorn_benchmark_audit.md`](docs/freqhorn_benchmark_audit.md) for
-bounded-exploration results and corner-case analysis.
-
 ### Trace-guided candidate generation (`--trace-houdini`)
 
 `--seed-houdini`, `--cands`, and `--mut` all propose candidates from what is
@@ -711,6 +684,30 @@ proposal engines -- statistical, learned, or otherwise -- without changing
 MultiHoudini or the certification boundary; see
 [`docs/candidate_generator_api.md`](docs/candidate_generator_api.md).
 
+
+## Bounded exploration (supporting engine)
+
+The bounded explorer is the engine used internally by `--trace-houdini` and
+`--validate-candidates`, and is available standalone for short counterexamples
+and replayable unrollings. It:
+
+1. parses a linear constrained Horn-clause system with Z3;
+2. normalizes every clause into a typed `HornProgram` / `HornRule` database;
+3. enumerates all ENTRY-to-error traces exhaustively in increasing length;
+4. converts each trace to an SSA verification condition using native Z3 ASTs;
+5. caches deterministic `(rule_id, step_index)` SSA instances in a bounded LRU cache;
+6. optionally dumps every checked trace as a compact, replayable
+   `bnd/expl`-compatible SMT-LIB2 unrolling;
+7. checks traces either with a cross-trace incremental solver pool or with the
+   original fresh-solver-per-trace baseline; and
+8. caches infeasible rule prefixes to prune every longer trace that begins with
+   one of them.
+
+```bash
+pyhorn-expl --upto 20 input.smt2
+python3 bounded_explorer.py --upto 20 examples/assert_syntax.smt2
+```
+
 ## Solver modes
 
 The default mode is a cross-trace incremental pool retaining at most 16
@@ -776,6 +773,7 @@ processes and compare at least:
 
 In fresh mode, `pushes`, `pops`, and retained `contexts` are always zero, while
 `solvers_created` equals the number of traces actually checked.
+
 
 ## Important options
 
@@ -860,6 +858,7 @@ same generated name are replaced; unrelated files in the directory are kept.
 its output against the 36 C++ reference dumps is not part of the bundled test
 suite, since those reference files are not included in this checkout.
 
+
 ## Incremental solver-pool reuse
 
 In `pool` mode, the explorer:
@@ -880,6 +879,7 @@ The `--debug` output reports the selected solver mode, configured pool limit,
 solvers created, recycled contexts, retained contexts, reused prefix steps,
 pushes, pops, checks, and SSA-cache size/hits/misses/evictions. The same counters,
 `solver_mode`, and `max_contexts` are included in `--json` output.
+
 
 ## Python API
 
@@ -951,6 +951,7 @@ from pyhorn_bnd import format_candidates_smt2
 dump_text = format_candidates_smt2(result.candidates, miner.variables)
 ```
 
+
 ## Literature-derived string invariant benchmarks
 
 The repository includes nine nontrivial CHC examples under
@@ -977,6 +978,7 @@ returns `unknown` on four safe regular-language problems that require DFA or
 modulo-count invariant synthesis. The benchmark origins, known invariants, and
 proposed L*/SAT-based automata-learning architecture are documented in
 [`docs/string_invariant_literature.md`](docs/string_invariant_literature.md).
+
 
 ## Repository layout
 
@@ -1024,6 +1026,7 @@ The implementation contract is documented in
 [`docs/implementation_spec.md`](docs/implementation_spec.md). Detailed Houdini
 solver semantics are in
 [`docs/houdini_incremental_solver_spec.md`](docs/houdini_incremental_solver_spec.md).
+
 
 ## Tests
 
