@@ -729,13 +729,17 @@ def mutate_candidates(
 
     Sort-agnostic equality substitution (new): given any equality ``a = b``
     (any sort: Int, Real, String, Array, Bool, BitVec, …) already in the
-    pool, every other candidate ``c`` is rewritten by substituting ``b`` for
-    ``a`` and ``a`` for ``b``. The resulting formulas are valid under the
-    invariant ``a = b``, so the rewrite is sound for free. This subsumes
-    many per-theory “bridge” rules (e.g. length facts under string equality,
-    select facts under array equality) as special cases. Cost is linear in
-    |candidates| × |equalities|; *max_equality_substitutions_per_relation*
-    bounds the number of rewrite attempts per relation (default
+    pool, every other candidate ``c`` is rewritten by substituting under
+    that equality. Orientations that replace a concrete literal with a
+    non-literal (e.g. ``"B"`` → variable) are skipped so structural
+    constants inside regexes and similar templates stay intact;
+    specialization (variable → literal) and variable renames are kept.
+    The resulting formulas are valid under the invariant ``a = b``, so the
+    rewrite is sound for free. This subsumes many per-theory “bridge”
+    rules (e.g. length facts under string equality, select facts under
+    array equality) as special cases. Cost is linear in |candidates| ×
+    |equalities|; *max_equality_substitutions_per_relation* bounds the
+    number of rewrite attempts per relation (default
     :data:`DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION`). Pass ``None``
     to disable the bound.
 
@@ -963,6 +967,19 @@ def _as_any_equality(
     return (candidate.arg(0), candidate.arg(1))
 
 
+def _is_concrete_value(expr: z3.ExprRef) -> bool:
+    """True for ground literals (string/int/real/bool/BV values), not variables."""
+    return bool(
+        z3.is_string_value(expr)
+        or z3.is_int_value(expr)
+        or z3.is_rational_value(expr)
+        or z3.is_algebraic_value(expr)
+        or z3.is_true(expr)
+        or z3.is_false(expr)
+        or z3.is_bv_value(expr)
+    )
+
+
 def _mutate_equality_substitutions(
     relation_candidates: tuple[z3.BoolRef, ...] | list[z3.BoolRef],
     equalities: list[tuple[z3.ExprRef, z3.ExprRef]],
@@ -972,10 +989,20 @@ def _mutate_equality_substitutions(
     """Rewrite other candidates by substituting under any equality ``a = b``.
 
     For every equality ``(a, b)`` and every candidate ``c`` that is not that
-    equality itself, emit ``c[b/a]`` and ``c[a/b]``. Sound because any model
-    of the invariant set that satisfies ``a = b`` also satisfies the
-    rewritten formula. Linear in |candidates| × |equalities|; *max_rewrites*
-    caps the number of rewrite attempts (both orientations count).
+    equality itself, emit ``c[b/a]`` and ``c[a/b]`` when the rewrite is a
+    specialization or a pure variable renaming. Sound because any model of
+    the invariant set that satisfies ``a = b`` also satisfies the rewritten
+    formula. Linear in |candidates| × |equalities|; *max_rewrites* caps the
+    number of rewrite attempts (both orientations count).
+
+    Orientations that replace a concrete literal with a non-literal
+    (e.g. ``"B"`` → ``__inv_0`` under ``(= __inv_0 "B")``) are skipped.
+    Those rewrites are still logically implied by the equality, but they
+    destroy structural constants inside regexes (``str.to_re "B"`` becomes
+    ``str.to_re __inv_0``), length templates, and other literal-shaped
+    candidates, producing formulas that fail initiation and waste Houdini
+    budget. Specialization (variable → literal) and variable-to-variable
+    renames are kept.
 
     Stops iterating entirely once *max_rewrites* is reached, rather than
     continuing to loop with the cap merely suppressing the substitute call:
@@ -1025,6 +1052,11 @@ def _mutate_equality_substitutions(
                     capped_out = True
                     break
                 attempted += 1
+                # Do not replace a concrete literal with a non-literal.
+                # That orientation turns str.to_re("B") into str.to_re(var)
+                # and similarly wrecks other constant-shaped templates.
+                if _is_concrete_value(src) and not _is_concrete_value(dst):
+                    continue
                 rewritten = z3.substitute(candidate, (src, dst))
                 if rewritten.eq(candidate):
                     # No occurrence of src; skip.

@@ -16,6 +16,23 @@ pyhorn-expl --seed-houdini --print-invariants input.smt2
 pyhorn-expl --trace-houdini --trace-depth 8 --print-invariants input.smt2
 ```
 
+### PhaseFit (branching loops)
+
+For transitions that contain nested `ite` / `mod` (the syntactic class that
+classic phase-counter approaches often reject), PhaseFit offers a weaker
+guess-then-validate strategy:
+
+```bash
+pyhorn-expl --phasefit --print-invariants input.smt2
+# can be combined with seed mining
+pyhorn-expl --phasefit --seed-houdini --print-invariants input.smt2
+```
+
+It flattens guarded updates, computes simple affine closed forms per branch,
+discovers monotonic or periodic phase boundaries, and feeds the resulting
+interval lemmas into MultiHoudini. See
+`docs/phasefit-branching-loop-solver-design.md` for the design sketch.
+
 `Success` is reported only when the conjunction of candidates retained for each
 predicate makes **every** normalized fact, transition, and query CHC valid under
 independent, fresh-solver certification. `unknown` means either that a query

@@ -8,7 +8,7 @@ version = "0.0.18"
 description = "Python/Z3 bounded exploration, seed-Houdini, and trace-guided Houdini analysis for linear CHCs"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["z3-solver>=4.13.0.0,<5"]
+dependencies = ["z3-solver>=4.13.0.0,<5", "sympy>=1.12,<2"]
 
 [project.scripts]
 pyhorn-expl = "pyhorn_bnd.cli:main"

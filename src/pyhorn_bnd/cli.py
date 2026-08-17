@@ -147,6 +147,17 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--phasefit",
+        action="store_true",
+        help=(
+            "run PhaseFit synthesis for branching (ite/mod) loops: extract "
+            "guarded branches, compute per-branch closed forms, discover "
+            "phase boundaries, and feed the resulting interval lemmas plus "
+            "seed atoms into MultiHoudini. Can be combined with "
+            "--seed-houdini (candidates are merged)."
+        ),
+    )
+    parser.add_argument(
         "--cands",
         type=Path,
         metavar="FILE",
@@ -852,8 +863,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--validate-candidates requires --seed-houdini or --cands")
     if args.mut and not (
         args.seed_houdini or args.cands is not None or args.trace_houdini
+        or args.phasefit
     ):
-        parser.error("--mut requires --seed-houdini, --cands, or --trace-houdini")
+        parser.error("--mut requires --seed-houdini, --cands, --trace-houdini, or --phasefit")
     if args.candidate_bound < 1:
         parser.error("--candidate-bound must be at least 1")
     if args.dump_promising_candidates is not None and not args.validate_candidates:
@@ -864,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         # be relevant to invariants that are mined or user-supplied.
         houdini_mode = (
             args.seed_houdini or args.cands is not None or args.trace_houdini
+            or args.phasefit
         )
         program = parse_chc_file(
             args.file,
@@ -949,6 +962,24 @@ def main(argv: list[str] | None = None) -> int:
                 if args.cands is not None:
                     user_candidates = parse_candidate_file(args.cands, miner.variables)
                     candidates = merge_candidate_maps(candidates, user_candidates)
+
+                if args.phasefit:
+                    from .phasefit import run_phasefit
+                    # Ensure we have a seed_result for atom harvesting. If we
+                    # had to mine it fresh here (i.e. --seed-houdini wasn't
+                    # also given), merge its candidates in too -- otherwise
+                    # relations PhaseFit doesn't touch (or fails to split)
+                    # would get no candidates at all from a --phasefit-only
+                    # run, contradicting --phasefit's own help text.
+                    if seed_result is None:
+                        seed_result = miner.mine()
+                        candidates = merge_candidate_maps(
+                            candidates, seed_result.candidates
+                        )
+                    _pf_results, pf_cands = run_phasefit(
+                        program, seed_result=seed_result
+                    )
+                    candidates = merge_candidate_maps(candidates, pf_cands)
 
                 if args.mut:
                     # Applies to whatever's in `candidates` at this point --
