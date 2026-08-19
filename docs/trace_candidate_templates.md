@@ -217,6 +217,36 @@ inclusive. Empty strings contribute no characters. This template permits any
 string over the observed alphabet; it does not preserve order or character
 counts.
 
+### `string.char-count-modulo`
+
+Formula schema:
+
+```smt2
+(str.in_re s <regex for count(c) ≡ r (mod m)>)
+```
+
+For each observed character `c` and each modulus
+`2 <= m <= max_congruence_modulus` (capped at 3 when the alphabet has more
+than two symbols), the miner emits a candidate when every retained sample has
+the same residue `r = count(s, c) mod m`. Empty strings contribute count 0.
+The regex is built from the standard counting DFA over the observed alphabet;
+parity (mod 2) uses a compact specialised form. This is the template that
+captures the classic coffee-can odd-white invariant.
+
+### `string.char-count-modulo-set`
+
+Formula schema:
+
+```smt2
+(str.in_re s (re.union <regex for count(c) ≡ r (mod m)> ...))
+```
+
+When the observed residues of `count(s, c) mod m` form a proper subset `R` of
+`{0,...,m-1}` with `|R| >= 2`, emit the union of the single-residue languages
+for each `r in R`. Same alphabet and modulus limits as
+`string.char-count-modulo`. This captures invariants such as the MU-puzzle
+property `count(I) ≢ 0 (mod 3)` (observed residues `{1,2}`).
+
 ### `string.equality`
 
 Formula:
@@ -296,7 +326,9 @@ The trace miner currently does not generate:
 - quantified formulas;
 - array-content or array-index invariants;
 - bit-vector masks, extracts, signed ranges, or modular arithmetic on bit-vectors;
-- arbitrary regexes or inferred automata;
+- arbitrary regexes or inferred automata beyond alphabet closure and
+  character-count modulo / modulo-set;
+- disjunctive character-count residues (e.g. count(c) ≢ 0 mod 3);
 - substring, containment, replacement, or index relations;
 - string length inequalities involving constants not observed as extrema;
 - concatenation with constants or repeated operands;

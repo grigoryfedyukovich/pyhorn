@@ -46,6 +46,8 @@ class TraceTemplateId(str, Enum):
     STRING_COMMON_PREFIX = "string.common-prefix"
     STRING_COMMON_SUFFIX = "string.common-suffix"
     STRING_ALPHABET_CLOSURE = "string.observed-alphabet-closure"
+    STRING_CHAR_COUNT_MODULO = "string.char-count-modulo"
+    STRING_CHAR_COUNT_MODULO_SET = "string.char-count-modulo-set"
     STRING_EQUALITY = "string.equality"
     STRING_PREFIX_RELATION = "string.prefix-relation"
     STRING_SUFFIX_RELATION = "string.suffix-relation"
@@ -169,6 +171,40 @@ TRACE_TEMPLATE_SPECIFICATIONS: tuple[TraceTemplateSpecification, ...] = (
         (
             "The union of Unicode characters observed in all samples has "
             "size 1..16. Empty strings contribute no character."
+        ),
+    ),
+    TraceTemplateSpecification(
+        TraceTemplateId.STRING_CHAR_COUNT_MODULO,
+        "String/RegLan",
+        "(str.in_re s <regex for count(c) ≡ r (mod m)>)",
+        (
+            "string predicate argument s",
+            "observed character c",
+            "modulus m in 2..max_congruence_modulus",
+        ),
+        (
+            "For each observed character c and each modulus "
+            "2 <= m <= max_congruence_modulus, all sampled strings have the "
+            "same residue r = count(s, c) mod m. Empty strings contribute "
+            "count 0 for every character."
+        ),
+    ),
+    TraceTemplateSpecification(
+        TraceTemplateId.STRING_CHAR_COUNT_MODULO_SET,
+        "String/RegLan",
+        "(str.in_re s (re.union <regexes for count(c) ≡ r (mod m), r in R>))",
+        (
+            "string predicate argument s",
+            "observed character c",
+            "modulus m in 2..max_congruence_modulus",
+        ),
+        (
+            "For each observed character c and each modulus "
+            "2 <= m <= max_congruence_modulus, the set R of residues "
+            "count(s, c) mod m across samples is a proper nonempty subset "
+            "of {0,...,m-1} with |R| >= 2 (some residues are never "
+            "observed). Emits the union of the single-residue languages "
+            "for r in R. Captures invariants such as count(c) ≢ 0 (mod 3)."
         ),
     ),
     TraceTemplateSpecification(
@@ -600,6 +636,81 @@ class TraceCandidateMiner:
                     f"string-{index}-alphabet",
                     z3.InRe(variable, z3.Star(alphabet_re)),
                 )
+            # Leading-symbol alphabet: every sample is c · (Σ \ {c})*.
+            # Stronger and much cheaper for the solver than a count-modulo
+            # regex for a character that appears exactly once as a prefix
+            # (e.g. MU-puzzle strings are M(I|U)*).
+            if prefix and len(prefix) == 1 and 0 < len(alphabet) <= 16:
+                lead = prefix[0]
+                if all(value.count(lead) == 1 for value in concrete):
+                    rest = [c for c in alphabet if c != lead]
+                    if rest:
+                        rest_re = z3.Re(z3.StringVal(rest[0]))
+                        for c in rest[1:]:
+                            rest_re = z3.Union(rest_re, z3.Re(z3.StringVal(c)))
+                        lead_re = z3.Concat(
+                            z3.Re(z3.StringVal(lead)), z3.Star(rest_re)
+                        )
+                        yield (
+                            TraceTemplateId.STRING_ALPHABET_CLOSURE,
+                            f"string-{index}-leading-{lead}-alphabet",
+                            z3.InRe(variable, lead_re),
+                        )
+
+            # Character-count modulo templates (parity, mod-3, residue sets).
+            # Only emit when the observed alphabet is small enough that the
+            # resulting regex stays manageable. Prefer small moduli; higher
+            # moduli are emitted only for binary alphabets where the regex
+            # remains compact.
+            #
+            # Characters with a *constant* raw count across all samples are
+            # skipped: a stack of M-count-mod-2/3/... regexes (always 1 M in
+            # MU samples) makes induction checks unknown without adding
+            # strength beyond prefix / leading-symbol patterns.
+            if 0 < len(alphabet) <= 8:
+                # m=2 (parity) and m=3 cover coffee-can / MU; higher moduli
+                # only bloat the pool and make induction checks unknown.
+                max_m = min(3, self.max_congruence_modulus)
+                for char in alphabet:
+                    counts = [value.count(char) for value in concrete]
+                    if len(set(counts)) == 1:
+                        continue
+                    for modulus in range(2, max_m + 1):
+                        residues = {count % modulus for count in counts}
+                        if not residues:
+                            continue
+                        if len(residues) == 1:
+                            residue = next(iter(residues))
+                            regex = _char_count_mod_regex(
+                                char, modulus, residue, alphabet
+                            )
+                            if regex is None:
+                                continue
+                            yield (
+                                TraceTemplateId.STRING_CHAR_COUNT_MODULO,
+                                f"string-{index}-count-{char}-mod-{modulus}-{residue}",
+                                z3.InRe(variable, regex),
+                            )
+                            continue
+                        # Proper subset with multiple residues (e.g. #I ≢ 0 mod 3).
+                        if len(residues) >= modulus:
+                            continue
+                        # Prefer classic "avoid residue 0" / almost-full sets.
+                        if 0 in residues and len(residues) < modulus - 1:
+                            continue
+                        set_re = _char_count_mod_set_regex(
+                            char, modulus, residues, alphabet
+                        )
+                        if set_re is None:
+                            continue
+                        residue_label = "-".join(
+                            str(r) for r in sorted(residues)
+                        )
+                        yield (
+                            TraceTemplateId.STRING_CHAR_COUNT_MODULO_SET,
+                            f"string-{index}-count-{char}-mod-{modulus}-in-{residue_label}",
+                            z3.InRe(variable, set_re),
+                        )
 
     def _numeric_features(
         self,
@@ -874,6 +985,165 @@ def _common_prefix(values: tuple[str, ...]) -> str:
 def _common_suffix(values: tuple[str, ...]) -> str:
     reversed_values = tuple(value[::-1] for value in values)
     return _common_prefix(reversed_values)[::-1]
+
+
+def _char_count_mod_regex(
+    char: str,
+    modulus: int,
+    residue: int,
+    alphabet: list[str],
+) -> z3.ReRef | None:
+    """Build a regex accepting strings over ``alphabet`` whose count of
+    ``char`` is congruent to ``residue`` modulo ``modulus``.
+
+    Uses the standard m-state counting DFA and converts it to a regular
+    expression by state elimination. Returns ``None`` when the construction
+    is refused (empty alphabet, invalid residue, or modulus out of range).
+    """
+    if modulus < 2 or not (0 <= residue < modulus) or not alphabet:
+        return None
+    if char not in alphabet:
+        return None
+
+    # Symbols that do not change the count.
+    others = [c for c in alphabet if c != char]
+    char_re = z3.Re(z3.StringVal(char))
+    if others:
+        other_res = [z3.Re(z3.StringVal(c)) for c in others]
+        other_re = other_res[0]
+        for re in other_res[1:]:
+            other_re = z3.Union(other_re, re)
+        # Stay-transition: zero or more non-counted symbols.
+        stay = z3.Star(other_re)
+    else:
+        # Alphabet is {char} only; stay is empty string.
+        stay = z3.Re(z3.StringVal(""))
+
+    # Special-case the common and most useful instances with compact regexes.
+    # Odd count of ``char`` over a binary alphabet (coffee-can).
+    if modulus == 2 and residue == 1 and others:
+        # (others)* char ( (others)* char (others)* char )* (others)*
+        # i.e. odd number of char.
+        return z3.Concat(
+            stay,
+            char_re,
+            z3.Star(z3.Concat(stay, char_re, stay, char_re)),
+            stay,
+        )
+    # Even count (including zero).
+    if modulus == 2 and residue == 0 and others:
+        # ( (others)* char (others)* char )* (others)*
+        return z3.Concat(
+            z3.Star(z3.Concat(stay, char_re, stay, char_re)),
+            stay,
+        )
+    def _repeat(unit: z3.ReRef, times: int) -> z3.ReRef:
+        """Concatenate ``unit`` with itself ``times`` times (times >= 1)."""
+        result = unit
+        for _ in range(times - 1):
+            result = z3.Concat(result, unit)
+        return result
+
+    # Pure powers of a single character.
+    if not others:
+        # char^k where k ≡ residue (mod modulus)
+        # (char^modulus)* char^residue
+        if residue == 0:
+            return z3.Star(_repeat(char_re, modulus))
+        prefix = char_re if residue == 1 else _repeat(char_re, residue)
+        cycle = _repeat(char_re, modulus)
+        return z3.Concat(z3.Star(cycle), prefix)
+
+    # General small-modulus construction via a loop of "blocks".
+    # Language: strings whose number of ``char`` ≡ residue (mod m).
+    # Regex shape:
+    #   stay (char stay)^{residue} ( (char stay)^{modulus} )*
+    # which is correct when the alphabet is partitioned into {char} ∪ others.
+    step = z3.Concat(char_re, stay)
+    if residue == 0:
+        block = _repeat(step, modulus)
+        return z3.Concat(stay, z3.Star(block))
+    head = step if residue == 1 else _repeat(step, residue)
+    block = _repeat(step, modulus)
+    return z3.Concat(stay, head, z3.Star(block))
+
+
+def _char_count_mod_set_regex(
+    char: str,
+    modulus: int,
+    residues: set[int],
+    alphabet: list[str],
+) -> z3.ReRef | None:
+    """Regex for count(char) mod modulus ∈ residues over ``alphabet``.
+
+    Builds a single compact expression from the counting DFA rather than a
+    naive union of full single-residue regexes, which helps the string solver
+    on induction checks (e.g. MU-puzzle doubling).
+    """
+    if modulus < 2 or not alphabet or not residues:
+        return None
+    if char not in alphabet:
+        return None
+    if any(r < 0 or r >= modulus for r in residues):
+        return None
+    # Full set = alphabet closure; not useful as a modulo invariant.
+    if len(residues) >= modulus:
+        return None
+
+    others = [c for c in alphabet if c != char]
+    char_re = z3.Re(z3.StringVal(char))
+    if others:
+        other_re = z3.Re(z3.StringVal(others[0]))
+        for c in others[1:]:
+            other_re = z3.Union(other_re, z3.Re(z3.StringVal(c)))
+        stay = z3.Star(other_re)
+    else:
+        stay = z3.Re(z3.StringVal(""))
+
+    def _repeat(unit: z3.ReRef, times: int) -> z3.ReRef:
+        result = unit
+        for _ in range(times - 1):
+            result = z3.Concat(result, unit)
+        return result
+
+    step = z3.Concat(char_re, stay)
+    cycle = _repeat(step, modulus) if modulus > 1 else step
+
+    # Special case: all nonzero residues (count ≢ 0 mod m) — one compact form.
+    nonzero = set(range(1, modulus))
+    if residues == nonzero:
+        # stay · step · (step^{m})* · (ε ∪ step ∪ ... ∪ step^{m-2})
+        # i.e. at least one counted char, residue in 1..m-1.
+        if modulus == 2:
+            # Odd: stay char (stay char stay char)* stay
+            return z3.Concat(
+                stay, char_re, z3.Star(z3.Concat(stay, char_re, stay, char_re)), stay
+            )
+        # After first step (res 1), any number of full cycles, then optional
+        # extra 0..m-2 steps (still avoiding 0).
+        tails: list[z3.ReRef] = [z3.Re(z3.StringVal(""))]  # +0 steps
+        for k in range(1, modulus - 1):
+            tails.append(_repeat(step, k))
+        tail_union = tails[0]
+        for t in tails[1:]:
+            tail_union = z3.Union(tail_union, t)
+        return z3.Concat(stay, step, z3.Star(cycle), tail_union)
+
+    # General: union over r in residues of stay · step^r · cycle* (r>0),
+    # and stay · cycle* for r=0.
+    parts: list[z3.ReRef] = []
+    for r in sorted(residues):
+        if r == 0:
+            parts.append(z3.Concat(stay, z3.Star(cycle)))
+        else:
+            head = step if r == 1 else _repeat(step, r)
+            parts.append(z3.Concat(stay, head, z3.Star(cycle)))
+    if not parts:
+        return None
+    result = parts[0]
+    for p in parts[1:]:
+        result = z3.Union(result, p)
+    return result
 
 
 def _nullspace(matrix: list[list[Fraction]]) -> tuple[tuple[Fraction, ...], ...]:

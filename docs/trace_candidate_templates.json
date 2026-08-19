@@ -109,6 +109,28 @@
   },
   {
     "applicable_features": [
+      "string predicate argument s",
+      "observed character c",
+      "modulus m in 2..max_congruence_modulus"
+    ],
+    "domain": "String/RegLan",
+    "emission_condition": "For each observed character c and each modulus 2 <= m <= max_congruence_modulus, all sampled strings have the same residue r = count(s, c) mod m. Empty strings contribute count 0 for every character.",
+    "formula_schema": "(str.in_re s <regex for count(c) ≡ r (mod m)>)",
+    "id": "string.char-count-modulo"
+  },
+  {
+    "applicable_features": [
+      "string predicate argument s",
+      "observed character c",
+      "modulus m in 2..max_congruence_modulus"
+    ],
+    "domain": "String/RegLan",
+    "emission_condition": "For each observed character c and each modulus 2 <= m <= max_congruence_modulus, the set R of residues count(s, c) mod m across samples is a proper nonempty subset of {0,...,m-1} with |R| >= 2. Emits the union of single-residue languages for r in R (e.g. count(c) ≢ 0 mod 3).",
+    "formula_schema": "(str.in_re s (re.union <regexes for count(c) ≡ r (mod m), r in R>))",
+    "id": "string.char-count-modulo-set"
+  },
+  {
+    "applicable_features": [
       "two distinct string predicate arguments"
     ],
     "domain": "String",
