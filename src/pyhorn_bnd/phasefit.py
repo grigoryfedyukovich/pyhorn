@@ -9,7 +9,8 @@ MultiHoudini / checkFact / checkConsecution / checkQuery before acceptance.
 
 Pipeline overview
 -----------------
-1. extract_guarded_branches  – flatten nested ite into (guard, pure update)
+1. extract_mbp_guarded_branches – enumerate phase guards with model-based projection
+   (with the existing ite flattener as a fallback)
 2. seed atoms                – reuse SeedMiner
 3. per-branch closed forms   – affine / simple recurrence closed forms via sympy
 4. guard_as_function_of_index – substitute closed forms, detect mono crossover
@@ -75,12 +76,22 @@ class GuardedUpdate:
 
 @dataclass
 class Branch:
-    """A simultaneous pure update for several variables under a common guard."""
+    """A simultaneous pure update for several variables under a common guard.
+
+    ``witness_model`` and ``guard_source`` make the control-flow provenance
+    explicit for MBP-derived phases: the guard and update arm are selected
+    from the same transition model, and downstream Phase/lemma construction
+    keeps them together.
+    """
 
     guard: z3.BoolRef
     updates: dict[z3.ExprRef, z3.ExprRef]  # post_var -> pure expr in pre vars
     # Optional name for debugging
     label: str = ""
+    # Representative transition model used to select the update arm.
+    witness_model: z3.ModelRef | None = None
+    # Provenance for the guard; e.g. "mbp" or "ite-flatten".
+    guard_source: str = ""
 
 
 @dataclass
@@ -353,6 +364,419 @@ def extract_guarded_branches(
         return unique
     else:
         return extract_guarded_branches(rule, per_variable=True)
+
+
+# ---------------------------------------------------------------------------
+# 2b. MBP-based phase guards (ImplCheck-style)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MBPPhase:
+    """One model-guided projection of a transition onto source variables."""
+
+    guard: z3.BoolRef
+    model: z3.ModelRef
+
+
+def _transition_formula(rule: HornRule) -> z3.BoolRef | None:
+    """Return the rule-local transition constraint, excluding CHC relations.
+
+    For an inductive rule, ``rule.body`` contains the source relation atom plus
+    transition constraints (and occasionally auxiliary relation-free atoms).
+    MBP should project the latter, not quantify over the source predicate.
+    """
+    if not rule.is_inductive:
+        return None
+    conjuncts = list(rule.body.children()) if z3.is_and(rule.body) else [rule.body]
+    tr: list[z3.BoolRef] = []
+    for c in conjuncts:
+        if z3.is_app(c) and c.decl() in {
+            rule.src_relation,
+            rule.dst_relation,
+        }:
+            continue
+        tr.append(c)
+    return z3.And(*tr) if tr else z3.BoolVal(True)
+
+
+def _expand_term_ites_in_formula(formula: z3.BoolRef) -> z3.BoolRef:
+    """Expand term-level ITEs into Boolean branching before MBP literal selection.
+
+    The ImplCheck MBP algorithm operates on Boolean literals in NNF.  CHC
+    frontends commonly encode control flow as term-level ``ite`` inside SSA
+    equalities, so we expose those alternatives logically here.  This is only
+    a local Boolean expansion; MBP still avoids eagerly converting the whole
+    transition relation to a global DNF.
+    """
+    if z3.is_and(formula):
+        return z3.And(*[_expand_term_ites_in_formula(c) for c in formula.children()])
+    if z3.is_or(formula):
+        return z3.Or(*[_expand_term_ites_in_formula(c) for c in formula.children()])
+    if z3.is_not(formula):
+        return z3.Not(_expand_term_ites_in_formula(formula.arg(0)))
+    if not z3.is_app(formula) or formula.num_args() == 0:
+        return formula
+
+    # Look for a top-level term ITE in any argument.  Split only on the first
+    # one and recurse, preserving sharing/order through nested conditionals.
+    for i, child in enumerate(formula.children()):
+        if _is_ite(child):
+            cond, then_t, else_t = child.arg(0), child.arg(1), child.arg(2)
+            then_args = list(formula.children())
+            else_args = list(formula.children())
+            then_args[i] = then_t
+            else_args[i] = else_t
+            then_atom = formula.decl()(*then_args)
+            else_atom = formula.decl()(*else_args)
+            return z3.Or(
+                z3.And(cond, _expand_term_ites_in_formula(then_atom)),
+                z3.And(z3.Not(cond), _expand_term_ites_in_formula(else_atom)),
+            )
+
+    rebuilt = formula
+    try:
+        kids = [_expand_term_ites_in_formula(c) if z3.is_bool(c) else c
+                for c in formula.children()]
+        if any(not a.eq(b) for a, b in zip(kids, formula.children())):
+            rebuilt = formula.decl()(*kids)
+    except z3.Z3Exception:
+        pass
+    return rebuilt
+
+
+def _nnf_formula(formula: z3.BoolRef) -> z3.BoolRef | None:
+    """Normalize *formula* to NNF using Z3's tactic when available."""
+    try:
+        goal = z3.Goal()
+        goal.add(_expand_term_ites_in_formula(formula))
+        result = z3.Tactic("nnf")(goal)
+        if len(result) != 1:
+            return z3.Or(*[g.as_expr() for g in result])
+        return z3.simplify(result[0].as_expr())
+    except z3.Z3Exception as exc:
+        logger.debug("PhaseFit MBP: NNF conversion failed: %s", exc)
+        return None
+
+
+def _nnf_literals(formula: z3.BoolRef) -> list[z3.BoolRef]:
+    """Collect literal leaves from a formula already in NNF."""
+    if z3.is_and(formula) or z3.is_or(formula):
+        out: list[z3.BoolRef] = []
+        for child in formula.children():
+            out.extend(_nnf_literals(child))
+        return out
+    return [formula]
+
+
+def _model_satisfies(model: z3.ModelRef, formula: z3.BoolRef) -> bool:
+    try:
+        return z3.is_true(model.eval(formula, model_completion=True))
+    except z3.Z3Exception:
+        return False
+
+
+def _qe_exists(vars_to_eliminate: Sequence[z3.ExprRef], body: z3.BoolRef) -> z3.BoolRef | None:
+    """Eliminate *vars_to_eliminate* using Z3's QE tactic."""
+    if not vars_to_eliminate:
+        return z3.simplify(body)
+    try:
+        q = z3.Exists(list(vars_to_eliminate), body)
+        goal = z3.Goal()
+        goal.add(q)
+        result = z3.Tactic("qe")(goal)
+        if len(result) == 0:
+            return z3.BoolVal(False)
+        exprs = [z3.simplify(g.as_expr()) for g in result]
+        out = exprs[0]
+        for e in exprs[1:]:
+            out = z3.Or(out, e)
+        return z3.simplify(out)
+    except z3.Z3Exception as exc:
+        logger.debug("PhaseFit MBP: QE failed: %s", exc)
+        return None
+
+
+def _mbp_direct_project(
+    true_literals: Sequence[z3.BoolRef],
+    post_vars: Sequence[z3.ExprRef],
+) -> tuple[z3.BoolRef, bool] | None:
+    """Fast MBP projection for SSA-style transitions.
+
+    Most FreqHorn transitions define every post variable with an equality such
+    as ``x' = t(pre)``.  In that case existential elimination is just
+    substitution; invoking Z3's general-purpose QE here is both unnecessary
+    and, for nested ITEs, extremely expensive.  Returns ``(guard, True)`` when
+    every post variable can be eliminated this way.
+    """
+    post_ids = {v.get_id(): v for v in post_vars}
+    defs: dict[int, z3.ExprRef] = {}
+
+    for lit in true_literals:
+        if not z3.is_eq(lit):
+            continue
+        lhs, rhs = lit.arg(0), lit.arg(1)
+        for post, term in ((lhs, rhs), (rhs, lhs)):
+            if not z3.is_const(post) or post.get_id() not in post_ids:
+                continue
+            # Only orient an equality when the opposite side contains no
+            # post-state variables.  This keeps the projection acyclic and
+            # avoids guessing about relational post-state constraints.
+            if any(v.get_id() in post_ids for v in get_vars(term)):
+                continue
+            defs[post.get_id()] = term
+            break
+
+    if not defs or any(v.get_id() not in defs for v in post_vars):
+        return None
+
+    body = z3.And(*true_literals)
+    # Repeatedly substitute in case a definition refers to another defined
+    # post variable (the usual SSA chain).
+    for _ in range(len(defs) + 1):
+        changed = False
+        for pid, rhs in defs.items():
+            post = post_ids[pid]
+            new_body = z3.substitute(body, (post, rhs))
+            if not new_body.eq(body):
+                body = new_body
+                changed = True
+        if not changed:
+            break
+
+    if any(v.get_id() in post_ids for v in get_vars(body)):
+        return None
+    return z3.simplify(body), True
+
+
+def _mbp_phase_guard_with_mode(
+    model: z3.ModelRef,
+    transition: z3.BoolRef,
+    post_vars: Sequence[z3.ExprRef],
+) -> tuple[z3.BoolRef | None, bool]:
+    """Return an MBP guard and whether it was projected without general QE."""
+    nnf = _nnf_formula(transition)
+    if nnf is None:
+        return None, False
+    true_literals = [
+        lit for lit in _nnf_literals(nnf)
+        if _model_satisfies(model, lit)
+    ]
+    if not true_literals:
+        return None, False
+
+    direct = _mbp_direct_project(true_literals, post_vars)
+    if direct is not None:
+        return direct
+    return _qe_exists(post_vars, z3.And(*true_literals)), False
+
+
+def mbp_phase_guard(
+    model: z3.ModelRef,
+    transition: z3.BoolRef,
+    post_vars: Sequence[z3.ExprRef],
+) -> z3.BoolRef | None:
+    """Construct one LIA MBP, following ImplCheck Algorithm 1.
+
+    The fast path performs exact existential elimination by SSA substitution;
+    general QE is retained as a fallback for non-SSA transitions.
+    """
+    guard, _ = _mbp_phase_guard_with_mode(model, transition, post_vars)
+    return guard
+
+
+def all_mbp_phase_guards(
+    transition: z3.BoolRef,
+    pre_vars: Sequence[z3.ExprRef],
+    post_vars: Sequence[z3.ExprRef],
+    *,
+    max_guards: int = 32,
+    timeout_ms: int = 500,
+) -> list[MBPPhase]:
+    """Lazily enumerate MBPs until the transition is covered.
+
+    This is ImplCheck's Algorithm 3: repeatedly obtain a model of the
+    transition not covered by the previously generated source-state guards,
+    construct its MBP, and continue until no uncovered transition remains.
+    """
+    guards: list[MBPPhase] = []
+    projected_transition: z3.BoolRef | None = None
+    for _ in range(max_guards):
+        solver = z3.Solver()
+        solver.set("timeout", timeout_ms)
+        solver.add(transition)
+        if guards:
+            solver.add(z3.Not(z3.Or(*[g.guard for g in guards])))
+        result = solver.check()
+        if result != z3.sat:
+            break
+        model = solver.model()
+        guard, exact_projection = _mbp_phase_guard_with_mode(
+            model, transition, post_vars
+        )
+        if guard is None or z3.is_false(guard):
+            # Projection failed (or was vacuous) for *this* model/cube.
+            # z3.Solver().check() is not guaranteed to return the same
+            # model on the next iteration for the same constraints, and a
+            # different not-yet-covered model may project just fine, so
+            # keep searching rather than abandoning the whole enumeration
+            # -- bounded by max_guards either way. See
+            # test_all_mbp_phase_guards_recovers_after_a_bad_model.
+            continue
+        # The SSA fast path is an exact projection of the model-selected
+        # literals, so no global QE is needed.  For non-SSA transitions, retain
+        # the old soundness check, but cache the expensive projection once.
+        if not exact_projection:
+            if projected_transition is None:
+                projected_transition = _qe_exists(post_vars, transition)
+            if projected_transition is None:
+                break
+            sound_solver = z3.Solver()
+            sound_solver.set("timeout", timeout_ms)
+            sound_solver.add(guard, z3.Not(projected_transition))
+            if sound_solver.check() != z3.unsat:
+                # This specific model's cube produced an unsound (over-
+                # approximating) guard -- discard just this one and keep
+                # looking. Bailing out entirely here would abandon
+                # coverage of every other, still-uncovered transition
+                # over one bad cube.
+                continue
+        if any(z3.simplify(guard).eq(z3.simplify(old.guard)) for old in guards):
+            break
+        guards.append(MBPPhase(guard=guard, model=model))
+    return guards
+
+
+def _projection_is_sound(
+    guard: z3.BoolRef,
+    transition: z3.BoolRef,
+    post_vars: Sequence[z3.ExprRef],
+    timeout_ms: int,
+) -> bool:
+    """Check guard => exists post-state.  This is the MBP soundness condition."""
+    projected = _qe_exists(post_vars, transition)
+    if projected is None:
+        return False
+    solver = z3.Solver()
+    solver.set("timeout", timeout_ms)
+    solver.add(guard, z3.Not(projected))
+    return solver.check() == z3.unsat
+
+
+def _select_ite_under_model(expr: z3.ExprRef, model: z3.ModelRef) -> z3.ExprRef:
+    """Replace term-level ITEs by the arm selected by *model*."""
+    if _is_ite(expr):
+        cond = expr.arg(0)
+        chosen = expr.arg(1) if _model_satisfies(model, cond) else expr.arg(2)
+        return _select_ite_under_model(chosen, model)
+    if not z3.is_app(expr) or expr.num_args() == 0:
+        return expr
+    kids = [_select_ite_under_model(c, model) for c in expr.children()]
+    if all(a.eq(b) for a, b in zip(kids, expr.children())):
+        return expr
+    try:
+        return expr.decl()(*kids)
+    except z3.Z3Exception:
+        return expr
+
+
+def extract_mbp_guarded_branches(rule: HornRule) -> list[Branch]:
+    """Extract phase branches using MBP guards rather than source-code guards.
+
+    The model returned for each MBP identifies the concrete control-flow arm
+    of term-level ``ite`` updates.  The phase guard itself comes only from MBP,
+    so the method also works when the useful phase condition is not exposed as
+    a predicate that SeedMiner can extract syntactically.
+    """
+    transition = _transition_formula(rule)
+    if transition is None:
+        return []
+    mbps = all_mbp_phase_guards(
+        transition,
+        rule.src_args,
+        rule.dst_args,
+    )
+    # print(f"PhaseFit MBPs for {rule}: {len(mbps)}")
+    # for i, mbp in enumerate(mbps):
+    #     print(f"  MBP {i}: guard = {mbp.guard}")
+    #     print(f"       model = {mbp.model}")
+    if not mbps:
+        return []
+
+    # Recover equalities for ordinary SSA-style updates.  For each destination
+    # variable, choose the term from the active ITE arm under the representative
+    # model.  This lets MBP supply the guard without throwing away the existing
+    # closed-form machinery.
+    defs: dict[int, z3.ExprRef] = {}
+    for lhs, rhs in _collect_equalities(transition):
+        defs[lhs.get_id()] = rhs
+
+    branches: list[Branch] = []
+    src_ids = {v.get_id() for v in rule.src_args}
+    for i, mbp in enumerate(mbps):
+        updates: dict[z3.ExprRef, z3.ExprRef] = {}
+        for idx, post in enumerate(rule.dst_args):
+            rhs = defs.get(post.get_id())
+            if rhs is None:
+                try:
+                    rhs = rule.src_args[idx]
+                except IndexError:
+                    rhs = post
+            updates[post] = _fully_expand(
+                _select_ite_under_model(rhs, mbp.model),
+                defs,
+                src_ids,
+            )
+
+        branch = Branch(
+            guard=mbp.guard,
+            updates=updates,
+            label=f"mbp-{i}",
+            witness_model=mbp.model,
+            guard_source="mbp",
+        )
+
+        # The MBP guard and the selected update arm must describe the same
+        # phase.  Since MBP projects a model-selected conjunction, verify
+        # that the selected pure updates satisfy the original transition
+        # throughout the entire projected guard, not merely at the witness
+        # model.  Otherwise we would be pairing a valid guard with an update
+        # arm that is only locally correct.
+        if not _branch_update_matches_guard(branch.guard, branch.updates, transition, rule.dst_args):
+            logger.debug(
+                "PhaseFit MBP: rejecting phase %s because guard/update "
+                "alignment could not be certified",
+                branch.label,
+            )
+            continue
+
+        branches.append(branch)
+    return branches
+
+
+def _branch_update_matches_guard(
+    guard: z3.BoolRef,
+    updates: Mapping[z3.ExprRef, z3.ExprRef],
+    transition: z3.BoolRef,
+    post_vars: Sequence[z3.ExprRef],
+) -> bool:
+    """Check that an MBP guard selects the supplied update branch globally.
+
+    This is the key provenance invariant for PhaseFit phases: the branch
+    guard must imply that its associated concrete update satisfies the
+    original transition relation.  The check is intentionally independent
+    of the witness model.
+    """
+    try:
+        instantiated = z3.substitute(
+            transition,
+            *[(post, updates[post]) for post in post_vars if post in updates],
+        )
+    except z3.Z3Exception:
+        return False
+    solver = z3.Solver()
+    solver.set("timeout", 500)
+    solver.add(guard, z3.Not(instantiated))
+    return solver.check() == z3.unsat
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1416,18 @@ def stitch_phases(
             ))
             break
 
+        # Concretize symbolic boundaries using known integer inits (from facts
+        # or a previous re-anchor).  E.g. n* = 5000 - x0_0 with x0_0=0 → 5000.
+        if not isinstance(boundary_local_n, int) and isinstance(boundary_local_n, sp.Expr):
+            # Build a temporary init_map from all closed forms
+            merged_imap: dict = {}
+            for cf in cforms.values():
+                merged_imap.update(cf.init_map)
+            conc = _concretize_sympy(boundary_local_n, current_init, merged_imap)
+            gi = _ground_int(conc)
+            if gi is not None and gi >= 0:
+                boundary_local_n = gi
+
         # Re-anchor: evaluate current closed forms at the (local) boundary
         # to obtain the initial state of the next phase.
         new_init: dict[z3.ExprRef, z3.ExprRef] = {
@@ -1061,106 +1497,253 @@ def stitch_phases(
 # 6. assemble candidates
 # ---------------------------------------------------------------------------
 
+def _concretize_sympy(
+    expr: sp.Expr,
+    init_state: Mapping[z3.ExprRef, z3.ExprRef] | None,
+    init_map: Mapping[sp.Symbol, z3.ExprRef] | None = None,
+) -> sp.Expr:
+    """Substitute known concrete integer inits into a sympy closed form / boundary."""
+    if not init_state and not init_map:
+        return expr
+    subs: dict[sp.Symbol, sp.Integer] = {}
+    # init_map: sympy symbol -> Z3 expression (often a pre-var or IntVal)
+    if init_map:
+        for sym, zexpr in init_map.items():
+            if z3.is_int_value(zexpr):
+                subs[sym] = sp.Integer(zexpr.as_long())
+            elif init_state is not None:
+                # zexpr may be a pre-var; look up its concrete value in init_state
+                for pv, val in init_state.items():
+                    if pv.get_id() == getattr(zexpr, "get_id", lambda: None)():
+                        if z3.is_int_value(val):
+                            subs[sym] = sp.Integer(val.as_long())
+                        break
+    # Also: if expr still has free symbols matching the exact sympy name
+    # compute_closed_form uses for a var's init symbol (f"{var}_0"), bind
+    # those too. This must be an EXACT name match, not a loose heuristic:
+    # every init symbol produced by compute_closed_form ends in "_0" (that
+    # suffix alone matches everything, not just this specific variable),
+    # and a Z3 variable's numeric get_id() is not otherwise embedded in
+    # its printed name, so neither is a safe way to identify "the init
+    # symbol for *this* pv" among several. Getting this wrong silently
+    # binds one variable's init symbol to a *different* variable's
+    # concrete value -- confirmed via
+    # test_concretize_sympy_does_not_cross_bind_variables.
+    if init_state:
+        for pv, val in init_state.items():
+            if not z3.is_int_value(val):
+                continue
+            expected = sp.Symbol(f"{pv}_0", integer=True)
+            if expected in expr.free_symbols and expected not in subs:
+                subs[expected] = sp.Integer(val.as_long())
+    if not subs:
+        return expr
+    try:
+        return sp.simplify(expr.subs(subs))
+    except _SYMBOLIC_BESTEFFORT_EXC:
+        return expr
+
+
+def _ground_int(expr: sp.Expr) -> int | None:
+    try:
+        if expr.is_Integer:
+            return int(expr)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def assemble_candidates(
     phases: Sequence[Phase],
     relation_vars: Sequence[z3.ExprRef],
     extra_atoms: Sequence[z3.BoolRef] | None = None,
+    *,
+    global_init: Mapping[z3.ExprRef, z3.ExprRef] | None = None,
 ) -> list[z3.BoolRef]:
-    """Build per-phase interval lemmas of the same shape phaserr uses.
+    """Build phase-local lemmas from closed forms, guarded by the phase guard.
 
-    For each phase with concrete integer bounds [lo, hi) we emit, for every
-    variable that has a closed form, inequalities that describe the possible
-    values inside that interval (very conservative: just the bound atoms and
-    the guard atoms themselves).
-
-    Also includes any extra atoms (e.g. raw guard atoms from SeedMiner).
+    Improvements over the minimal emitter:
+    * Concrete fact-init values are substituted into closed forms so constant
+      phases yield real equalities (e.g. ``y == 5000`` under ``x < 5000``).
+    * Affine closed forms ``v(n) = a*n + b`` with ground ``a,b`` and concrete
+      phase bounds produce interval lemmas on ``v``.
+    * When one variable tracks the step counter and another is constant on the
+      phase, emit the constant and the counter bounds implied by the guard.
+    * Raw phase-guard comparison atoms (over relation vars only) are also
+      proposed -- they help close off-by-one gaps at boundaries (design §6).
+    * Cross-variable n-independent offsets become guarded equalities when the
+      offset is ground after init substitution.
     """
     cands: list[z3.BoolRef] = []
     if extra_atoms:
         cands.extend(extra_atoms)
 
+    rel_ids = {v.get_id() for v in relation_vars}
+    n_sym = sp.Symbol("n", integer=True, nonnegative=True)
+
     for ph in phases:
+        guard = ph.branch.guard
+        # Prefer phase-local init (re-anchored); fall back to global fact init.
+        # Copy rather than alias ph.init_state -- setdefault below must not
+        # mutate the Phase object itself (confirmed: aliasing here silently
+        # leaked global_init entries into ph.init_state as a side effect).
+        phase_init = dict(ph.init_state) if ph.init_state else {}
+        if global_init:
+            for k, v in global_init.items():
+                phase_init.setdefault(k, v)
+
+        def emit(lemma: z3.BoolRef) -> None:
+            try:
+                if z3.is_true(guard):
+                    cands.append(lemma)
+                else:
+                    cands.append(z3.Implies(guard, lemma))
+            except z3.Z3Exception as exc:
+                logger.debug("assemble_candidates: guarded lemma skipped: %s", exc)
+
+        # --- (a) phase-guard atoms as candidates (design §6) ---------------
+        def _emit_guard_atoms(g: z3.BoolRef) -> None:
+            if z3.is_true(g) or z3.is_false(g):
+                return
+            if z3.is_and(g):
+                for c in g.children():
+                    _emit_guard_atoms(c)
+                return
+            # Anything else (a comparison atom, an Or, or a Not(atom)) is
+            # kept as one unit candidate when all its free vars are local
+            # to the relation.
+            try:
+                free = get_vars(g)
+            except z3.Z3Exception:
+                return
+            if free and all(v.get_id() in rel_ids for v in free):
+                cands.append(g)
+
+        _emit_guard_atoms(guard)
+
         lo = ph.start_n
         hi = ph.end_n
-        # Emit the phase-guard atoms projected onto the relation variables
-        # (they are already over pre-state).
-        try:
-            # Simple: the branch guard itself is a useful candidate
-            if not z3.is_true(ph.branch.guard):
-                cands.append(ph.branch.guard)
-        except z3.Z3Exception as exc:
-            logger.debug("assemble_candidates: guard atom skipped: %s", exc)
+        # Concretize symbolic phase bounds using known inits
+        if not isinstance(lo, int) and isinstance(lo, sp.Expr):
+            lo_c = _concretize_sympy(lo, phase_init)
+            gi = _ground_int(lo_c)
+            if gi is not None:
+                lo = gi
+        if not isinstance(hi, int) and isinstance(hi, sp.Expr):
+            hi_c = _concretize_sympy(hi, phase_init)
+            gi = _ground_int(hi_c)
+            if gi is not None:
+                hi = gi
 
-        n_sym = sp.Symbol("n", integer=True, nonnegative=True)
-
-        # For concrete numeric bounds emit n-related inequalities when a
-        # variable is known to be equal to the index (identity recurrence).
         for v, cf in ph.closed_forms.items():
-            # If the closed form is simply “n” or “n + c”, emit bounds
+            if not _is_arith_sort(v):
+                continue
+            # Substitute concrete inits into the closed form
+            expr = _concretize_sympy(cf.expr, phase_init, cf.init_map)
+
+            # (b) fully ground constant closed form
+            gi = _ground_int(expr) if n_sym not in expr.free_symbols else None
+            if gi is not None:
+                emit(v == z3.IntVal(gi))
+                continue
+
+            # (c) constant w.r.t. n but still symbolic -- if it reduces to a
+            # single init variable that we know is this var's own pre-value,
+            # skip (tautology). If it reduces to another var, emit equality.
+            if n_sym not in expr.free_symbols:
+                z3e = _sympy_to_z3(expr, cf.init_map)
+                if z3e is not None:
+                    try:
+                        z3e = z3.simplify(z3e)
+                        if phase_init:
+                            z3e = z3.simplify(
+                                z3.substitute(z3e, *[(k, val) for k, val in phase_init.items()])
+                            )
+                        if z3.is_int_value(z3e):
+                            emit(v == z3e)
+                        elif z3.is_const(z3e) and z3e.get_id() != v.get_id():
+                            # v equals some other relation var throughout the phase
+                            if z3e.get_id() in rel_ids:
+                                emit(v == z3e)
+                    except z3.Z3Exception as exc:
+                        logger.debug("assemble: const CF z3 failed: %s", exc)
+
+            # (d) counter-like: expr = n + c  (c ground after init subst)
             try:
-                if cf.expr == n_sym or (cf.expr - n_sym).is_constant():
-                    # v is essentially the loop counter
-                    if isinstance(lo, int):
-                        cands.append(v >= z3.IntVal(lo))
-                    if isinstance(hi, int):
-                        cands.append(v < z3.IntVal(hi))
-            except (TypeError, ValueError) as exc:
-                logger.debug("assemble_candidates: bound skipped for %s: %s", v, exc)
+                shifted = sp.simplify(expr - n_sym)
+                if n_sym not in shifted.free_symbols:
+                    c_val = _ground_int(shifted)
+                    if c_val is not None:
+                        # v == n + c  ⇒  under concrete [lo, hi) bounds on v
+                        if isinstance(lo, int):
+                            emit(v >= z3.IntVal(lo + c_val))
+                        if isinstance(hi, int):
+                            emit(v < z3.IntVal(hi + c_val))
+                        # Also: if guard is a threshold on v, the dual var
+                        # bounds are already covered by guard atoms.
+            except _SYMBOLIC_BESTEFFORT_EXC as exc:
+                logger.debug("assemble: counter form failed for %s: %s", v, exc)
 
-            # Constant closed form inside the phase → equality candidate.
-            # Note: use `is_Integer` (is this expression *literally* a
-            # concrete integer) rather than the `is_integer` *assumption*
-            # query, which is also true for e.g. a bare Symbol declared
-            # `integer=True` -- such a symbol has no free `n` but is not a
-            # number, and `int()` on it raises.
-            if n_sym not in cf.expr.free_symbols and cf.expr.is_Integer:
-                cands.append(v == z3.IntVal(int(cf.expr)))
+            # (e) general affine: a*n + b with ground a,b and concrete bounds
+            try:
+                poly = sp.Poly(sp.expand(expr), n_sym)
+                if poly.degree() == 1:
+                    a = poly.coeff_monomial(n_sym)
+                    b = poly.coeff_monomial(1)
+                    if a.is_Integer and (b.is_Integer or n_sym not in b.free_symbols):
+                        ai = int(a)
+                        bi = _ground_int(b)
+                        if bi is not None and isinstance(lo, int) and isinstance(hi, int):
+                            # range of a*n+b over n in [lo, hi)
+                            ends = [ai * lo + bi, ai * (hi - 1) + bi]
+                            emit(v >= z3.IntVal(min(ends)))
+                            emit(v <= z3.IntVal(max(ends)))
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                pass
 
-        # Two variables that grow at the same rate (same coefficient of n,
-        # i.e. their closed forms differ by an n-independent amount) stay
-        # at a fixed offset from each other for the whole phase. This is
-        # exactly what proves e.g. "y == x" once two variables that used to
-        # move independently start incrementing together (the headline
-        # PhaseFit example). Detect it by diffing the two closed forms
-        # symbolically, then resolving the (n-independent) remainder back
-        # to a real Z3 value via each variable's own init_map so it's
-        # checked against the actual re-anchored state, not just the
-        # placeholder symbol names.
+        # (f) cross-variable n-independent offsets (ground after init subst)
         items = list(ph.closed_forms.items())
         for i, (v1, cf1) in enumerate(items):
             if not _is_arith_sort(v1):
                 continue
             for v2, cf2 in items[i + 1:]:
-                # Both sides of `v1 == v2 (+ c)` must be the same,
-                # arithmetic sort -- comparing e.g. an Int var against a
-                # Bool/Array/String one (or adding a literal to one) is a
-                # Z3 sort error, not something to even attempt here.
                 if v1.sort() != v2.sort() or not _is_arith_sort(v2):
                     continue
                 try:
-                    diff = sp.simplify(cf1.expr - cf2.expr)
-                except (TypeError, ValueError) as exc:
+                    e1 = _concretize_sympy(cf1.expr, phase_init, cf1.init_map)
+                    e2 = _concretize_sympy(cf2.expr, phase_init, cf2.init_map)
+                    diff = sp.simplify(e1 - e2)
+                except _SYMBOLIC_BESTEFFORT_EXC as exc:
                     logger.debug("assemble_candidates: diff failed: %s", exc)
                     continue
                 if n_sym in diff.free_symbols:
-                    continue  # different growth rate within this phase
+                    continue
+                gi = _ground_int(diff)
+                if gi is not None:
+                    emit(v1 == v2 if gi == 0 else v1 == v2 + z3.IntVal(gi))
+                    continue
+                # non-ground but both CFs are pure inits: skip tautologies
                 merged_map = {**cf2.init_map, **cf1.init_map}
                 z3_diff = _sympy_to_z3(diff, merged_map)
                 if z3_diff is None:
                     continue
                 try:
                     simplified = z3.simplify(z3_diff)
+                    if phase_init:
+                        simplified = z3.simplify(
+                            z3.substitute(
+                                simplified,
+                                *[(k, val) for k, val in phase_init.items()],
+                            )
+                        )
                 except z3.Z3Exception as exc:
                     logger.debug("assemble_candidates: simplify failed: %s", exc)
                     continue
                 if z3.is_int_value(simplified):
                     const = simplified.as_long()
-                    cands.append(
-                        v1 == v2 if const == 0 else v1 == v2 + z3.IntVal(const)
-                    )
+                    emit(v1 == v2 if const == 0 else v1 == v2 + z3.IntVal(const))
 
-
-    # Deduplicate by sexpr string
+    # Deduplicate by sexpr string.
     seen: set[str] = set()
     unique: list[z3.BoolRef] = []
     for c in cands:
@@ -1215,18 +1798,17 @@ def stitch_phases_from_all_starts(
 ) -> tuple[list[Phase], list[PhaseBoundary]]:
     """Try every branch as the phase-0 starting point and merge the results.
 
-    PhaseFit generally has no static way of knowing which branch's guard
-    is actually satisfied by the states that reach this rule on entry --
-    that's part of what the surrounding fixed-point computation is trying
-    to discover. Rather than hardcoding a single (frequently wrong)
-    starting branch, this explores each one and lets downstream Houdini
-    validation keep whichever resulting candidates actually hold; wrong
-    guesses just fail validation and get dropped, per the guess-then-
-    validate design (see docs/phasefit-branching-loop-solver-design.md).
+    When *initial_state* is known (e.g. from fact rules), starting branches
+    whose guard is already UNSAT under that state are skipped -- they cannot
+    be the entry phase and only produce noise candidates.
     """
     all_phases: list[Phase] = []
     all_boundaries: list[PhaseBoundary] = []
     for start in range(len(branches)):
+        if initial_state:
+            consistency = _branch_guard_consistent(branches[start], initial_state)
+            if consistency is False:
+                continue
         phases, boundaries = stitch_phases(
             branches,
             pre_vars,
@@ -1239,6 +1821,79 @@ def stitch_phases_from_all_starts(
         all_phases.extend(phases)
         all_boundaries.extend(boundaries)
     return all_phases, all_boundaries
+
+
+
+def extract_concrete_inits(
+    program: HornProgram,
+    relation: z3.FuncDeclRef,
+) -> dict[z3.ExprRef, z3.ExprRef]:
+    """Harvest concrete initial values from fact rules for *relation*.
+
+    When a fact assigns integer constants to the relation arguments
+    (``(inv 0 5000)``), those constants become the phase-0 init_state so
+    closed forms and boundaries can be concretized (e.g. n*=5000 instead of
+    ``5000 - x0``).  Multiple facts: only keep values agreed by all facts;
+    conflicting positions are left unconstrained.
+    """
+    agreed: dict[int, z3.ExprRef] | None = None  # position -> value
+    arity = relation.arity()
+    for rule in program.rules:
+        if not rule.is_fact or rule.dst_relation.get_id() != relation.get_id():
+            continue
+        if len(rule.dst_args) != arity:
+            continue
+        pos_vals: dict[int, z3.ExprRef] = {}
+        for i, arg in enumerate(rule.dst_args):
+            # Prefer evaluating equalities in the fact body
+            val = None
+            body = rule.body
+            conjuncts = list(body.children()) if z3.is_and(body) else [body]
+            for c in conjuncts:
+                if z3.is_eq(c):
+                    lhs, rhs = c.arg(0), c.arg(1)
+                    if lhs.get_id() == arg.get_id() and (
+                        z3.is_int_value(rhs) or z3.is_rational_value(rhs)
+                    ):
+                        val = rhs
+                        break
+                    if rhs.get_id() == arg.get_id() and (
+                        z3.is_int_value(lhs) or z3.is_rational_value(lhs)
+                    ):
+                        val = lhs
+                        break
+            if val is None and (z3.is_int_value(arg) or z3.is_rational_value(arg)):
+                val = arg
+            if val is not None:
+                pos_vals[i] = val
+        if agreed is None:
+            agreed = pos_vals
+        else:
+            # intersection of agreed concrete values
+            agreed = {
+                i: v for i, v in agreed.items()
+                if i in pos_vals and pos_vals[i].eq(v)
+            }
+    if not agreed:
+        return {}
+    # Map to a representative fact's dst_args / any rule's arg placeholders
+    # Callers re-key onto pre_vars by position.
+    return agreed
+
+
+def _init_state_for_rule(
+    program: HornProgram,
+    rule: HornRule,
+) -> dict[z3.ExprRef, z3.ExprRef]:
+    """Build pre_var -> concrete value map for phase-0, when facts allow it."""
+    if rule.src_relation is None:
+        return {}
+    by_pos = extract_concrete_inits(program, rule.src_relation)
+    out: dict[z3.ExprRef, z3.ExprRef] = {}
+    for i, pre in enumerate(rule.src_args):
+        if i in by_pos:
+            out[pre] = by_pos[i]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1302,9 +1957,14 @@ class PhaseFit:
             for post, pre in zip(rule.dst_args, rule.src_args)
         }
 
-        branches = extract_guarded_branches(
-            rule, per_variable=self.per_variable_branches
-        )
+        branches = extract_mbp_guarded_branches(rule)
+        if not branches:
+            # Retain the syntactic flattener as a conservative fallback for
+            # unsupported theories or QE failures.  The primary PhaseFit
+            # path is MBP-based, matching ImplCheck.
+            branches = extract_guarded_branches(
+                rule, per_variable=self.per_variable_branches
+            )
         if not branches:
             return PhaseFitResult(
                 relation=rel,
@@ -1318,14 +1978,18 @@ class PhaseFit:
         # Seed atoms already mined for this relation
         extra = list(seed_result.candidates.get(rel, ()))
 
+        fact_init = _init_state_for_rule(self.program, rule)
         phases, boundaries = stitch_phases_from_all_starts(
             branches,
             pre_vars,
             post_to_pre,
             phase_budget=self.phase_budget,
             p_max=self.p_max,
+            initial_state=fact_init or None,
         )
-        raw_cands = assemble_candidates(phases, pre_vars, extra_atoms=extra)
+        raw_cands = assemble_candidates(
+            phases, pre_vars, extra_atoms=extra, global_init=fact_init or None
+        )
 
         # Project rule-local variables onto the SeedMiner canonical variables
         # so MultiHoudini accepts the candidates.
