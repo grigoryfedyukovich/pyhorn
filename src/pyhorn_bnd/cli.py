@@ -345,6 +345,69 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ff",
+        action="store_true",
+        help=(
+            "compute reachability directly by forward image iteration "
+            "(no candidate guessing): propagate each fact rule's initial "
+            "states forward through Z3 quantifier elimination, union the "
+            "result into each relation's reachable-state formula, and "
+            "check every query against it after each round. Reports "
+            "Success (with exit 0) only once the reachable-set formulas "
+            "stop growing -- an exact fixpoint, and therefore a genuine "
+            "proof, not a validated guess. Reports a real counterexample "
+            "(exit 1) the moment a query becomes reachable -- this can "
+            "prove UNSAFE, which none of --seed-houdini/--phasefit/"
+            "--trace-houdini can do. A naive, non-widening iteration: "
+            "expect 'unknown' (exit 2) on anything with an unbounded or "
+            "slow-to-converge reachable set. Cannot be combined with any "
+            "other analysis flag -- this is a standalone, self-contained "
+            "technique."
+        ),
+    )
+    parser.add_argument(
+        "--ff-max-iterations",
+        type=int,
+        default=None,
+        help="iteration budget for --ff (default: 20; requires --ff)",
+    )
+    parser.add_argument(
+        "--ff-timeout-ms",
+        type=int,
+        default=None,
+        help="per-Z3-call timeout in ms for --ff (default: 10000; requires --ff)",
+    )
+    parser.add_argument(
+        "--ff-overall-timeout-s",
+        type=float,
+        default=None,
+        help="overall wall-clock budget in seconds for --ff (default: 30; "
+        "requires --ff)",
+    )
+    parser.add_argument(
+        "--ff-no-generalization",
+        action="store_true",
+        help=(
+            "disable interval widening of post-images for --ff (default: "
+            "enabled; requires --ff). Widening lets genuinely "
+            "unbounded-but-safe loops (e.g. a plain counter) converge to a "
+            "proof in a handful of rounds instead of never converging; "
+            "disabling it falls back to the exact-only iteration, which "
+            "only ever proves programs whose reachable set is small and "
+            "literally stabilizes within the iteration budget."
+        ),
+    )
+    parser.add_argument(
+        "--ff-widening-delay",
+        type=int,
+        default=None,
+        help=(
+            "rounds to let --ff's generalized track grow un-widened before "
+            "interval widening kicks in (default: 2; requires --ff)"
+        ),
+    )
+    parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
+    parser.add_argument(
         "--list-trace-templates",
         action="store_true",
         help=(
@@ -354,7 +417,6 @@ def _parser() -> argparse.ArgumentParser:
             "output."
         ),
     )
-    parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
     parser.add_argument(
         "--solver-mode",
         choices=("pool", "fresh"),
@@ -836,6 +898,113 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.file is None:
         parser.error("the following arguments are required: file")
+    if args.ff and (
+        args.seed_houdini
+        or args.cands is not None
+        or args.trace_houdini
+        or args.phasefit
+        or args.mut
+    ):
+        parser.error(
+            "--ff cannot be combined with --seed-houdini, --cands, "
+            "--trace-houdini, --phasefit, or --mut -- it is a standalone "
+            "technique"
+        )
+    if not args.ff and (
+        args.ff_max_iterations is not None
+        or args.ff_timeout_ms is not None
+        or args.ff_overall_timeout_s is not None
+        or args.ff_no_generalization
+        or args.ff_widening_delay is not None
+    ):
+        parser.error(
+            "--ff-max-iterations, --ff-timeout-ms, --ff-overall-timeout-s, "
+            "--ff-no-generalization, and --ff-widening-delay all require "
+            "--ff -- without it, they have no effect and this run would "
+            "silently fall through to the default bounded-explorer "
+            "pipeline instead"
+        )
+    if args.ff:
+        try:
+            program = parse_chc_file(args.file, slice_program=False)
+        except (HornParseError, HornNormalizationError, OSError) as exc:
+            print(f"error: {exc}")
+            return 3
+        from .forward_fixpoint import (
+            DEFAULT_MAX_ITERATIONS,
+            DEFAULT_OVERALL_TIMEOUT_S,
+            DEFAULT_TIMEOUT_MS,
+            DEFAULT_WIDENING_DELAY,
+            ForwardFixpointStatus,
+            run_forward_fixpoint,
+        )
+
+        if args.debug:
+            print(
+                f"Parsed {len(program.rules)} linear CHCs (unsliced); "
+                f"Z3 {z3.get_version_string()}"
+            )
+            for rule in program.rules:
+                print(f"  {rule.short()}: {rule.body}")
+
+        result = run_forward_fixpoint(
+            program,
+            max_iterations=(
+                DEFAULT_MAX_ITERATIONS
+                if args.ff_max_iterations is None
+                else args.ff_max_iterations
+            ),
+            timeout_ms=(
+                DEFAULT_TIMEOUT_MS
+                if args.ff_timeout_ms is None
+                else args.ff_timeout_ms
+            ),
+            overall_timeout_s=(
+                DEFAULT_OVERALL_TIMEOUT_S
+                if args.ff_overall_timeout_s is None
+                else args.ff_overall_timeout_s
+            ),
+            enable_generalization=not args.ff_no_generalization,
+            widening_delay=(
+                DEFAULT_WIDENING_DELAY
+                if args.ff_widening_delay is None
+                else args.ff_widening_delay
+            ),
+        )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": result.status.value,
+                        "iterations": result.iterations,
+                        "fixpoint_reached": result.fixpoint_reached,
+                        "message": result.message,
+                        "violated_rule": (
+                            result.violated_rule.short()
+                            if result.violated_rule
+                            else None
+                        ),
+                        "counterexample": result.counterexample_model,
+                        "qe_unsound_rejections": result.qe_unsound_rejections,
+                    }
+                )
+            )
+        elif args.print_invariants and result.status is ForwardFixpointStatus.SAFE:
+            for relation, formula in result.reached.items():
+                canonical = result.variables.get(relation, ())
+                args_str = ", ".join(str(v) for v in canonical)
+                print(f"{relation.name()}({args_str}):")
+                print(f"  {formula}")
+        if result.status is ForwardFixpointStatus.SAFE:
+            print("Success")
+            return 0
+        if result.status is ForwardFixpointStatus.UNSAFE:
+            print("counterexample")
+            if result.counterexample_model:
+                print(result.counterexample_model)
+            return 1
+        print("unknown")
+        return 2
     if args.upto < args.start:
         parser.error("--upto must be greater than or equal to --from")
     if (

@@ -51,6 +51,25 @@ described briefly under [Installation](#installation) and in full under
 pyhorn-expl --upto 20 --model input.smt2
 ```
 
+### Forward fixpoint (direct reachability, no candidate guessing)
+
+Unlike Seed-Houdini, PhaseFit, and trace-guided mining, `--ff` doesn't guess
+candidates at all: it computes each relation's set of reachable states
+directly by forward image iteration through Z3 quantifier elimination, and
+can prove **UNSAFE** with a genuine counterexample as well as SAFE.
+
+```bash
+pyhorn-expl --ff --print-invariants input.smt2
+```
+
+It's a standalone technique -- it cannot be combined with `--seed-houdini`,
+`--cands`, `--trace-houdini`, `--phasefit`, or `--mut` -- and it reports
+`unknown` on anything with an unbounded or slow-to-converge reachable set
+that an interval-widened generalization pass still can't pin down (e.g. a
+relational invariant like `y == 2*x` between two counters). See
+[`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the full
+algorithm, the generalized/widening track, and the `--ff-*` flag reference.
+
 ## Supported input formats
 
 Both common CHC encodings are supported.

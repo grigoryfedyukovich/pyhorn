@@ -73,6 +73,19 @@ from .solver_pool import (
 # that name is already the public, load-bearing merge used by --cands /
 # --seed-houdini combination (see cands.merge_candidate_maps above). Import
 # it directly from `pyhorn_bnd.trace_miner` if you need it.
+from .phasefit import (
+    PhaseFit,
+    PhaseFitResult,
+    run_phasefit,
+)
+
+from .forward_fixpoint import (
+    ForwardFixpoint,
+    ForwardFixpointResult,
+    ForwardFixpointStatus,
+    run_forward_fixpoint,
+)
+
 from .trace_miner import (
     DEFAULT_MAX_AFFINE_COEFFICIENT,
     DEFAULT_MAX_CONGRUENCE_MODULUS,
@@ -172,4 +185,11 @@ __all__ = [
     "trace_template_specifications",
     "validate_candidate_reachability",
     "validate_removed_candidate",
+    "PhaseFit",
+    "PhaseFitResult",
+    "run_phasefit",
+    "ForwardFixpoint",
+    "ForwardFixpointResult",
+    "ForwardFixpointStatus",
+    "run_forward_fixpoint",
 ]
