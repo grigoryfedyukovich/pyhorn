@@ -70,6 +70,15 @@ relational invariant like `y == 2*x` between two counters). See
 [`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the full
 algorithm, the generalized/widening track, and the `--ff-*` flag reference.
 
+`--ff-houdini` alternates `--ff` and Seed-/Trace-Houdini in rounds, each
+feeding what it found to the other, and can prove programs neither side
+proves alone -- a reachability fact `--ff` derives across a relation
+boundary that Houdini's syntactic mining has no way to guess, combined
+with a relational fact Houdini mines directly from the query that `--ff`'s
+own interval widening can't express. See
+[`docs/ff_houdini.md`](docs/ff_houdini.md) for the mechanism, the
+soundness argument, and a verified worked example.
+
 ## Supported input formats
 
 Both common CHC encodings are supported.

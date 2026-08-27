@@ -29,6 +29,13 @@ from .explorer import (
     ExplorationStatus,
     TraceCheck,
 )
+from .ff_houdini import FFHoudiniResult, FFHoudiniStatus, run_ff_houdini
+from .forward_fixpoint import (
+    ForwardFixpoint,
+    ForwardFixpointResult,
+    ForwardFixpointStatus,
+    run_forward_fixpoint,
+)
 from .horn import (
     ArithmeticSortProfile,
     HornParseError,
@@ -48,6 +55,18 @@ from .houdini import (
     run_trace_houdini,
 )
 from .normalize import HornNormalizationError
+
+# Note: trace_miner also defines a `merge_candidate_maps`, but it is
+# superseded by `merge_candidate_batches` above (which every caller in this
+# codebase actually uses) and is deliberately NOT re-exported here, since
+# that name is already the public, load-bearing merge used by --cands /
+# --seed-houdini combination (see cands.merge_candidate_maps above). Import
+# it directly from `pyhorn_bnd.trace_miner` if you need it.
+from .phasefit import (
+    PhaseFit,
+    PhaseFitResult,
+    run_phasefit,
+)
 from .seedminer import (
     CandidateMap,
     MutationResult,
@@ -66,26 +85,6 @@ from .solver_pool import (
     SolverPoolCheck,
     SolverPoolStatistics,
 )
-
-# Note: trace_miner also defines a `merge_candidate_maps`, but it is
-# superseded by `merge_candidate_batches` above (which every caller in this
-# codebase actually uses) and is deliberately NOT re-exported here, since
-# that name is already the public, load-bearing merge used by --cands /
-# --seed-houdini combination (see cands.merge_candidate_maps above). Import
-# it directly from `pyhorn_bnd.trace_miner` if you need it.
-from .phasefit import (
-    PhaseFit,
-    PhaseFitResult,
-    run_phasefit,
-)
-
-from .forward_fixpoint import (
-    ForwardFixpoint,
-    ForwardFixpointResult,
-    ForwardFixpointStatus,
-    run_forward_fixpoint,
-)
-
 from .trace_miner import (
     DEFAULT_MAX_AFFINE_COEFFICIENT,
     DEFAULT_MAX_CONGRUENCE_MODULUS,
@@ -137,6 +136,11 @@ __all__ = [
     "DepthStatistics",
     "ExplorationResult",
     "ExplorationStatus",
+    "FFHoudiniResult",
+    "FFHoudiniStatus",
+    "ForwardFixpoint",
+    "ForwardFixpointResult",
+    "ForwardFixpointStatus",
     "FreshTraceSolver",
     "HornNormalizationError",
     "HornParseError",
@@ -150,6 +154,8 @@ __all__ = [
     "MultiHoudini",
     "MutationResult",
     "MutationStatistics",
+    "PhaseFit",
+    "PhaseFitResult",
     "RemovedCandidate",
     "SSAConstructionStatistics",
     "SeedMiner",
@@ -180,16 +186,12 @@ __all__ = [
     "mutate_candidates",
     "parse_candidate_file",
     "parse_chc_file",
+    "run_ff_houdini",
+    "run_forward_fixpoint",
+    "run_phasefit",
     "run_seed_houdini",
     "run_trace_houdini",
     "trace_template_specifications",
     "validate_candidate_reachability",
     "validate_removed_candidate",
-    "PhaseFit",
-    "PhaseFitResult",
-    "run_phasefit",
-    "ForwardFixpoint",
-    "ForwardFixpointResult",
-    "ForwardFixpointStatus",
-    "run_forward_fixpoint",
 ]

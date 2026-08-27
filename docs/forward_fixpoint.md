@@ -173,7 +173,9 @@ regression test.
 proof strategy converged in the given budget. Raising `--ff-max-iterations`
 and/or `--ff-overall-timeout-s` may help for a genuinely-bounded system that
 just needs more rounds; it will not help for the relational-invariant case
-above.
+above -- but `--ff-houdini` (see [`ff_houdini.md`](ff_houdini.md)) might,
+since Houdini's syntactic mining is exactly what covers relational facts
+like `y == 2*x`.
 
 ## CLI reference
 
