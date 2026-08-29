@@ -490,6 +490,29 @@ class ForwardFixpoint:
     # was proven true some other way, not accumulated by this run's own
     # QE steps.
     external_invariants: Mapping[z3.FuncDeclRef, z3.BoolRef] | None = None
+    # Per-relation formulas to seed round 0 with, in place of the literal
+    # fact-rule-derived value -- e.g. a single conjunct mined from the
+    # fact rule (see ff_seeded.py), a candidate from --cands, or a
+    # trace-derived formula. Any relation not present here still gets
+    # its normal fact-rule seeding. `run()` requires (and checks, raising
+    # ValueError if violated -- see there) that Init implies each given
+    # seed, i.e. the seed must not exclude any real initial state; a
+    # seed that's a strict superset of Init is fine (and is the whole
+    # point -- see below), it just makes this run compute a possibly
+    # looser, differently-shaped closure than the literal init would.
+    #
+    # This changes what a SAFE verdict *means* not at all -- a seed's own
+    # closure avoiding the query is still a sound proof the true
+    # (narrower or equal) init's closure does too, by the same argument
+    # `external_invariants` and the generalized track already rely on.
+    # It also, perhaps surprisingly, needs no extra protection on the
+    # UNSAFE side either: `_confirm_counterexample` re-checks any
+    # candidate counterexample against `self.program`'s own real fact
+    # rules via BoundedExplorer, entirely independent of whatever seed
+    # this run used -- so a counterexample only reachable from the part
+    # of an over-broad seed that isn't real is caught and rejected there
+    # the same way a `qe`-tactic over-approximation would be.
+    initial_seed: Mapping[z3.FuncDeclRef, z3.BoolRef] | None = None
     _resolved_variables: VariableMap = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -810,6 +833,41 @@ class ForwardFixpoint:
             prior = reached[rule.dst_relation]
             reached[rule.dst_relation] = z3.simplify(z3.Or(prior, image))
 
+        if self.initial_seed:
+            for relation, seed in self.initial_seed.items():
+                if relation not in reached:
+                    continue
+                true_init = reached[relation]
+                # Verify Init => seed (the seed must not exclude any real
+                # initial state) before trusting it as an override for
+                # this relation's round-0 value -- see this class's
+                # docstring. A seed this doesn't hold for is not a sound
+                # basis for proving the *original* program's safety, no
+                # matter what its own closure under the step rules looks
+                # like, so this fails loudly rather than silently
+                # substituting the unchecked seed or falling back to
+                # the true fact-rule value.
+                checker = z3.Solver()
+                checker.set(timeout=self._remaining_timeout_ms(deadline))
+                checker.add(true_init, z3.Not(seed))
+                verdict = checker.check()
+                if verdict != z3.unsat:
+                    reason = (
+                        "a real initial state violates it"
+                        if verdict == z3.sat
+                        else "the check was undecided within the timeout"
+                    )
+                    raise ValueError(
+                        f"initial_seed for {relation.name()} does not "
+                        f"satisfy Init => seed ({reason}) -- the caller "
+                        "must verify this before passing a seed override, "
+                        "since a seed that excludes real initial states "
+                        "is not a sound basis for proving the original "
+                        "program safe"
+                    )
+                reached[relation] = seed
+                tainted.discard(relation)
+
         for rule in query_rules:
             outcome = self._check_query(
                 rule, reached, tainted=tainted, deadline=deadline
@@ -1100,6 +1158,7 @@ def run_forward_fixpoint(
     enable_generalization: bool = True,
     widening_delay: int = DEFAULT_WIDENING_DELAY,
     external_invariants: Mapping[z3.FuncDeclRef, z3.BoolRef] | None = None,
+    initial_seed: Mapping[z3.FuncDeclRef, z3.BoolRef] | None = None,
 ) -> ForwardFixpointResult:
     """Convenience wrapper: construct a :class:`ForwardFixpoint` and run it."""
     return ForwardFixpoint(
@@ -1111,4 +1170,5 @@ def run_forward_fixpoint(
         enable_generalization=enable_generalization,
         widening_delay=widening_delay,
         external_invariants=external_invariants,
+        initial_seed=initial_seed,
     ).run()

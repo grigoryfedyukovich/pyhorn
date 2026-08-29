@@ -10,6 +10,7 @@ import z3
 
 from pyhorn_bnd import forward_fixpoint as ff
 from pyhorn_bnd.forward_fixpoint import (
+    ForwardFixpoint,
     ForwardFixpointStatus,
     _contains_any_var,
     run_forward_fixpoint,
@@ -746,4 +747,134 @@ def test_genuinely_unsafe_program_still_reports_unsafe(tmp_path):
 
     assert result.status is ForwardFixpointStatus.UNSAFE
     assert result.counterexample_model is not None
+
+
+# ---------------------------------------------------------------------------
+# initial_seed: seeding round 0 from a formula other than the literal
+# fact-rule condition, provided Init implies it.
+# ---------------------------------------------------------------------------
+
+
+def test_initial_seed_that_drops_an_irrelevant_variable_still_proves_safe(
+    tmp_path,
+):
+    """x and w are tied together (both freeze permanently the first
+    round w's threshold condition goes false); y and z are a
+    completely separate pair the query never touches, incrementing
+    unconditionally every round regardless of anything else. Seeding
+    with just (x==0 AND w==1) -- dropping y and z entirely, leaving
+    them unconstrained -- should still prove x<=1, since x's own
+    reachable range never depended on y or z at all. In fact the full,
+    unseeded computation (all four variables, y and z included) does
+    *not* reliably converge to this same proof -- confirmed
+    reproducible over repeated runs -- which is itself a small,
+    concrete demonstration of this module's value: variables that are
+    genuinely irrelevant to a query can still make the full joint `qe`
+    computation less able to find a proof it can find once they're
+    dropped, not just slower.
+    """
+    smt2 = """
+(declare-rel inv (Int Int Int Int))
+(declare-var x0 Int)
+(declare-var x1 Int)
+(declare-var w0 Int)
+(declare-var w1 Int)
+(declare-var y0 Int)
+(declare-var y1 Int)
+(declare-var z0 Int)
+(declare-var z1 Int)
+(declare-rel fail ())
+(rule (=> (and (= x1 0) (= w1 1) (= y1 0) (= z1 0)) (inv x1 y1 z1 w1)))
+(rule (=>
+    (and
+        (inv x0 y0 z0 w0)
+        (= x1 (ite (<= w0 1) (+ x0 1) x0))
+        (= w1 (ite (<= w0 1) (+ w0 1) w0))
+        (= y1 (+ y0 1))
+        (= z1 (+ z0 1))
+    )
+    (inv x1 y1 z1 w1)
+  )
+)
+(rule (=> (and (inv x0 y0 z0 w0) (not (<= x0 1))) fail))
+(query fail)
+"""
+    path = _write(tmp_path, "threshold_pair.smt2", smt2)
+    program = parse_chc_file(path, slice_program=False)
+    inv_rel = next(r for r in program.relations if r.name() == "inv")
+    canon = ForwardFixpoint(program)._resolved_variables[inv_rel]
+    x, _y, _z, w = canon
+
+    seed = z3.And(x == 0, w == 1)
+    result = run_forward_fixpoint(
+        program,
+        max_iterations=10,
+        timeout_ms=5_000,
+        initial_seed={inv_rel: seed},
+    )
+
+    assert result.status is ForwardFixpointStatus.SAFE
+
+
+def test_initial_seed_dropping_a_needed_variable_does_not_converge(tmp_path):
+    """The flip side of the test above: x's own update depends on w's
+    parity, so seeding with x==0 alone (w, y, z all left unconstrained)
+    can't establish x<=1 the way (x==0 AND w==1) does above -- w's
+    parity becomes arbitrary each round, so x looks able to grow
+    forever. Must come back UNKNOWN, never a wrong verdict. (The
+    reduced 2-variable version of this program, x and w only with no y
+    or z, turns out to still converge to SAFE even with w dropped --
+    w's own update happens to always land on an even value after one
+    step regardless of where it started, a genuine mathematical fact
+    about this particular arithmetic, not a bug. This test uses the
+    full 4-variable program specifically because *that* one doesn't
+    converge with x alone -- interesting on its own: extra, genuinely
+    irrelevant variables (y, z) still in play made qe less able to
+    find the SAFE proof here, not more.)
+    """
+    smt2 = _DILLIG46_SMT2
+    path = _write(tmp_path, "dillig46.smt2", smt2)
+    program = parse_chc_file(path, slice_program=False)
+    inv_rel = next(r for r in program.relations if r.name() == "inv")
+    canon = ForwardFixpoint(program)._resolved_variables[inv_rel]
+    x, _y, _z, _w = canon
+
+    result = run_forward_fixpoint(
+        program,
+        max_iterations=10,
+        timeout_ms=5_000,
+        initial_seed={inv_rel: x == 0},
+    )
+
+    assert result.status is ForwardFixpointStatus.UNKNOWN
+
+
+def test_initial_seed_violating_init_raises(tmp_path):
+    """A seed Init doesn't imply -- one that excludes a real initial
+    state -- is not a sound basis for a proof about the real program,
+    so this must fail loudly rather than silently substitute or ignore
+    it.
+    """
+    smt2 = """
+(declare-var x Int)
+(declare-rel inv (Int))
+(declare-rel fail ())
+(rule (inv 0))
+(rule (=> (inv x) (inv (+ x 1))))
+(rule (=> (and (inv x) (>= x 100)) fail))
+(query fail)
+"""
+    path = _write(tmp_path, "trivial.smt2", smt2)
+    program = parse_chc_file(path, slice_program=False)
+    inv_rel = next(r for r in program.relations if r.name() == "inv")
+    canon = ForwardFixpoint(program)._resolved_variables[inv_rel]
+    (x,) = canon
+
+    with pytest.raises(ValueError, match="does not satisfy Init"):
+        run_forward_fixpoint(
+            program,
+            max_iterations=5,
+            timeout_ms=5_000,
+            initial_seed={inv_rel: x == 5},
+        )
 

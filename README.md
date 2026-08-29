@@ -79,6 +79,17 @@ own interval widening can't express. See
 [`docs/ff_houdini.md`](docs/ff_houdini.md) for the mechanism, the
 soundness argument, and a verified worked example.
 
+`--ff-seeded` runs `--ff` seeded from individual pieces of a relation's
+fact-rule condition, one at a time, before falling back to the full fact
+rule -- never less capable than plain `--ff`, and sometimes faster or
+more robust, since a smaller seed means a smaller, simpler forward-image
+computation every round. Not a strict win, though: trying pieces that
+don't pan out costs real time, and it's not a fix for the `qe`-tactic
+soundness issue documented in `forward_fixpoint.md` (a smaller seed
+doesn't change which operators are in play). See
+[`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the mechanism
+and a measured example.
+
 ## Supported input formats
 
 Both common CHC encodings are supported.

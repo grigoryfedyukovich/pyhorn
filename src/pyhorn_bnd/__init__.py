@@ -30,6 +30,11 @@ from .explorer import (
     TraceCheck,
 )
 from .ff_houdini import FFHoudiniResult, FFHoudiniStatus, run_ff_houdini
+from .ff_seeded import (
+    SeededForwardFixpointResult,
+    fact_rule_conjuncts,
+    run_forward_fixpoint_from_init_conjuncts,
+)
 from .forward_fixpoint import (
     ForwardFixpoint,
     ForwardFixpointResult,
@@ -162,6 +167,7 @@ __all__ = [
     "SeedMiningResult",
     "SeedMiningStatistics",
     "SeedObservation",
+    "SeededForwardFixpointResult",
     "SolverPoolCheck",
     "SolverPoolStatistics",
     "StateVersion",
@@ -180,6 +186,7 @@ __all__ = [
     "VerificationConditionBuilder",
     "__version__",
     "build_verification_condition",
+    "fact_rule_conjuncts",
     "format_candidates_smt2",
     "merge_candidate_batches",
     "merge_candidate_maps",
@@ -188,6 +195,7 @@ __all__ = [
     "parse_chc_file",
     "run_ff_houdini",
     "run_forward_fixpoint",
+    "run_forward_fixpoint_from_init_conjuncts",
     "run_phasefit",
     "run_seed_houdini",
     "run_trace_houdini",

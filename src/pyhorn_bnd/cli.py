@@ -440,6 +440,35 @@ def _parser() -> argparse.ArgumentParser:
             "requires --ff-houdini)"
         ),
     )
+    parser.add_argument(
+        "--ff-seeded",
+        action="store_true",
+        help=(
+            "run --ff seeded from individual pieces of each relation's "
+            "fact-rule condition, one at a time, before trying the full "
+            "fact rule -- e.g. for a fact 'x==0 AND y==5', tries x==0 "
+            "alone, then y==5 alone, stopping at the first one whose own "
+            "closure under the step rules proves the query unreachable. "
+            "Never less capable than plain --ff (it falls back to the "
+            "full, literal fact rule -- today's --ff behavior -- if no "
+            "single piece works alone), but not strictly faster either: "
+            "trying several pieces that don't pan out before reaching a "
+            "working one, or the fallback, costs real time. Most likely "
+            "to help when a query only genuinely depends on some of a "
+            "relation's variables -- a smaller, simpler forward-image "
+            "computation each round -- and, as measured, can matter for "
+            "more than just speed: variables genuinely irrelevant to a "
+            "query have been observed to make the full joint computation "
+            "less able to find a proof it can find once they're dropped, "
+            "not just slower. See docs/forward_fixpoint.md. Cannot be "
+            "combined with --ff, --ff-houdini, --seed-houdini, --cands, "
+            "--trace-houdini, --phasefit, or --mut -- it is its own "
+            "standalone technique built on --ff. --ff's own tuning flags "
+            "(--ff-max-iterations, --ff-timeout-ms, --ff-overall-timeout-s, "
+            "--ff-no-generalization, --ff-widening-delay) apply to every "
+            "attempt this makes."
+        ),
+    )
     parser.add_argument("--random-seed", type=int, help="set Z3's SMT random seed")
     parser.add_argument(
         "--list-trace-templates",
@@ -939,26 +968,40 @@ def main(argv: list[str] | None = None) -> int:
         or args.phasefit
         or args.mut
         or args.ff_houdini
+        or args.ff_seeded
     ):
         parser.error(
             "--ff cannot be combined with --seed-houdini, --cands, "
-            "--trace-houdini, --phasefit, --mut, or --ff-houdini -- it is "
-            "a standalone technique"
+            "--trace-houdini, --phasefit, --mut, --ff-houdini, or "
+            "--ff-seeded -- it is a standalone technique"
         )
     if args.ff_houdini and (
         args.seed_houdini
         or args.cands is not None
         or args.phasefit
         or args.mut
+        or args.ff_seeded
     ):
         parser.error(
             "--ff-houdini cannot be combined with --seed-houdini, --cands, "
-            "--phasefit, or --mut -- it already runs its own seed-mining "
-            "each round (combine with --trace-houdini if you want "
-            "Trace-Houdini's mining instead of plain Seed-Houdini for the "
-            "Houdini side of each round)"
+            "--phasefit, --mut, or --ff-seeded -- it already runs its own "
+            "seed-mining each round (combine with --trace-houdini if you "
+            "want Trace-Houdini's mining instead of plain Seed-Houdini for "
+            "the Houdini side of each round)"
         )
-    if not args.ff and not args.ff_houdini and (
+    if args.ff_seeded and (
+        args.seed_houdini
+        or args.cands is not None
+        or args.trace_houdini
+        or args.phasefit
+        or args.mut
+    ):
+        parser.error(
+            "--ff-seeded cannot be combined with --seed-houdini, --cands, "
+            "--trace-houdini, --phasefit, or --mut -- it is its own "
+            "standalone technique built on --ff"
+        )
+    if not args.ff and not args.ff_houdini and not args.ff_seeded and (
         args.ff_max_iterations is not None
         or args.ff_timeout_ms is not None
         or args.ff_overall_timeout_s is not None
@@ -968,9 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--ff-max-iterations, --ff-timeout-ms, --ff-overall-timeout-s, "
             "--ff-no-generalization, and --ff-widening-delay all require "
-            "--ff or --ff-houdini -- without either, they have no effect "
-            "and this run would silently fall through to the default "
-            "bounded-explorer pipeline instead"
+            "--ff, --ff-houdini, or --ff-seeded -- without one of those, "
+            "they have no effect and this run would silently fall through "
+            "to the default bounded-explorer pipeline instead"
         )
     if not args.ff_houdini and args.ff_houdini_max_rounds is not None:
         parser.error("--ff-houdini-max-rounds requires --ff-houdini")
@@ -1036,6 +1079,103 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         "counterexample": result.counterexample_model,
                         "qe_unsound_rejections": result.qe_unsound_rejections,
+                    }
+                )
+            )
+        elif args.print_invariants and result.status is ForwardFixpointStatus.SAFE:
+            for relation, formula in result.reached.items():
+                canonical = result.variables.get(relation, ())
+                args_str = ", ".join(str(v) for v in canonical)
+                print(f"{relation.name()}({args_str}):")
+                print(f"  {formula}")
+        if result.status is ForwardFixpointStatus.SAFE:
+            print("Success")
+            return 0
+        if result.status is ForwardFixpointStatus.UNSAFE:
+            print("counterexample")
+            if result.counterexample_model:
+                print(result.counterexample_model)
+            return 1
+        print("unknown")
+        return 2
+    if args.ff_seeded:
+        try:
+            program = parse_chc_file(args.file, slice_program=False)
+        except (HornParseError, HornNormalizationError, OSError) as exc:
+            print(f"error: {exc}")
+            return 3
+        from .ff_seeded import run_forward_fixpoint_from_init_conjuncts
+        from .forward_fixpoint import (
+            DEFAULT_MAX_ITERATIONS,
+            DEFAULT_OVERALL_TIMEOUT_S,
+            DEFAULT_TIMEOUT_MS,
+            DEFAULT_WIDENING_DELAY,
+            ForwardFixpointStatus,
+        )
+
+        if args.debug:
+            print(
+                f"Parsed {len(program.rules)} linear CHCs (unsliced); "
+                f"Z3 {z3.get_version_string()}"
+            )
+            for rule in program.rules:
+                print(f"  {rule.short()}: {rule.body}")
+
+        outcome = run_forward_fixpoint_from_init_conjuncts(
+            program,
+            max_iterations=(
+                DEFAULT_MAX_ITERATIONS
+                if args.ff_max_iterations is None
+                else args.ff_max_iterations
+            ),
+            timeout_ms=(
+                DEFAULT_TIMEOUT_MS
+                if args.ff_timeout_ms is None
+                else args.ff_timeout_ms
+            ),
+            overall_timeout_s=(
+                DEFAULT_OVERALL_TIMEOUT_S
+                if args.ff_overall_timeout_s is None
+                else args.ff_overall_timeout_s
+            ),
+            enable_generalization=not args.ff_no_generalization,
+            widening_delay=(
+                DEFAULT_WIDENING_DELAY
+                if args.ff_widening_delay is None
+                else args.ff_widening_delay
+            ),
+        )
+        result = outcome.result
+        if args.debug:
+            print(
+                f"tried {outcome.attempts} single-conjunct seed(s) before "
+                + (
+                    f"succeeding with: {outcome.seed_used}"
+                    if outcome.seed_used is not None
+                    else "falling back to the full init"
+                )
+            )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": result.status.value,
+                        "iterations": result.iterations,
+                        "fixpoint_reached": result.fixpoint_reached,
+                        "message": result.message,
+                        "violated_rule": (
+                            result.violated_rule.short()
+                            if result.violated_rule
+                            else None
+                        ),
+                        "counterexample": result.counterexample_model,
+                        "qe_unsound_rejections": result.qe_unsound_rejections,
+                        "seed_used": (
+                            str(outcome.seed_used)
+                            if outcome.seed_used is not None
+                            else None
+                        ),
+                        "attempts": outcome.attempts,
                     }
                 )
             )

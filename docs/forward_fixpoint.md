@@ -153,6 +153,98 @@ runtime by two orders of magnitude on an otherwise-fast benchmark. See
 `test_growing_reachable_set_does_not_blow_up_wall_clock_time` for the
 regression test.
 
+## Seeding from something other than the literal init (`initial_seed`, `--ff-seeded`)
+
+By default, round 0 is seeded from the literal, complete fact-rule
+condition. `ForwardFixpoint.initial_seed` lets a caller override this,
+per relation, with any formula -- as long as it's implied by the real
+init (`Init ⇒ seed`, checked internally; violating this raises
+`ValueError` rather than silently producing an unsound result). A seed
+that's a superset of the real init (a single conjunct of it, say,
+dropping other conjuncts entirely) is always valid this way.
+
+This is sound in both directions, for reasons already established
+elsewhere in this document:
+
+- **SAFE** stays sound the same way the generalized track's SAFE
+  verdicts do: a superset seed's own closure avoiding the query means
+  the true, narrower init's closure avoids it too.
+- **UNSAFE** needs no extra protection at all: `_confirm_counterexample`
+  (see the CAUTION note above) already re-checks any candidate
+  counterexample via `BoundedExplorer` against the program's *real* fact
+  rules, entirely independent of whatever seed produced it -- so a
+  counterexample only reachable from the part of an over-broad seed
+  that isn't real gets caught and rejected there, the same as a
+  `qe`-tactic over-approximation would be.
+
+`--ff-seeded` (`ff_seeded.py`) is a concrete use of this: it extracts
+the individual pieces of each relation's fact-rule condition -- the same
+`SeedMiner`/`_boolean_seed_nodes` machinery Seed-Houdini already mines
+candidates with, filtered to fact-rule provenance -- and tries each one
+alone as `initial_seed`, in turn, stopping at the first SAFE (a
+confirmed UNSAFE also stops immediately, being just as valid a proof of
+the real program's unsafety as any other `--ff` counterexample). If none
+work alone, it falls back to the full, literal init: today's plain `--ff`
+behavior. This makes `--ff-seeded` never less capable than `--ff`, but
+not strictly faster either -- trying several pieces that don't pan out
+before reaching a working one, or the fallback, costs real time.
+
+```bash
+pyhorn-expl --ff-seeded input.smt2
+```
+
+Why a smaller seed can help at all, beyond just being a smaller problem:
+a relation with variables a query genuinely doesn't depend on can still
+make the *full* joint `qe` computation less able to find a proof it
+finds once those variables are dropped -- not just slower. This was
+measured directly, not assumed: a small benchmark with two variables
+tied together by a threshold condition and two more the query never
+touches converges cleanly to SAFE when seeded with just the first pair,
+but the full four-variable computation reliably comes back UNKNOWN on
+the same program (confirmed over repeated runs -- see
+`test_initial_seed_that_drops_an_irrelevant_variable_still_proves_safe`).
+It is *not*, however, a fix for the specific `qe`-tactic soundness issue
+in the CAUTION note above, or a reliable way to route around it -- that
+issue was reproduced on a formula mixing `%` with `If`, and swapping in
+a smaller seed for the same mixed formula doesn't change the operators
+involved. Confirmed on the actual case that motivated this feature: on
+the mod/ite-based `dillig46` benchmark specifically, no single
+fact-rule conjunct (x alone, y alone, z alone, or w alone) is enough --
+the property genuinely needs two of them together -- so `--ff-seeded`
+pays for several failed single-conjunct attempts before falling back to
+the full init on that particular input, with no net win. This is an
+honest limitation of trying single conjuncts specifically, not of the
+underlying `initial_seed` mechanism, which works correctly for any sound
+seed regardless of where it came from -- a caller with a way to
+construct better combinations (multiple conjuncts together, a
+Seed-Houdini candidate, a trace-derived formula) can pass any of them to
+`initial_seed` directly, `--ff-seeded`'s single-conjunct strategy is just
+the one built in today.
+
+### A verified example
+
+```smt2
+(declare-var x Int)
+(declare-var y Int)
+(declare-rel inv (Int Int))
+(declare-rel fail ())
+(rule (=> (and (= x 0) (= y 0)) (inv x y)))
+(rule (=> (and (inv x y) (< x 5)) (inv (+ x 1) y)))
+(rule (=> (and (inv x y) (>= x 100)) fail))
+(query fail)
+```
+
+```bash
+$ pyhorn-expl --ff-seeded --debug irrelevant_y.smt2
+...
+tried 1 single-conjunct seed(s) before succeeding with: __inv_0 == 0
+Success
+```
+
+`y` never affects `x`, and the single conjunct `x == 0` -- extracted
+straight from the fact rule -- is already enough to prove `x < 100` on
+its own, without ever needing to account for `y` at all.
+
 ## When to expect UNKNOWN
 
 - A relational invariant (a fixed relationship between two or more
@@ -182,6 +274,7 @@ like `y == 2*x`.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--ff` | off | Enable the technique. Required for any `--ff-*` flag below to have an effect. |
+| `--ff-seeded` | off | Run `--ff` seeded from individual fact-rule conjuncts, falling back to the full init -- see above. |
 | `--ff-max-iterations` | 20 | Round budget before giving up with UNKNOWN. |
 | `--ff-timeout-ms` | 10000 | Per-Z3-call timeout, in milliseconds. |
 | `--ff-overall-timeout-s` | 30 | Overall wall-clock budget for the whole run, in seconds. |
@@ -213,7 +306,10 @@ With `--json`, a single JSON object is printed instead, with fields
 exact track's own soundness" above -- normally 0; nonzero means at
 least one candidate counterexample was independently rejected along the
 way, so `status` may be UNKNOWN where a less careful reading of `qe`'s
-raw output would have said UNSAFE).
+raw output would have said UNSAFE). `--ff-seeded` adds two more:
+`seed_used` (the winning conjunct as a string, or `null` if it fell back
+to the full init) and `attempts` (how many single-conjunct seeds were
+tried, including a failed one if the winner was the fallback).
 
 ### Example
 
