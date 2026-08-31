@@ -958,9 +958,9 @@ def run_seed_houdini(
 
     ``extra_candidates``, if given, is merged in alongside the mined
     candidates before filtering -- e.g. a per-relation invariant an
-    orchestrator has independently established some other way (see
-    ``ff_houdini.py``). It must be expressed over the same canonical
-    variables ``SeedMiner`` allocates for this *program* (i.e.
+    orchestrator has independently established some other way. It must
+    be expressed over the same canonical variables ``SeedMiner``
+    allocates for this *program* (i.e.
     ``SeedMiner(program).variables``), or the merge will not line up with
     what MultiHoudini expects for each relation.
     """

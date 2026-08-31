@@ -410,34 +410,37 @@ def _parser() -> argparse.ArgumentParser:
         "--ff-houdini",
         action="store_true",
         help=(
-            "alternate --ff (forward-fixpoint) and Houdini in rounds: a "
-            "forward-fixpoint generalized fixpoint too loose to prove "
-            "safety on its own is merged into Houdini's candidate pool as "
-            "an extra (always-true, so never at risk of being incorrectly "
-            "eliminated) candidate, and once Houdini's own candidates for "
-            "a relation are proven closed under every fact and step rule "
-            "-- not just query rules -- they're fed back into "
-            "forward-fixpoint as external facts for the next round. "
-            "Handles real cases neither side proves alone -- see "
-            "docs/forward_fixpoint.md. Combine with --trace-houdini to use "
-            "Trace-Houdini instead of plain Seed-Houdini for the Houdini "
-            "side of each round. Cannot be combined with --ff, "
-            "--seed-houdini, --cands, --phasefit, or --mut -- it already "
-            "runs its own seed-mining each round on top of whatever "
-            "forward-fixpoint contributes. --ff's own tuning flags "
+            "run --ff (forward-fixpoint) seeded individually from a "
+            "candidate pool, generalizing --ff-seeded from a single fixed "
+            "source (fact-rule conjuncts) to any combination of this "
+            "codebase's candidate-generating techniques: gather candidates "
+            "-- by default (nothing else given), SeedMiner's own full "
+            "mining, the same mining --seed-houdini uses; once --cands "
+            "and/or --trace-houdini is given instead, --seed-houdini "
+            "becomes a genuine opt-in toggle for that mining rather than "
+            "something included regardless, exactly like it is for the "
+            "ordinary Houdini pipeline (--phasefit is the one exception: "
+            "it needs a seed-mining pass of its own for atom harvesting "
+            "regardless, so its candidates end up in the pool either way) "
+            "-- drop any that fail the initiation check (Init => candidate "
+            "-- the same soundness condition --ff-seeded's fact-rule "
+            "conjuncts satisfy by construction), then try each surviving "
+            "candidate on its own as forward-fixpoint's initial_seed for "
+            "its relation -- every other relation keeps its normal, full "
+            "fact-rule seeding -- stopping at the first SAFE or confirmed "
+            "UNSAFE. There is no further fallback to a whole-program, "
+            "un-seeded --ff run if nothing in the pool settles it (see "
+            "docs/ff_houdini.md for why). Combinable with --seed-houdini, "
+            "--cands, --phasefit, --mut, --trace-houdini, and --ff-seeded "
+            "(the last of which has no separate effect alongside it: "
+            "--ff-seeded's own fact-rule-conjunct strategy is exactly this "
+            "mode's default candidate source). Cannot be combined with "
+            "plain --ff -- it is a different, standalone technique. --ff's "
+            "own tuning flags "
             "(--ff-max-iterations, --ff-timeout-ms, --ff-overall-timeout-s, "
-            "--ff-no-generalization, --ff-widening-delay) apply to the "
-            "forward-fixpoint side of each round; --to and --random-seed "
-            "apply to the Houdini side."
-        ),
-    )
-    parser.add_argument(
-        "--ff-houdini-max-rounds",
-        type=int,
-        default=None,
-        help=(
-            "round budget for --ff-houdini alternation (default: 3; "
-            "requires --ff-houdini)"
+            "--ff-no-generalization, --ff-widening-delay) apply to every "
+            "individual attempt this makes; --to and --random-seed apply "
+            "to trace mining, when --trace-houdini is also given."
         ),
     )
     parser.add_argument(
@@ -460,10 +463,13 @@ def _parser() -> argparse.ArgumentParser:
             "more than just speed: variables genuinely irrelevant to a "
             "query have been observed to make the full joint computation "
             "less able to find a proof it can find once they're dropped, "
-            "not just slower. See docs/forward_fixpoint.md. Cannot be "
-            "combined with --ff, --ff-houdini, --seed-houdini, --cands, "
-            "--trace-houdini, --phasefit, or --mut -- it is its own "
-            "standalone technique built on --ff. --ff's own tuning flags "
+            "not just slower. See docs/forward_fixpoint.md. May be passed "
+            "alongside --ff-houdini but has no separate effect there, "
+            "since trying individual sound fact-rule conjuncts is exactly "
+            "--ff-houdini's own default behavior. Otherwise cannot be "
+            "combined with --ff, --seed-houdini, --cands, --trace-houdini, "
+            "--phasefit, or --mut -- it is its own standalone technique "
+            "built on --ff. --ff's own tuning flags "
             "(--ff-max-iterations, --ff-timeout-ms, --ff-overall-timeout-s, "
             "--ff-no-generalization, --ff-widening-delay) apply to every "
             "attempt this makes."
@@ -975,21 +981,16 @@ def main(argv: list[str] | None = None) -> int:
             "--trace-houdini, --phasefit, --mut, --ff-houdini, or "
             "--ff-seeded -- it is a standalone technique"
         )
-    if args.ff_houdini and (
-        args.seed_houdini
-        or args.cands is not None
-        or args.phasefit
-        or args.mut
-        or args.ff_seeded
-    ):
-        parser.error(
-            "--ff-houdini cannot be combined with --seed-houdini, --cands, "
-            "--phasefit, --mut, or --ff-seeded -- it already runs its own "
-            "seed-mining each round (combine with --trace-houdini if you "
-            "want Trace-Houdini's mining instead of plain Seed-Houdini for "
-            "the Houdini side of each round)"
-        )
-    if args.ff_seeded and (
+    # --ff-houdini is deliberately NOT rejected in combination with
+    # --seed-houdini, --cands, --phasefit, --mut, --trace-houdini, or
+    # --ff-seeded: it gathers candidates from any combination of those
+    # (see docs/ff_houdini.md), and --ff-seeded specifically has no
+    # separate effect alongside it (its own fact-rule-conjunct strategy
+    # is exactly --ff-houdini's own default candidate source), so the
+    # --ff-seeded validation below is skipped whenever --ff-houdini is
+    # also set rather than rejecting the (redundant but harmless)
+    # combination.
+    if args.ff_seeded and not args.ff_houdini and (
         args.seed_houdini
         or args.cands is not None
         or args.trace_houdini
@@ -1015,8 +1016,6 @@ def main(argv: list[str] | None = None) -> int:
             "they have no effect and this run would silently fall through "
             "to the default bounded-explorer pipeline instead"
         )
-    if not args.ff_houdini and args.ff_houdini_max_rounds is not None:
-        parser.error("--ff-houdini-max-rounds requires --ff-houdini")
     if args.ff:
         try:
             program = parse_chc_file(args.file, slice_program=False)
@@ -1092,6 +1091,140 @@ def main(argv: list[str] | None = None) -> int:
             print("Success")
             return 0
         if result.status is ForwardFixpointStatus.UNSAFE:
+            print("counterexample")
+            if result.counterexample_model:
+                print(result.counterexample_model)
+            return 1
+        print("unknown")
+        return 2
+    if args.ff_houdini:
+        # Reject the same trace-houdini-only sub-pipeline restrictions the
+        # plain houdini_mode block enforces below, since --ff-houdini
+        # never reaches that block (it returns before it).
+        if args.trace_houdini and args.validate_candidates:
+            parser.error(
+                "--trace-houdini cannot be combined with --validate-candidates"
+            )
+        if args.trace_houdini and args.dump_cands is not None:
+            parser.error("--trace-houdini cannot be combined with --dump-cands")
+        try:
+            program = parse_chc_file(args.file, slice_program=False)
+        except (HornParseError, HornNormalizationError, OSError) as exc:
+            print(f"error: {exc}")
+            return 3
+        from .ff_houdini import FFHoudiniStatus, run_ff_houdini
+        from .forward_fixpoint import (
+            DEFAULT_MAX_ITERATIONS,
+            DEFAULT_OVERALL_TIMEOUT_S,
+            DEFAULT_TIMEOUT_MS,
+            DEFAULT_WIDENING_DELAY,
+        )
+
+        if args.debug:
+            print(
+                f"Parsed {len(program.rules)} linear CHCs (unsliced); "
+                f"Z3 {z3.get_version_string()}"
+            )
+            for rule in program.rules:
+                print(f"  {rule.short()}: {rule.body}")
+
+        try:
+            result = run_ff_houdini(
+                program,
+                use_seed_houdini=args.seed_houdini,
+                cands_path=args.cands,
+                use_phasefit=args.phasefit,
+                use_mut=args.mut,
+                use_trace=args.trace_houdini,
+                trace_depth=args.trace_depth,
+                trace_limit=args.trace_limit,
+                trace_models_per_prefix=args.trace_models_per_prefix,
+                trace_samples_per_relation=args.trace_samples_per_predicate,
+                trace_candidates_per_relation=args.trace_candidates_per_predicate,
+                ff_max_iterations=(
+                    DEFAULT_MAX_ITERATIONS
+                    if args.ff_max_iterations is None
+                    else args.ff_max_iterations
+                ),
+                ff_timeout_ms=(
+                    DEFAULT_TIMEOUT_MS
+                    if args.ff_timeout_ms is None
+                    else args.ff_timeout_ms
+                ),
+                ff_overall_timeout_s=(
+                    DEFAULT_OVERALL_TIMEOUT_S
+                    if args.ff_overall_timeout_s is None
+                    else args.ff_overall_timeout_s
+                ),
+                ff_enable_generalization=not args.ff_no_generalization,
+                ff_widening_delay=(
+                    DEFAULT_WIDENING_DELAY
+                    if args.ff_widening_delay is None
+                    else args.ff_widening_delay
+                ),
+                houdini_timeout_ms=args.timeout_ms,
+                random_seed=args.random_seed,
+            )
+        except (HornParseError, HornNormalizationError, OSError) as exc:
+            # --cands parsing (a user-supplied candidate file, unlike the
+            # program file itself) can fail the same ways.
+            print(f"error: {exc}")
+            return 3
+        if args.debug:
+            print(
+                f"gathered {result.candidates_gathered} candidate(s), "
+                f"{result.candidates_sound} initiation-sound; tried "
+                f"{result.attempts} "
+                + (
+                    "before succeeding with "
+                    f"{result.winning_relation.name()}: "
+                    f"{result.winning_candidate}"
+                    if result.winning_candidate is not None
+                    else "-- none settled the question"
+                )
+            )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "status": result.status.value,
+                        "message": result.message,
+                        "candidates_gathered": result.candidates_gathered,
+                        "candidates_sound": result.candidates_sound,
+                        "attempts": result.attempts,
+                        "winning_relation": (
+                            result.winning_relation.name()
+                            if result.winning_relation is not None
+                            else None
+                        ),
+                        "winning_candidate": (
+                            str(result.winning_candidate)
+                            if result.winning_candidate is not None
+                            else None
+                        ),
+                        "violated_rule": (
+                            result.violated_rule.short()
+                            if result.violated_rule
+                            else None
+                        ),
+                        "counterexample": result.counterexample_model,
+                    }
+                )
+            )
+        elif (
+            args.print_invariants
+            and result.status is FFHoudiniStatus.SAFE
+            and result.invariants
+        ):
+            for relation, formula in result.invariants.items():
+                canonical = result.variables.get(relation, ())
+                args_str = ", ".join(str(v) for v in canonical)
+                print(f"{relation.name()}({args_str}):")
+                print(f"  {formula}")
+        if result.status is FFHoudiniStatus.SAFE:
+            print("Success")
+            return 0
+        if result.status is FFHoudiniStatus.UNSAFE:
             print("counterexample")
             if result.counterexample_model:
                 print(result.counterexample_model)
@@ -1195,97 +1328,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("unknown")
         return 2
-    if args.ff_houdini:
-        try:
-            program = parse_chc_file(args.file, slice_program=False)
-        except (HornParseError, HornNormalizationError, OSError) as exc:
-            print(f"error: {exc}")
-            return 3
-        from .ff_houdini import DEFAULT_MAX_ROUNDS, FFHoudiniStatus, run_ff_houdini
-        from .forward_fixpoint import (
-            DEFAULT_MAX_ITERATIONS,
-            DEFAULT_OVERALL_TIMEOUT_S,
-            DEFAULT_TIMEOUT_MS,
-            DEFAULT_WIDENING_DELAY,
-        )
-
-        if args.debug:
-            print(
-                f"Parsed {len(program.rules)} linear CHCs (unsliced); "
-                f"Z3 {z3.get_version_string()}"
-            )
-            for rule in program.rules:
-                print(f"  {rule.short()}: {rule.body}")
-
-        result = run_ff_houdini(
-            program,
-            use_trace=args.trace_houdini,
-            max_rounds=(
-                DEFAULT_MAX_ROUNDS
-                if args.ff_houdini_max_rounds is None
-                else args.ff_houdini_max_rounds
-            ),
-            ff_max_iterations=(
-                DEFAULT_MAX_ITERATIONS
-                if args.ff_max_iterations is None
-                else args.ff_max_iterations
-            ),
-            ff_timeout_ms=(
-                DEFAULT_TIMEOUT_MS
-                if args.ff_timeout_ms is None
-                else args.ff_timeout_ms
-            ),
-            ff_overall_timeout_s=(
-                DEFAULT_OVERALL_TIMEOUT_S
-                if args.ff_overall_timeout_s is None
-                else args.ff_overall_timeout_s
-            ),
-            ff_enable_generalization=not args.ff_no_generalization,
-            ff_widening_delay=(
-                DEFAULT_WIDENING_DELAY
-                if args.ff_widening_delay is None
-                else args.ff_widening_delay
-            ),
-            houdini_timeout_ms=args.timeout_ms,
-            random_seed=args.random_seed,
-        )
-        if args.json:
-            print(
-                json.dumps(
-                    {
-                        "status": result.status.value,
-                        "rounds": result.rounds,
-                        "message": result.message,
-                        "violated_rule": (
-                            result.violated_rule.short()
-                            if result.violated_rule
-                            else None
-                        ),
-                        "counterexample": result.counterexample_model,
-                    }
-                )
-            )
-        elif (
-            args.print_invariants
-            and result.status is FFHoudiniStatus.SAFE
-            and result.invariants
-        ):
-            for relation, conjuncts in result.invariants.items():
-                canonical = result.variables.get(relation, ())
-                args_str = ", ".join(str(v) for v in canonical)
-                print(f"{relation.name()}({args_str}):")
-                for conjunct in conjuncts:
-                    print(f"  {conjunct}")
-        if result.status is FFHoudiniStatus.SAFE:
-            print("Success")
-            return 0
-        if result.status is FFHoudiniStatus.UNSAFE:
-            print("counterexample")
-            if result.counterexample_model:
-                print(result.counterexample_model)
-            return 1
-        print("unknown")
-        return 2
     if args.upto < args.start:
         parser.error("--upto must be greater than or equal to --from")
     if (
@@ -1299,7 +1341,12 @@ def main(argv: list[str] | None = None) -> int:
     # seed-houdini attempt as its own first stage, so passing --seed-houdini
     # alongside it is accepted as a (redundant but harmless) no-op rather
     # than an error.
-    if args.trace_houdini and args.cands is not None:
+    # --ff-houdini builds its own candidate pool directly (see
+    # docs/ff_houdini.md) rather than delegating to run_trace_houdini(),
+    # so it does not share that function's "--trace-houdini cannot be
+    # combined with --cands" limitation -- exempted here rather than
+    # rejecting a combination --ff-houdini actually supports.
+    if args.trace_houdini and args.cands is not None and not args.ff_houdini:
         parser.error("--trace-houdini cannot be combined with --cands")
     if args.trace_houdini and args.validate_candidates:
         parser.error("--trace-houdini cannot be combined with --validate-candidates")
@@ -1313,9 +1360,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--validate-candidates requires --seed-houdini or --cands")
     if args.mut and not (
         args.seed_houdini or args.cands is not None or args.trace_houdini
-        or args.phasefit
+        or args.phasefit or args.ff_houdini
     ):
-        parser.error("--mut requires --seed-houdini, --cands, --trace-houdini, or --phasefit")
+        parser.error(
+            "--mut requires --seed-houdini, --cands, --trace-houdini, "
+            "--phasefit, or --ff-houdini"
+        )
     if args.candidate_bound < 1:
         parser.error("--candidate-bound must be at least 1")
     if args.dump_promising_candidates is not None and not args.validate_candidates:

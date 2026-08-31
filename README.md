@@ -70,12 +70,19 @@ relational invariant like `y == 2*x` between two counters). See
 [`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the full
 algorithm, the generalized/widening track, and the `--ff-*` flag reference.
 
-`--ff-houdini` alternates `--ff` and Seed-/Trace-Houdini in rounds, each
-feeding what it found to the other, and can prove programs neither side
-proves alone -- a reachability fact `--ff` derives across a relation
-boundary that Houdini's syntactic mining has no way to guess, combined
-with a relational fact Houdini mines directly from the query that `--ff`'s
-own interval widening can't express. See
+`--ff-houdini` generalizes `--ff-seeded`'s "try one sound fact-rule
+conjunct at a time" strategy from a single fixed candidate source to any
+combination of this codebase's candidate-generating techniques: gather a
+pool (SeedMiner's own mining by default, broadened by any of `--cands`,
+`--phasefit`, `--mut`, and `--trace-houdini`), drop whatever fails the
+initiation check (`Init => candidate`), and try each survivor
+individually as forward-fixpoint's seed, stopping at the first proof.
+Unlike `--ff` itself, it is compatible with every one of
+`--seed-houdini`, `--cands`, `--phasefit`, `--mut`, `--trace-houdini`, and
+`--ff-seeded` -- it can prove programs neither `--ff` nor Seed-/
+Trace-Houdini proves alone, such as a reachability fact that only exists
+because of forward propagation across a relation boundary with no
+literal comparison anywhere for syntactic mining to weaken. See
 [`docs/ff_houdini.md`](docs/ff_houdini.md) for the mechanism, the
 soundness argument, and a verified worked example.
 

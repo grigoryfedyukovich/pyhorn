@@ -481,9 +481,9 @@ class ForwardFixpoint:
     widening_delay: int = DEFAULT_WIDENING_DELAY
     # Per-relation formulas that are already known to be true for every
     # reachable state of that relation, established independently of
-    # this run (typically a Houdini-certified invariant fed in by an
-    # orchestrator alternating between this technique and Houdini -- see
-    # ff_houdini.py). Purely additive and always sound to use: it can
+    # this run (e.g. a Houdini-certified invariant an orchestrator has
+    # proven some other way and wants this run to build on). Purely
+    # additive and always sound to use: it can
     # only tighten a hypothesis or a query check, never loosen one, and
     # it can stand in for a tainted relation's own (possibly-incomplete)
     # computed reachable set, since it doesn't inherit that taint -- it
@@ -1172,3 +1172,92 @@ def run_forward_fixpoint(
         external_invariants=external_invariants,
         initial_seed=initial_seed,
     ).run()
+
+
+def relation_fact_seed(
+    program: HornProgram,
+    relation: z3.FuncDeclRef,
+    *,
+    variables: VariableMap | None = None,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    overall_timeout_s: float = DEFAULT_OVERALL_TIMEOUT_S,
+) -> z3.BoolRef | None:
+    """*relation*'s own literal fact-rule condition -- the union of the
+    forward images of every fact rule whose destination is *relation* --
+    exactly what round 0 of :meth:`ForwardFixpoint.run` computes for it
+    before any ``initial_seed`` override is applied. Computed here in
+    isolation from every other relation: a fact rule has no
+    ``src_relation``, so its image never depends on any other relation's
+    own reachable set (see :meth:`ForwardFixpoint._image_of_rule`).
+
+    Returns ``z3.BoolVal(False)`` if *relation* has no fact rule at all --
+    a real, trustworthy "no initial states of its own", not a failure.
+    Returns ``None`` if QE failed to compute at least one contributing
+    fact rule's image, in which case the caller has no trustworthy
+    condition to check anything against.
+    """
+    fp = ForwardFixpoint(
+        program,
+        variables=variables,
+        timeout_ms=timeout_ms,
+        overall_timeout_s=overall_timeout_s,
+    )
+    deadline = time.monotonic() + overall_timeout_s
+    reached = z3.BoolVal(False)
+    for rule in program.rules:
+        if not rule.is_fact or rule.dst_relation is not relation:
+            continue
+        # A fact rule's image never reads `reached` (its
+        # `_src_hypothesis` is unconditionally True -- no src_relation to
+        # look up), so an empty mapping is a safe stand-in here.
+        image = fp._image_of_rule(rule, {}, tainted=set(), deadline=deadline)
+        if image is None:
+            return None
+        reached = z3.simplify(z3.Or(reached, image))
+    return reached
+
+
+def candidate_passes_initiation(
+    program: HornProgram,
+    relation: z3.FuncDeclRef,
+    candidate: z3.BoolRef,
+    *,
+    fact_seed: z3.BoolRef | None = None,
+    variables: VariableMap | None = None,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    overall_timeout_s: float = DEFAULT_OVERALL_TIMEOUT_S,
+) -> bool | None:
+    """Whether *candidate* is a sound ``initial_seed`` override for
+    *relation*: does ``Init(relation) => candidate`` hold, where
+    ``Init(relation)`` is *relation*'s own literal fact-rule condition
+    (see :func:`relation_fact_seed`)?
+
+    This is exactly the check :meth:`ForwardFixpoint.run` itself performs
+    -- and raises ``ValueError`` over -- when handed an ``initial_seed``;
+    calling this first lets a caller with a whole pool of untrusted
+    candidates (see ``ff_houdini.py``) filter out the unsound ones instead
+    of hitting that exception one at a time.
+
+    Pass a *fact_seed* already computed via :func:`relation_fact_seed` to
+    avoid recomputing *relation*'s fact condition for every one of its
+    candidates -- it does not change from one candidate to the next.
+
+    True/False, or ``None`` if either *relation*'s fact condition or the
+    entailment check itself could not be decided within the timeout --
+    callers should treat ``None`` the same as ``False``, since an
+    unconfirmed candidate is not a safe basis for a proof either way.
+    """
+    init = (
+        fact_seed
+        if fact_seed is not None
+        else relation_fact_seed(
+            program,
+            relation,
+            variables=variables,
+            timeout_ms=timeout_ms,
+            overall_timeout_s=overall_timeout_s,
+        )
+    )
+    if init is None:
+        return None
+    return _entails(init, candidate, timeout_ms=timeout_ms)
