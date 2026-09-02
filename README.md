@@ -70,32 +70,36 @@ relational invariant like `y == 2*x` between two counters). See
 [`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the full
 algorithm, the generalized/widening track, and the `--ff-*` flag reference.
 
-`--ff-houdini` generalizes `--ff-seeded`'s "try one sound fact-rule
-conjunct at a time" strategy from a single fixed candidate source to any
-combination of this codebase's candidate-generating techniques: gather a
-pool (SeedMiner's own mining by default, broadened by any of `--cands`,
-`--phasefit`, `--mut`, and `--trace-houdini`), drop whatever fails the
-initiation check (`Init => candidate`), and try each survivor
-individually as forward-fixpoint's seed, stopping at the first proof.
-Unlike `--ff` itself, it is compatible with every one of
-`--seed-houdini`, `--cands`, `--phasefit`, `--mut`, `--trace-houdini`, and
-`--ff-seeded` -- it can prove programs neither `--ff` nor Seed-/
-Trace-Houdini proves alone, such as a reachability fact that only exists
-because of forward propagation across a relation boundary with no
-literal comparison anywhere for syntactic mining to weaken. See
-[`docs/ff_houdini.md`](docs/ff_houdini.md) for the mechanism, the
-soundness argument, and a verified worked example.
-
-`--ff-seeded` runs `--ff` seeded from individual pieces of a relation's
-fact-rule condition, one at a time, before falling back to the full fact
-rule -- never less capable than plain `--ff`, and sometimes faster or
-more robust, since a smaller seed means a smaller, simpler forward-image
-computation every round. Not a strict win, though: trying pieces that
-don't pan out costs real time, and it's not a fix for the `qe`-tactic
+`--ff-seeded` runs `--ff` seeded individually from a candidate pool, one
+candidate at a time, before falling back to the full fact rule -- never
+less capable than plain `--ff`, and sometimes faster or more robust,
+since a smaller seed means a smaller, simpler forward-image computation
+every round. By default the pool is a relation's own fact-rule
+conjuncts; `--seed-houdini`, `--cands`, `--phasefit`, `--mut`, and
+`--trace-houdini` widen it to any of this codebase's other
+candidate-generating techniques, each checked against the same
+initiation condition (`Init => candidate`) fact-rule conjuncts satisfy
+by construction. Not a strict win, though: trying candidates that don't
+pan out costs real time, and it's not a fix for the `qe`-tactic
 soundness issue documented in `forward_fixpoint.md` (a smaller seed
 doesn't change which operators are in play). See
 [`docs/forward_fixpoint.md`](docs/forward_fixpoint.md) for the mechanism
 and a measured example.
+
+`--ff-houdini` alternates real Houdini elimination and this same
+accelerated forward-fixpoint in rounds, each feeding the other: run
+`MultiHoudini` on the whole candidate pool at once (always SeedMiner's
+full mining, further widened the same way `--ff-seeded`'s flags widen
+its own pool); whatever it certifies as inductive becomes
+`external_invariants` for one forward-fixpoint pass, tightening the
+image computed each iteration; if that doesn't settle it either, the
+pass's own reachable-set formulas feed the *next* round's Houdini pass,
+together with the entire original pool again. It can prove programs
+neither `--ff` nor Seed-Houdini proves alone -- Houdini's own candidates
+aren't quite enough by themselves, but combining with a genuinely
+computed reachable-set formula is. See
+[`docs/ff_houdini.md`](docs/ff_houdini.md) for the mechanism and a
+verified worked example.
 
 ## Supported input formats
 

@@ -207,19 +207,33 @@ It is *not*, however, a fix for the specific `qe`-tactic soundness issue
 in the CAUTION note above, or a reliable way to route around it -- that
 issue was reproduced on a formula mixing `%` with `If`, and swapping in
 a smaller seed for the same mixed formula doesn't change the operators
-involved. Confirmed on the actual case that motivated this feature: on
-the mod/ite-based `dillig46` benchmark specifically, no single
-fact-rule conjunct (x alone, y alone, z alone, or w alone) is enough --
-the property genuinely needs two of them together -- so `--ff-seeded`
-pays for several failed single-conjunct attempts before falling back to
-the full init on that particular input, with no net win. This is an
-honest limitation of trying single conjuncts specifically, not of the
-underlying `initial_seed` mechanism, which works correctly for any sound
-seed regardless of where it came from -- a caller with a way to
-construct better combinations (multiple conjuncts together, a
-Seed-Houdini candidate, a trace-derived formula) can pass any of them to
-`initial_seed` directly, `--ff-seeded`'s single-conjunct strategy is just
-the one built in today.
+involved. On the mod/ite-based `dillig46` benchmark specifically, no
+single fact-rule conjunct (x alone, y alone, z alone, or w alone) is
+enough on its own -- the property genuinely needs two of them together.
+This is an honest limitation of trying single conjuncts specifically,
+not of the underlying `initial_seed` mechanism itself, which works
+correctly for any sound seed regardless of where it came from -- and
+it's why `--ff-seeded` widens its own candidate pool, rather than only
+ever trying fact-rule conjuncts one at a time, when asked to:
+
+```bash
+# broadens the pool beyond fact-rule conjuncts to any of this
+# codebase's other candidate-generating techniques -- each one checked
+# against the same initiation condition fact-rule conjuncts satisfy by
+# construction -- while keeping the fallback to the full, literal init
+pyhorn-expl --ff-seeded --seed-houdini --cands extra.smt2 --phasefit --mut --trace-houdini input.smt2
+```
+
+By default (none of those given), the pool is still exactly the
+fact-rule conjuncts described above. `--seed-houdini` is a genuine
+toggle for SeedMiner's own full mining (fact-, step-, and query-rule
+provenance alike) whenever it's given, whether alone or alongside the
+others; `--phasefit` is the one exception, since it needs a seed-mining
+pass of its own regardless. See `--ff-houdini` (`ff_houdini.md`) for a
+different, complementary technique built on the same widened candidate
+pool: instead of trying candidates individually against `initial_seed`,
+it runs real Houdini elimination on the whole pool at once and
+alternates with an accelerated forward-fixpoint pass.
 
 ### A verified example
 
@@ -274,7 +288,7 @@ like `y == 2*x`.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--ff` | off | Enable the technique. Required for any `--ff-*` flag below to have an effect. |
-| `--ff-seeded` | off | Run `--ff` seeded from individual fact-rule conjuncts, falling back to the full init -- see above. |
+| `--ff-seeded` | off | Run `--ff` seeded individually from a candidate pool (fact-rule conjuncts by default, widened by `--seed-houdini`/`--cands`/`--phasefit`/`--mut`/`--trace-houdini`), falling back to the full init -- see above. |
 | `--ff-max-iterations` | 20 | Round budget before giving up with UNKNOWN. |
 | `--ff-timeout-ms` | 10000 | Per-Z3-call timeout, in milliseconds. |
 | `--ff-overall-timeout-s` | 30 | Overall wall-clock budget for the whole run, in seconds. |
