@@ -1,0 +1,8 @@
+(set-logic HORN)
+(declare-rel inv (Int))
+(declare-rel fail ())
+(declare-var x0 Int) (declare-var x1 Int)
+(rule (=> (= x1 1000000000) (inv x1)))
+(rule (=> (and (inv x0) (> x0 0) (= x1 (- x0 17))) (inv x1)))
+(rule (=> (and (inv x0) (<= x0 0)) fail))
+(query fail)

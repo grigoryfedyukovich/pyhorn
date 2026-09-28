@@ -1,0 +1,23 @@
+(set-logic HORN)
+(declare-rel inv (Int Int Int Int Int Int))
+(declare-rel fail ())
+(declare-var x0 Int) (declare-var x1 Int)
+(declare-var a0 Int) (declare-var a1 Int)
+(declare-var b0 Int) (declare-var b1 Int)
+(declare-var c0 Int) (declare-var c1 Int)
+(declare-var d0 Int) (declare-var d1 Int)
+(declare-var e0 Int) (declare-var e1 Int)
+(rule (=> (and (= x1 0) (= a1 0) (= b1 0) (= c1 0) (= d1 0) (= e1 0)) (inv x1 a1 b1 c1 d1 e1)))
+(rule
+  (=>
+    (and
+      (inv x0 a0 b0 c0 d0 e0)
+      (= x1 (+ x0 1))
+      (= a1 (ite (< x0 100000000) (+ a0 1) a0))
+      (= b1 (ite (< x0 100000000) b0 (ite (< x0 250000000) (+ b0 1) b0)))
+      (= c1 (ite (< x0 250000000) c0 (ite (< x0 450000000) (+ c0 1) c0)))
+      (= d1 (ite (< x0 450000000) d0 (ite (< x0 700000000) (+ d0 1) d0)))
+      (= e1 (ite (< x0 700000000) e0 (+ e0 1))))
+    (inv x1 a1 b1 c1 d1 e1)))
+(rule (=> (and (inv x0 a0 b0 c0 d0 e0) (>= e0 900000000)) fail))
+(query fail)

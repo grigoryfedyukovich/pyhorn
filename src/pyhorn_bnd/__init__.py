@@ -8,6 +8,7 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.18"
 
+from .accel import AccelerationSummary, accelerate_program, describe_witness
 from .candidate_generation import (
     CandidateBatch,
     CandidateGenerator,
@@ -119,6 +120,7 @@ from .vc import (
 )
 
 __all__ = [
+    "AccelerationSummary",
     "DEFAULT_CANDIDATE_BOUND",
     "DEFAULT_MAX_AFFINE_COEFFICIENT",
     "DEFAULT_MAX_CONGRUENCE_MODULUS",
@@ -185,7 +187,9 @@ __all__ = [
     "VerificationCondition",
     "VerificationConditionBuilder",
     "__version__",
+    "accelerate_program",
     "build_verification_condition",
+    "describe_witness",
     "fact_rule_conjuncts",
     "format_candidates_smt2",
     "merge_candidate_batches",

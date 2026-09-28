@@ -775,6 +775,86 @@ pyhorn-expl --upto 20 input.smt2
 python3 bounded_explorer.py --upto 20 examples/assert_syntax.smt2
 ```
 
+### Loop acceleration (`--accelerate-bmc`, no unrolling for deep loops)
+
+Exhaustive unrolling needs a bound at least as large as the deepest real
+counterexample: a bug that only manifests after a million loop iterations
+needs `--upto` past a million, which is rarely practical. `--accelerate-bmc`
+ports the core idea of Frohn/Giesl et al.'s "Accelerated Bounded Model
+Checking" (FM 2024) into the explorer: before searching, it looks at every
+self-loop rule, and for every branch of that loop PhaseFit's closed-form
+machinery can solve a recurrence for, synthesizes a shortcut rule
+representing "n consecutive iterations of this branch" with `n` a free
+variable. A trace that uses the shortcut reaches a real iteration count of
+`n` at search depth 1 instead of depth `n`:
+
+```bash
+pyhorn-expl --accelerate-bmc --debug --upto 10 input.smt2
+```
+
+On a single counter loop guarded by `x < 1000000000` (`examples/accelerate_bmc/deep_counter_large.smt2`),
+plain `--upto` would need a billion steps; `--accelerate-bmc` finds the
+counterexample at depth 3 regardless of the threshold's magnitude, because
+the shortcut's closed form doesn't care how large `n` turns out to be. On a
+threshold small enough for both to finish
+(`examples/accelerate_bmc/deep_counter_small.smt2` scaled to 3000), this
+measured an ~9000x wall-clock speedup for an identical counterexample.
+
+Scope of this version:
+
+- only a *singleton* self-loop (one rule, `src_relation == dst_relation`) is
+  accelerated -- multi-rule/multi-predicate cycles (nested loops) are not;
+- internal `ite` branches inside one self-loop ARE supported, one shortcut
+  per branch, matching PhaseFit's own multi-phase view of a loop;
+- only guards PhaseFit's closed-form/guard machinery can classify -- either
+  n-invariant under a branch's own updates, or "monotonic" with an explicit
+  crossover -- are accelerated; anything past that (periodic guards, or
+  updates past PhaseFit's affine/geometric/mod closed-form ceiling) falls
+  back to plain unrolling for that branch, silently, never claiming an
+  unsound shortcut.
+
+The raw rule is *replaced* by its shortcuts only after an independent SMT
+coverage check proves that every original one-step transition is represented
+by at least one shortcut with `n = 1`. This check is intentionally separate
+from PhaseFit's branch enumeration, which is best-effort and caps very large
+Cartesian products. If coverage cannot be proved, the raw rule is kept as a
+fallback and the sound shortcuts are added alongside it. The replacement
+optimization still avoids doubling BoundedExplorer's loop branching factor on
+ordinary fully-covered loops, but correctness no longer depends on assuming
+that branch enumeration was complete.
+
+Before a shortcut is emitted, its closed forms are also checked directly: the
+trajectory must start at the real source state (`f(0) = state`) and every
+virtual step `f(k) -> f(k+1)` must satisfy the extracted branch update for all
+`0 <= k < n`. This rejects, for example, coupled recurrences that PhaseFit's
+per-variable candidate solver cannot represent soundly. Non-update equalities
+such as source-state guards remain guards rather than being discarded.
+
+Not meaningful outside the default counterexample search; combining it with
+`--ff`, `--ff-houdini`, `--ff-seeded`, `--seed-houdini`, `--cands`,
+`--trace-houdini`, `--phasefit`, or `--mut` is rejected.
+
+When a counterexample uses an accelerated step, the report includes a
+compact witness -- how many real transitions the trace represents (`N`,
+which can vastly exceed the trace's own length) and, per accelerated step,
+its concrete iteration count and per-variable closed form -- instead of
+only a rule-name sequence and a raw solver model:
+
+```
+Counterexample of length 3 found
+Trace: r0: ENTRY -> inv ; r3: inv -> inv ; r2: inv -> fail
+Witness: 3 trace step(s) represent N = 1000000002 real transition(s)
+  step 1: rule r3 (from r1) applied n=1000000000 times -- x1(i) = n + x0
+```
+
+`--json` carries the same information under a `witness` key. Soundness does
+not depend on the presentation layer: before a shortcut is emitted, direct
+SMT checks validate both its guard bound and the closed-form trajectory it
+uses. A proposed bound is accepted only if no iterate in its claimed range
+violates the loop/branch guards, and a closed form is accepted only if it is
+anchored at the real source state and satisfies the branch update at every
+virtual step.
+
 ## Solver modes
 
 The default mode is a cross-trace incremental pool retaining at most 16
@@ -872,6 +952,11 @@ In fresh mode, `pushes`, `pops`, and retained `contexts` are always zero, while
   default is `65536`; `0` intentionally disables the limit;
 - `--skip-elim`: retain rules outside the semantics-preserving ENTRY-to-query
   graph slice.
+- `--accelerate-bmc`: add closed-form loop-shortcut rules before searching,
+  so a counterexample needing many loop iterations is found at a shallow
+  search depth instead of one proportional to the iteration count; see
+  [Loop acceleration](#loop-acceleration---accelerate-bmc-no-unrolling-for-deep-loops)
+  above.
 
 Exit codes are `0` for bounded/complete safety or seed-Houdini `Success`, `1`
 for a bounded counterexample, `2` for `unknown`, and `3` for input or usage

@@ -11,6 +11,7 @@ from typing import Any
 import z3
 
 from . import __version__
+from .accel import AccelerationSummary, accelerate_program, describe_witness
 from .candidate_validation import (
     DEFAULT_CANDIDATE_BOUND,
     CandidateReachability,
@@ -111,6 +112,26 @@ def _parser() -> argparse.ArgumentParser:
         "--skip-elim",
         action="store_true",
         help="compatibility option: retain rules outside ENTRY-to-query slices",
+    )
+    parser.add_argument(
+        "--accelerate-bmc",
+        action="store_true",
+        help=(
+            "before searching, add a closed-form shortcut rule for every "
+            "self-loop branch PhaseFit can solve a recurrence for -- each "
+            "shortcut represents n consecutive iterations of that branch as "
+            "one alternative edge in the rule graph, so a trace that uses "
+            "it reaches a real iteration count of n at search depth 1 "
+            "instead of depth n. Ordinary unrolling stays available for "
+            "every rule/branch this can't accelerate (multi-rule cycles, "
+            "non-affine updates, guards it can't classify), so results are "
+            "identical to a plain run modulo which depth a counterexample "
+            "is found at and how far --upto needs to reach for a bounded- "
+            "safe verdict. Only meaningful for the default counterexample "
+            "search; cannot be combined with --ff, --ff-houdini, "
+            "--ff-seeded, --seed-houdini, --cands, --trace-houdini, "
+            "--phasefit, or --mut."
+        ),
     )
     parser.add_argument(
         "--debug",
@@ -571,8 +592,51 @@ def _trace_data(result: ExplorationResult) -> dict[str, Any] | None:
     }
 
 
+def _witness_data(
+    result: ExplorationResult, acceleration: AccelerationSummary | None
+) -> dict[str, Any] | None:
+    """VCEX-style structured witness: total real transition count N (which
+    can vastly exceed the trace's own length) plus, for each accelerated
+    step used, its concrete n and per-variable closed form -- the JSON
+    counterpart to describe_witness's text report.
+    """
+    if (
+        acceleration is None
+        or not acceleration.formulas_by_rule_id
+        or result.status is not ExplorationStatus.COUNTEREXAMPLE
+        or result.trace_check is None
+        or result.trace_check.model is None
+    ):
+        return None
+    check = result.trace_check
+    segments = []
+    total_real_steps = 0
+    for step_index, rule in enumerate(check.vc.trace):
+        formulas = acceleration.formulas_by_rule_id.get(rule.rule_id)
+        if formulas is None:
+            total_real_steps += 1
+            continue
+        fresh_n = check.vc.steps[step_index].fresh_rule_vars[-1]
+        n_value = check.model.eval(fresh_n, model_completion=True).as_long()
+        total_real_steps += n_value
+        segments.append(
+            {
+                "step": step_index,
+                "rule_id": rule.rule_id,
+                "origin_rule_id": rule.original_rule_id,
+                "n": n_value,
+                "formulas": {name: expr for name, expr in formulas},
+            }
+        )
+    return {"real_steps": total_real_steps, "accelerated_segments": segments}
+
+
 def _as_json(
-    result: ExplorationResult, program_rules: int, explorer: BoundedExplorer
+    result: ExplorationResult,
+    program_rules: int,
+    explorer: BoundedExplorer,
+    *,
+    acceleration: AccelerationSummary | None = None,
 ) -> str:
     data = {
         "status": result.status.value,
@@ -580,6 +644,20 @@ def _as_json(
         "explored_upto": result.explored_upto,
         "complete": result.complete,
         "rules": program_rules,
+        "acceleration": (
+            None
+            if acceleration is None
+            else {
+                "inductive_rules_considered": (
+                    acceleration.inductive_rules_considered
+                ),
+                "branches_considered": acceleration.branches_considered,
+                "shortcuts_added": acceleration.shortcuts_added,
+                "shortcut_rules": [
+                    rule.short() for rule in acceleration.shortcut_rules
+                ],
+            }
+        ),
         "depths": [
             {
                 "depth": item.depth,
@@ -591,6 +669,7 @@ def _as_json(
             for item in result.depth_statistics
         ],
         "decisive_trace": _trace_data(result),
+        "witness": _witness_data(result, acceleration),
         "solver_mode": explorer.solver_mode,
         "solver_pool": {
             "max_contexts": explorer.max_solver_contexts,
@@ -618,7 +697,12 @@ def _as_json(
     return json.dumps(data, indent=2, sort_keys=True)
 
 
-def _print_human(result: ExplorationResult, *, show_model: bool) -> None:
+def _print_human(
+    result: ExplorationResult,
+    *,
+    show_model: bool,
+    acceleration: AccelerationSummary | None = None,
+) -> None:
     if result.status is ExplorationStatus.COUNTEREXAMPLE:
         if result.trace_check is None:
             raise RuntimeError("counterexample result has no decisive trace")
@@ -626,6 +710,22 @@ def _print_human(result: ExplorationResult, *, show_model: bool) -> None:
         print(
             "Trace: " + " ; ".join(rule.short() for rule in result.trace_check.vc.trace)
         )
+        if (
+            acceleration is not None
+            and acceleration.formulas_by_rule_id
+            and result.trace_check.model is not None
+        ):
+            fresh_vars = tuple(
+                step.fresh_rule_vars for step in result.trace_check.vc.steps
+            )
+            print(
+                describe_witness(
+                    result.trace_check.vc.trace,
+                    result.trace_check.model,
+                    fresh_vars,
+                    acceleration,
+                )
+            )
         if show_model and result.trace_check.model is not None:
             print("Model:")
             print(result.trace_check.model)
@@ -994,6 +1094,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.file is None:
         parser.error("the following arguments are required: file")
+    if args.accelerate_bmc and (
+        args.ff
+        or args.ff_houdini
+        or args.ff_seeded
+        or args.seed_houdini
+        or args.cands is not None
+        or args.trace_houdini
+        or args.phasefit
+        or args.mut
+    ):
+        parser.error(
+            "--accelerate-bmc speeds up only the default counterexample "
+            "search and cannot be combined with --ff, --ff-houdini, "
+            "--ff-seeded, --seed-houdini, --cands, --trace-houdini, "
+            "--phasefit, or --mut"
+        )
     if args.ff and (
         args.seed_houdini
         or args.cands is not None
@@ -1423,6 +1539,9 @@ def main(argv: list[str] | None = None) -> int:
             args.file,
             slice_program=False if houdini_mode else not args.skip_elim,
         )
+        acceleration: AccelerationSummary | None = None
+        if args.accelerate_bmc:
+            program, acceleration = accelerate_program(program)
         if args.debug:
             mode = "sliced" if program.sliced else "unsliced"
             arithmetic = program.arithmetic_sorts
@@ -1450,6 +1569,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             for rule in program.rules:
                 print(f"  {rule.short()}: {rule.body}")
+            if acceleration is not None:
+                print(f"Acceleration: {acceleration.describe()}")
 
         if houdini_mode:
             user_candidates: CandidateMap | None = None
@@ -1655,9 +1776,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"evictions={ssa.cache_evictions}"
             )
         if args.json:
-            print(_as_json(result, len(program.rules), explorer))
+            print(
+                _as_json(
+                    result, len(program.rules), explorer, acceleration=acceleration
+                )
+            )
         else:
-            _print_human(result, show_model=args.model)
+            _print_human(result, show_model=args.model, acceleration=acceleration)
 
         if args.dump_vc is not None:
             if result.trace_check is None:
