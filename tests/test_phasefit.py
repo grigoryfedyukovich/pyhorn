@@ -8,8 +8,10 @@ import z3
 
 from pyhorn_bnd.horn import parse_chc_file
 from pyhorn_bnd.phasefit import (
+    Branch,
     extract_guarded_branches,
     compute_closed_form,
+    compute_branch_closed_forms,
     run_phasefit,
     PhaseFit,
 )
@@ -39,6 +41,65 @@ def test_closed_form_increment():
     n = __import__("sympy").Symbol("n", integer=True, nonnegative=True)
     # should be x0 + n
     assert n in cf.expr.free_symbols
+
+
+
+
+def test_closed_form_cyclic_affine_scc_polynomial():
+    """A genuinely cyclic affine system with a polynomial trajectory is
+    solved jointly rather than being abandoned when dependency ordering stalls.
+
+    A = [[2, 1], [-1, 0]] = I + N with N^2 = 0, so
+      x_n = x + n*(x+y)
+      y_n = y - n*(x+y).
+    """
+    import sympy as sp
+
+    x, y = z3.Ints("x y")
+    x1, y1 = z3.Ints("x1 y1")
+    branch = Branch(
+        guard=z3.BoolVal(True),
+        updates={x1: 2 * x + y, y1: -x},
+    )
+    forms = compute_branch_closed_forms(
+        branch,
+        [x, y],
+        {x1: x, y1: y},
+    )
+    assert set(v.get_id() for v in forms) == {x.get_id(), y.get_id()}
+
+    n = sp.Symbol("n", integer=True, nonnegative=True)
+
+    def value_at(cf, steps: int, xv: int, yv: int):
+        subs = {n: steps}
+        for sym, zexpr in cf.init_map.items():
+            if zexpr.eq(x):
+                subs[sym] = xv
+            elif zexpr.eq(y):
+                subs[sym] = yv
+        return sp.simplify(cf.expr.subs(subs))
+
+    assert value_at(forms[x], 3, 2, 5) == 23
+    assert value_at(forms[y], 3, 2, 5) == -16
+
+
+def test_closed_form_cyclic_affine_scc_rejects_exponential_trajectory():
+    """Cyclic affine systems are accepted only when the bounded-degree
+    polynomial guess passes the exact symbolic recurrence check."""
+    x, y = z3.Ints("exp_x exp_y")
+    x1, y1 = z3.Ints("exp_x1 exp_y1")
+    branch = Branch(
+        guard=z3.BoolVal(True),
+        updates={x1: x + y, y1: x + 2 * y},
+    )
+    forms = compute_branch_closed_forms(
+        branch,
+        [x, y],
+        {x1: x, y1: y},
+    )
+    # Fibonacci-like/exponential behavior is outside the current translator's
+    # polynomial closed-form language and must fail closed.
+    assert not forms
 
 
 def test_phasefit_runs_without_error():

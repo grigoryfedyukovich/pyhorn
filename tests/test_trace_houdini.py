@@ -211,24 +211,15 @@ def test_trace_houdini_improves_original_affine_and_modular_cases() -> None:
         assert trace.trace_result is not None
 
 
-def test_trace_houdini_mutate_applies_to_combined_seed_and_trace_candidates() -> None:
-    """--mut is not restricted to seed-mined or --cands candidates: when
-    combined with --trace-houdini, mutate_candidates() is applied to the
-    full seed-plus-trace candidate pool at whichever stage the pipeline
-    reaches, not just to the syntactic seed candidates alone."""
+def test_trace_houdini_mutation_is_deferred_until_needed() -> None:
+    """A successful trace stage is preserved immediately even when --mut
+    was requested; mutation is a later fallback, not a reason to rerun an
+    already successful proof over a larger candidate pool."""
 
     program = parse_chc_file(
         TRACE_EXAMPLES / "count_by_2_modular_safe.smt2", slice_program=False
     )
-    plain = run_trace_houdini(
-        program,
-        trace_depth=5,
-        trace_limit=100,
-        models_per_prefix=1,
-        timeout_ms=5_000,
-        random_seed=1,
-    )
-    mutated = run_trace_houdini(
+    result = run_trace_houdini(
         program,
         trace_depth=5,
         trace_limit=100,
@@ -237,11 +228,9 @@ def test_trace_houdini_mutate_applies_to_combined_seed_and_trace_candidates() ->
         random_seed=1,
         mutate=True,
     )
-    assert plain.mutation_result is None
-    assert mutated.mutation_result is not None
-    assert mutated.mutation_result.statistics.candidates_added > 0
-    assert mutated.trace_result is not None
-    assert mutated.status is HoudiniStatus.SUCCESS
+    assert result.status is HoudiniStatus.SUCCESS
+    assert result.trace_result is not None
+    assert result.mutation_result is None
 
 
 def test_cli_mut_requires_a_candidate_source(capsys) -> None:
@@ -270,9 +259,9 @@ def test_cli_trace_houdini_mut_combination(capsys) -> None:
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "success"
-    assert payload["mutation"] is not None
-    assert payload["mutation"]["candidates_added"] > 0
     assert payload["trace_mining"] is not None
+    # Mutation may be skipped when the earlier trace stage already proves the
+    # benchmark; that is the intended monotone staging.
 
 
 def test_cli_trace_houdini_still_rejects_cands_and_validate_candidates() -> None:
@@ -421,47 +410,56 @@ def test_run_trace_houdini_mutate_stress_pool_is_fast() -> None:
     assert result.statistics.general_equalities_considered == 3
 
 
-def test_cli_trace_mutation_substitution_limit_is_wired_through(capsys) -> None:
-    """Regression test: max_equality_substitutions_per_relation previously
-    had no CLI flag and was never passed from run_trace_houdini() to
-    mutate_candidates() at all, so it silently always used its hardcoded
-    default regardless of anything the user set. This checks the flag
-    exists, is accepted, and actually changes the reported statistics --
-    not just that the process exits 0."""
+def test_cli_trace_mutation_substitution_limit_is_wired_through(
+    capsys, monkeypatch
+) -> None:
+    """The CLI forwards the independent substitution cap even if an
+    earlier stage later decides mutation is unnecessary."""
+    from pyhorn_bnd import cli as cli_module
 
     path = TRACE_EXAMPLES / "integer_affine_safe.smt2"
-    assert (
-        main(
-            [
-                "--trace-houdini",
-                "--mut",
-                "--trace-mutation-substitution-limit",
-                "1",
-                "--json",
-                str(path),
-            ]
-        )
-        == 0
-    )
-    tight = json.loads(capsys.readouterr().out)
+    original = cli_module.run_trace_houdini
+    observed: list[int | None] = []
 
-    assert (
-        main(
-            [
-                "--trace-houdini",
-                "--mut",
-                "--trace-mutation-substitution-limit",
-                "0",
-                "--json",
-                str(path),
-            ]
-        )
-        == 0
-    )
-    unlimited = json.loads(capsys.readouterr().out)
+    def wrapped(program, **kwargs):
+        observed.append(kwargs["max_mutation_substitutions_per_relation"])
+        return original(program, **kwargs)
 
-    assert (
-        tight["mutation"]["substitution_rewrites_attempted"]
-        <= unlimited["mutation"]["substitution_rewrites_attempted"]
-    )
-    assert tight["mutation"]["substitution_rewrites_attempted"] <= 1
+    monkeypatch.setattr(cli_module, "run_trace_houdini", wrapped)
+    main([
+        "--trace-houdini", "--mut",
+        "--trace-mutation-substitution-limit", "1",
+        "--json", str(path),
+    ])
+    capsys.readouterr()
+    main([
+        "--trace-houdini", "--mut",
+        "--trace-mutation-substitution-limit", "0",
+        "--json", str(path),
+    ])
+    capsys.readouterr()
+    assert observed == [1, None]
+
+
+
+def test_cli_phasefit_trace_houdini_passes_phasefit_candidates(
+    capsys, monkeypatch
+) -> None:
+    """Regression: --trace-houdini used to select a separate CLI branch
+    that silently ignored --phasefit."""
+    from pyhorn_bnd import cli as cli_module
+
+    path = ROOT / "examples" / "bench_horn" / "03_mixed_bool_int_mod_ite.smt2"
+    original = cli_module.run_trace_houdini
+    observed = {}
+
+    def wrapped(program, **kwargs):
+        observed["seed_result"] = kwargs.get("seed_result")
+        observed["extra_candidates"] = kwargs.get("extra_candidates")
+        return original(program, **kwargs)
+
+    monkeypatch.setattr(cli_module, "run_trace_houdini", wrapped)
+    main(["--phasefit", "--trace-houdini", "--json", str(path)])
+    capsys.readouterr()
+    assert observed["seed_result"] is not None
+    assert observed["extra_candidates"]

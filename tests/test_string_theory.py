@@ -123,6 +123,22 @@ def test_regex_candidates_are_preserved_and_certified() -> None:
     assert result.status is HoudiniStatus.SUCCESS
 
 
+
+
+def test_regex_candidate_detection_is_structural():
+    from pyhorn_bnd.houdini import _is_regex_candidate
+
+    s = z3.String("regex_detect_s")
+    regex_formula = z3.InRe(s, z3.Star(z3.Re("a")))
+    quantified = z3.ForAll([s], z3.Implies(z3.Length(s) >= 0, regex_formula))
+
+    # Deliberately pass opaque keys so the result must come from AST traversal,
+    # not from spotting "str.in_re" in an already-rendered s-expression.
+    assert _is_regex_candidate("opaque", regex_formula)
+    assert _is_regex_candidate("opaque-quantified", quantified)
+    assert not _is_regex_candidate("opaque-arith", z3.Int("rx_x") >= 0)
+
+
 def test_mixed_string_integer_length_invariant_is_supported() -> None:
     program = parse_chc_file(
         EXAMPLES / "mixed_string_int_safe.smt2",

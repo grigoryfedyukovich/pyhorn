@@ -832,68 +832,143 @@ def compute_closed_form(
     var: z3.ExprRef,
     pre_vars: Sequence[z3.ExprRef],
     init_values: Mapping[z3.ExprRef, z3.ExprRef] | None = None,
+    known_closed_forms: Mapping[z3.ExprRef, ClosedForm] | None = None,
 ) -> ClosedForm | None:
-    """Compute a closed form for a single variable under a pure (ite-free) update.
+    """Compute a closed form for one variable under a pure (ite-free) update.
 
-    Supports:
-    - x' = x + c          →  x0 + c*n
-    - x' = a*x + b        →  geometric closed form (a constant)
-    - x' = c              →  constant
-    - x' = (x + 1) mod m  →  (x0 + n) mod m   (special-cased)
+    Besides the original scalar affine cases, *known_closed_forms* may supply
+    trajectories for other variables in the same simultaneous update.  Those
+    trajectories are substituted at the current loop index before solving this
+    recurrence.  This is enough to solve triangular systems naturally, e.g.::
 
-    Returns None when the update is not recognised as a simple affine
-    recurrence that sympy (or the special cases) can solve.
+        y' = y + 1
+        x' = x + y
+
+    by solving ``y`` first and then solving ``x' = x + (y0 + n)``.  The
+    resulting forms are still ordinary :class:`ClosedForm` objects, so both
+    PhaseFit invariant synthesis and ABMC consume them through their existing
+    pipelines.
+
+    Supports (best effort):
+    - x' = x + c          -> x0 + c*n
+    - x' = a*x + b(n)     -> sympy recurrence solution
+    - x' = c              -> constant
+    - x' = (x + c) mod m  -> (x0 + c*n) mod m
+
+    Int and Real state variables are represented with the corresponding SymPy
+    assumptions.  Non-arithmetic variables retain the previous integer-symbol
+    fallback so identity forms continue to work as before.
     """
     n = sp.Symbol("n", integer=True, nonnegative=True)
     symbol_map: dict[int, sp.Symbol] = {}
 
-    # Map pre-state variables to sympy symbols; the target var gets a special
+    def _state_symbol(v: z3.ExprRef, name: str) -> sp.Symbol:
+        """Create a SymPy symbol whose arithmetic sort matches *v* when known."""
+        try:
+            if v.sort().kind() == z3.Z3_REAL_SORT:
+                return sp.Symbol(name, real=True)
+        except z3.Z3Exception:
+            pass
+        # Preserve the historical behaviour for Int and for unsupported sorts.
+        return sp.Symbol(name, integer=True)
+
+    # Map all Z3 variables we may need to reconstruct after solving.
+    z3_by_id: dict[int, z3.ExprRef] = {v.get_id(): v for v in pre_vars}
+    try:
+        for v in get_vars(update):
+            z3_by_id.setdefault(v.get_id(), v)
+    except z3.Z3Exception:
+        pass
+
+    # Map pre-state variables to SymPy symbols; the target var gets a special
     # initial-value symbol.
-    x0_sym = sp.Symbol(f"{var}_0", integer=True)
+    x0_sym = _state_symbol(var, f"{var}_0")
     for v in pre_vars:
         if v.get_id() == var.get_id():
             symbol_map[v.get_id()] = x0_sym
         else:
-            symbol_map[v.get_id()] = sp.Symbol(str(v), integer=True)
+            symbol_map[v.get_id()] = _state_symbol(v, str(v))
 
-    # Also map any free constants that appear
-    for v in get_vars(update):
+    # Also map any free constants that appear in the update.
+    for v in z3_by_id.values():
         if v.get_id() not in symbol_map:
-            symbol_map[v.get_id()] = sp.Symbol(str(v), integer=True)
+            symbol_map[v.get_id()] = _state_symbol(v, str(v))
 
     try:
         rhs_sp = _z3_to_sympy(update, symbol_map)
     except _SYMBOLIC_BESTEFFORT_EXC as exc:
-        logger.debug("z3→sympy failed for %s: %s", update, exc)
+        logger.debug("z3->sympy failed for %s: %s", update, exc)
         return None
 
-    # Special case: identity
+    # Substitute trajectories already solved for other simultaneously-changing
+    # variables.  Their forms are functions of the *current* local index n,
+    # exactly what the one-step recurrence for ``var`` needs on its RHS.
+    inherited_init: dict[sp.Symbol, z3.ExprRef] = {}
+    if known_closed_forms:
+        substitutions: dict[sp.Symbol, sp.Expr] = {}
+        for known_var, known_cf in known_closed_forms.items():
+            if known_var.get_id() == var.get_id():
+                continue
+            current_sym = symbol_map.get(known_var.get_id())
+            if current_sym is None or current_sym not in rhs_sp.free_symbols:
+                continue
+            substitutions[current_sym] = known_cf.expr
+            inherited_init.update(known_cf.init_map)
+        if substitutions:
+            try:
+                rhs_sp = sp.simplify(rhs_sp.subs(substitutions, simultaneous=True))
+            except _SYMBOLIC_BESTEFFORT_EXC as exc:
+                logger.debug("closed-form dependency substitution failed: %s", exc)
+                return None
+
+    def _init_map_for(expr: sp.Expr) -> dict[sp.Symbol, z3.ExprRef]:
+        """Recover Z3 initial values for every free symbol in *expr*."""
+        out: dict[sp.Symbol, z3.ExprRef] = {
+            x0_sym: init_values.get(var, var) if init_values else var
+        }
+        for sym, z3_expr in inherited_init.items():
+            if sym in expr.free_symbols:
+                out[sym] = z3_expr
+        for zid, sym in symbol_map.items():
+            if sym not in expr.free_symbols or sym == x0_sym:
+                continue
+            z3_var = z3_by_id.get(zid)
+            if z3_var is not None:
+                out[sym] = init_values.get(z3_var, z3_var) if init_values else z3_var
+        return out
+
+    # Special case: identity.
     if rhs_sp == x0_sym:
-        init_map = {x0_sym: init_values.get(var, var) if init_values else var}
-        return ClosedForm(var=var, expr=x0_sym, init_map=init_map)
+        return ClosedForm(var=var, expr=x0_sym, init_map=_init_map_for(x0_sym))
 
-    # Special case: constant
-    if x0_sym not in rhs_sp.free_symbols:
-        init_map = {x0_sym: init_values.get(var, var) if init_values else var}
-        return ClosedForm(var=var, expr=rhs_sp, init_map=init_map)
+    # Special case: a genuinely time-independent assignment.  After dependency
+    # substitution, an RHS that omits x0 may still depend on n (e.g. x' = y
+    # with y' = y+1); such a recurrence is *not* the pointwise expression
+    # rhs_sp and must fall through to recurrence solving instead.
+    if x0_sym not in rhs_sp.free_symbols and n not in rhs_sp.free_symbols:
+        return ClosedForm(var=var, expr=rhs_sp, init_map=_init_map_for(rhs_sp))
 
-    # Special case: (x + c) mod m
+    # Special case: (x + c) mod m.
     if isinstance(rhs_sp, sp.Mod):
         arg, mod = rhs_sp.args
         if arg.has(x0_sym) and not mod.has(x0_sym):
-            # assume arg = x0 + c
             c = sp.simplify(arg - x0_sym)
             if c.is_constant():
                 expr = sp.Mod(x0_sym + c * n, mod)
-                init_map = {x0_sym: init_values.get(var, var) if init_values else var}
                 try:
                     period = int(mod)
                 except _SYMBOLIC_BESTEFFORT_EXC:
                     period = None
-                return ClosedForm(var=var, expr=expr, init_map=init_map, period=period)
+                return ClosedForm(
+                    var=var,
+                    expr=expr,
+                    init_map=_init_map_for(expr),
+                    period=period,
+                )
 
-    # Linear recurrence x' = a*x + b
-    # Collect coefficient of x0_sym and the rest
+    # Linear recurrence x' = a(n)*x + b(n).  The previous implementation
+    # required the other state variables to remain symbolic constants; after
+    # dependency substitution, b (and in principle a) may depend on n.
     try:
         poly = sp.Poly(rhs_sp, x0_sym)
         if poly.degree() > 1:
@@ -901,44 +976,37 @@ def compute_closed_form(
         a = poly.coeff_monomial(x0_sym) if poly.degree() == 1 else sp.Integer(0)
         b = poly.coeff_monomial(1)
     except _SYMBOLIC_BESTEFFORT_EXC:
-        # not a polynomial in x0
         return None
 
-    # Solve the recurrence with sympy.rsolve
     f = sp.Function("f")
     rec = f(n + 1) - a * f(n) - b
     try:
         sol = sp.rsolve(rec, f(n), [f(0)])
         if sol is None:
-            return None
-        # sol is an expression in f(0) and n; replace f(0) by x0_sym
-        sol = sol.subs(f(0), x0_sym)
-        sol = sp.simplify(sol)
+            raise ValueError("rsolve returned no solution")
+        sol = sp.simplify(sol.subs(f(0), x0_sym))
     except _SYMBOLIC_BESTEFFORT_EXC as exc:
         logger.debug("rsolve failed: %s", exc)
-        # Fallback for a == 1: x0 + b*n
+        # Safe fallbacks.  For a == 1 and n-dependent forcing, explicitly
+        # sum b(0)..b(n-1); this is precisely the triangular-recurrence case.
         if a == 1:
-            sol = x0_sym + b * n
-        elif a == 0:
+            if n not in b.free_symbols:
+                sol = x0_sym + b * n
+            else:
+                k = sp.Symbol("k", integer=True, nonnegative=True)
+                try:
+                    total = sp.summation(b.subs(n, k), (k, 0, n - 1))
+                    if isinstance(total, sp.Sum) or total.has(sp.Sum):
+                        return None
+                    sol = sp.simplify(x0_sym + total)
+                except _SYMBOLIC_BESTEFFORT_EXC:
+                    return None
+        elif a == 0 and n not in b.free_symbols:
             sol = b
         else:
             return None
 
-    init_map = {x0_sym: init_values.get(var, var) if init_values else var}
-    # Also keep any other free symbols that appear in b
-    for s in sol.free_symbols:
-        if s != n and s != x0_sym and s not in init_map:
-            # try to recover a Z3 expression
-            for zid, ssym in symbol_map.items():
-                if ssym == s:
-                    # find the Z3 var
-                    for v in pre_vars:
-                        if v.get_id() == zid:
-                            init_map[s] = init_values.get(v, v) if init_values else v
-                            break
-                    break
-
-    return ClosedForm(var=var, expr=sol, init_map=init_map)
+    return ClosedForm(var=var, expr=sol, init_map=_init_map_for(sol))
 
 
 def compute_branch_closed_forms(
@@ -947,18 +1015,319 @@ def compute_branch_closed_forms(
     post_to_pre: Mapping[z3.ExprRef, z3.ExprRef],
     init_state: Mapping[z3.ExprRef, z3.ExprRef] | None = None,
 ) -> dict[z3.ExprRef, ClosedForm]:
-    """Compute closed forms for every variable under a pure branch update.
+    """Compute branch closed forms, including polynomial affine SCCs.
 
-    *post_to_pre* maps each post-state variable to the corresponding
-    pre-state (canonical) variable so that the ClosedForm is keyed by the
-    program variable the invariant will talk about.
+    The fast path remains dependency-ordered scalar solving: triangular
+    systems are handled by solving a dependency first and substituting its
+    trajectory into later recurrences.  If that stalls on a genuinely cyclic
+    component, a small symbolic interpolation pass attempts the whole affine
+    SCC simultaneously.  Candidate polynomial trajectories are accepted only
+    after an exact symbolic recurrence check, so interpolation is a synthesis
+    device rather than a proof rule.
+
+    This keeps the public ``ClosedForm`` representation unchanged; PhaseFit
+    invariant generation and ABMC therefore receive the richer forms through
+    their existing paths.
     """
     forms: dict[z3.ExprRef, ClosedForm] = {}
+
+    # Canonicalise every post-state update to the corresponding pre-state
+    # variable once. Dependency tests then operate only on pre-state IDs.
+    pending: list[tuple[z3.ExprRef, z3.ExprRef]] = []
+    updated_ids: set[int] = set()
+    var_by_id: dict[int, z3.ExprRef] = {v.get_id(): v for v in pre_vars}
+    update_by_id: dict[int, z3.ExprRef] = {}
     for post_v, upd in branch.updates.items():
         pre_v = post_to_pre.get(post_v, post_v)
-        cf = compute_closed_form(upd, pre_v, pre_vars, init_state)
-        if cf is not None:
-            forms[pre_v] = cf
+        pending.append((pre_v, upd))
+        updated_ids.add(pre_v.get_id())
+        var_by_id[pre_v.get_id()] = pre_v
+        update_by_id[pre_v.get_id()] = upd
+
+    def _deps(upd: z3.ExprRef, own_id: int) -> set[int]:
+        try:
+            return {
+                v.get_id()
+                for v in get_vars(upd)
+                if v.get_id() in updated_ids and v.get_id() != own_id
+            }
+        except z3.Z3Exception:
+            return set()
+
+    def _cyclic_components(
+        unresolved: Sequence[tuple[z3.ExprRef, z3.ExprRef]],
+    ) -> list[list[int]]:
+        """Return multi-node SCCs in dependency order-independent form."""
+        unresolved_ids = {v.get_id() for v, _ in unresolved}
+        graph = {
+            v.get_id(): _deps(upd, v.get_id()) & unresolved_ids
+            for v, upd in unresolved
+        }
+        index = 0
+        stack: list[int] = []
+        on_stack: set[int] = set()
+        indices: dict[int, int] = {}
+        lowlink: dict[int, int] = {}
+        components: list[list[int]] = []
+
+        def strongconnect(node: int) -> None:
+            nonlocal index
+            indices[node] = index
+            lowlink[node] = index
+            index += 1
+            stack.append(node)
+            on_stack.add(node)
+            for nxt in graph.get(node, ()):
+                if nxt not in indices:
+                    strongconnect(nxt)
+                    lowlink[node] = min(lowlink[node], lowlink[nxt])
+                elif nxt in on_stack:
+                    lowlink[node] = min(lowlink[node], indices[nxt])
+            if lowlink[node] != indices[node]:
+                return
+            component: list[int] = []
+            while True:
+                item = stack.pop()
+                on_stack.remove(item)
+                component.append(item)
+                if item == node:
+                    break
+            if len(component) > 1:
+                components.append(component)
+
+        for node in graph:
+            if node not in indices:
+                strongconnect(node)
+        return components
+
+    def _state_symbol(v: z3.ExprRef, name: str) -> sp.Symbol:
+        try:
+            if v.sort().kind() == z3.Z3_REAL_SORT:
+                return sp.Symbol(name, real=True)
+        except z3.Z3Exception:
+            pass
+        return sp.Symbol(name, integer=True)
+
+    def _solve_polynomial_affine_scc(
+        component_ids: Sequence[int],
+        solved_ids: set[int],
+    ) -> dict[z3.ExprRef, ClosedForm] | None:
+        component = [var_by_id[item] for item in component_ids]
+        component_set = set(component_ids)
+        # Keep the best-effort fallback deliberately small: symbolic prefixes
+        # grow rapidly with SCC dimension, while larger systems are unlikely to
+        # fit PhaseFit's compact polynomial fragment anyway.
+        if len(component) > 4:
+            return None
+
+        # Do not jump over another unresolved changing component.
+        for var in component:
+            outside = _deps(update_by_id[var.get_id()], var.get_id()) - component_set
+            if not outside.issubset(solved_ids):
+                return None
+
+        n = sp.Symbol("n", integer=True, nonnegative=True)
+        symbol_map: dict[int, sp.Symbol] = {}
+        z3_by_id: dict[int, z3.ExprRef] = {v.get_id(): v for v in pre_vars}
+        for upd in (update_by_id[v.get_id()] for v in component):
+            try:
+                for fv in get_vars(upd):
+                    z3_by_id.setdefault(fv.get_id(), fv)
+            except z3.Z3Exception:
+                return None
+
+        component_state: dict[int, sp.Symbol] = {
+            v.get_id(): _state_symbol(v, f"{v}__cur") for v in component
+        }
+        component_init: dict[int, sp.Symbol] = {
+            v.get_id(): _state_symbol(v, f"{v}_0") for v in component
+        }
+        for zid, zv in z3_by_id.items():
+            symbol_map[zid] = component_state.get(
+                zid, _state_symbol(zv, str(zv))
+            )
+
+        rhs_by_id: dict[int, sp.Expr] = {}
+        inherited_init: dict[sp.Symbol, z3.ExprRef] = {}
+        for var in component:
+            try:
+                rhs = _z3_to_sympy(update_by_id[var.get_id()], symbol_map)
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                return None
+
+            # Reject opaque compound terms that _z3_to_sympy had to invent a
+            # symbol for: every symbol-map key must correspond to a real Z3
+            # variable we know how to reconstruct later.
+            if any(zid not in z3_by_id for zid in symbol_map):
+                return None
+
+            substitutions: dict[sp.Symbol, sp.Expr] = {}
+            for known_var, known_cf in forms.items():
+                if known_var.get_id() in component_set:
+                    continue
+                current = symbol_map.get(known_var.get_id())
+                if current is not None and current in rhs.free_symbols:
+                    substitutions[current] = known_cf.expr
+                    inherited_init.update(known_cf.init_map)
+            if substitutions:
+                try:
+                    rhs = sp.simplify(rhs.subs(substitutions, simultaneous=True))
+                except _SYMBOLIC_BESTEFFORT_EXC:
+                    return None
+
+            # This extension deliberately targets affine SCCs only.  Coefficients
+            # may depend on n or unchanged parameters, but the component's own
+            # state occurs with total degree at most one.
+            try:
+                poly = sp.Poly(rhs, *component_state.values())
+                if poly.total_degree() > 1:
+                    return None
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                return None
+            rhs_by_id[var.get_id()] = rhs
+
+        # Generate a short exact symbolic prefix.  Eight interpolation degrees
+        # covers the small affine systems PhaseFit is designed for; any guessed
+        # polynomial is subsequently proved against the recurrence symbolically.
+        max_degree = DEFAULT_PHASE_BUDGET_K
+        sequences: dict[int, list[sp.Expr]] = {
+            v.get_id(): [component_init[v.get_id()]] for v in component
+        }
+        current = {
+            component_state[v.get_id()]: component_init[v.get_id()]
+            for v in component
+        }
+        for step in range(max_degree + 1):
+            nxt: dict[int, sp.Expr] = {}
+            for var in component:
+                try:
+                    value = rhs_by_id[var.get_id()].subs(current, simultaneous=True)
+                    value = sp.simplify(value.subs(n, sp.Integer(step)))
+                except _SYMBOLIC_BESTEFFORT_EXC:
+                    return None
+                nxt[var.get_id()] = value
+            for var in component:
+                sequences[var.get_id()].append(nxt[var.get_id()])
+            current = {
+                component_state[v.get_id()]: nxt[v.get_id()] for v in component
+            }
+
+        candidates: dict[int, sp.Expr] = {}
+        points = list(range(max_degree + 2))
+        for var in component:
+            values = sequences[var.get_id()]
+            try:
+                candidate = sp.interpolate(list(zip(points, values, strict=True)), n)
+                candidate = sp.factor(sp.simplify(candidate))
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                return None
+            # Restrict this fallback to genuine polynomials in n.  Exponential
+            # and periodic systems belong to later domain-specific extensions.
+            try:
+                if sp.Poly(candidate, n).degree() > max_degree:
+                    return None
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                return None
+            candidates[var.get_id()] = candidate
+
+        # Exact local proof: F(n+1) must equal the original simultaneous update
+        # applied to F(n), with already-solved external trajectories at n.
+        recurrence_subs = {
+            component_state[v.get_id()]: candidates[v.get_id()]
+            for v in component
+        }
+        for var in component:
+            try:
+                lhs = sp.simplify(candidates[var.get_id()].subs(n, n + 1))
+                rhs = sp.simplify(
+                    rhs_by_id[var.get_id()].subs(recurrence_subs, simultaneous=True)
+                )
+                if sp.simplify(lhs - rhs) != 0:
+                    return None
+                if sp.simplify(
+                    candidates[var.get_id()].subs(n, 0)
+                    - component_init[var.get_id()]
+                ) != 0:
+                    return None
+            except _SYMBOLIC_BESTEFFORT_EXC:
+                return None
+
+        sym_to_z3: dict[sp.Symbol, z3.ExprRef] = dict(inherited_init)
+        for var in component:
+            init_sym = component_init[var.get_id()]
+            sym_to_z3[init_sym] = (
+                init_state.get(var, var) if init_state else var
+            )
+        for zid, sym in symbol_map.items():
+            if zid in component_set:
+                continue
+            zv = z3_by_id.get(zid)
+            if zv is not None:
+                sym_to_z3[sym] = init_state.get(zv, zv) if init_state else zv
+
+        result: dict[z3.ExprRef, ClosedForm] = {}
+        for var in component:
+            expr = candidates[var.get_id()]
+            init_map = {
+                sym: zexpr
+                for sym, zexpr in sym_to_z3.items()
+                if sym in expr.free_symbols
+            }
+            # Every free symbol except n must be reconstructible by callers.
+            if any(sym != n and sym not in init_map for sym in expr.free_symbols):
+                return None
+            result[var] = ClosedForm(var=var, expr=expr, init_map=init_map)
+        return result
+
+    solved_ids: set[int] = set()
+    while pending:
+        progress = False
+        deferred: list[tuple[z3.ExprRef, z3.ExprRef]] = []
+
+        for pre_v, upd in pending:
+            deps = _deps(upd, pre_v.get_id())
+            if not deps.issubset(solved_ids):
+                deferred.append((pre_v, upd))
+                continue
+
+            cf = compute_closed_form(
+                upd,
+                pre_v,
+                pre_vars,
+                init_state,
+                known_closed_forms=forms,
+            )
+            if cf is not None:
+                forms[pre_v] = cf
+                solved_ids.add(pre_v.get_id())
+                progress = True
+            # A scalar synthesis failure remains pending so a cyclic/system
+            # attempt below can still rescue it if appropriate.
+            else:
+                deferred.append((pre_v, upd))
+
+        if progress:
+            pending = [
+                item for item in deferred if item[0].get_id() not in solved_ids
+            ]
+            continue
+
+        # No scalar variable is dependency-ready.  Try genuinely cyclic affine
+        # SCCs as polynomial systems, one component at a time.
+        rescued = False
+        for component_ids in _cyclic_components(deferred):
+            scc_forms = _solve_polynomial_affine_scc(component_ids, solved_ids)
+            if not scc_forms:
+                continue
+            forms.update(scc_forms)
+            solved_ids.update(v.get_id() for v in scc_forms)
+            rescued = True
+        if not rescued:
+            break
+        pending = [
+            item for item in deferred if item[0].get_id() not in solved_ids
+        ]
+
     return forms
 
 

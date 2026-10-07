@@ -72,7 +72,13 @@ from .forward_fixpoint import (
 )
 from .horn import HornProgram, HornRule
 from .houdini import HoudiniStatus, MultiHoudini
-from .seedminer import CandidateMap, SeedMiner, VariableMap
+from .seedminer import (
+    DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+    CandidateMap,
+    SeedMiner,
+    VariableMap,
+    mutate_candidates,
+)
 from .trace_miner import (
     DEFAULT_MODELS_PER_PREFIX,
     DEFAULT_SAMPLES_PER_RELATION,
@@ -166,37 +172,87 @@ def run_ff_houdini(
     *max_rounds* times.
     """
     variables = SeedMiner(program).variables
-    base_pool, _gathered, _sound = gather_candidate_pool(
-        program,
-        variables=variables,
-        # "ALL candidates" (see the module docstring's step 1) always
-        # means the *full* syntactic mining Seed-Houdini itself uses --
-        # fact-, step-, and query-rule provenance alike -- not
-        # `--ff-seeded`'s own narrower fact-rule-only default. Those two
-        # defaults differ for a real reason: `--ff-seeded` needs each
-        # candidate to be a sound `initial_seed` *by construction*, with
-        # no independent check beyond that; a real Houdini pass verifies
-        # inductiveness of *any* candidate itself, regardless of
-        # provenance, via its own certification (see this module's
-        # docstring) -- so there is no reason to withhold query-rule-
-        # derived candidates (often exactly the ones actually needed;
-        # `y == 2*x` mined straight from a negated query is the routine
-        # case) the way `--ff-seeded` must. `--seed-houdini` therefore has
-        # no CLI-visible effect here: forcing this unconditionally is
-        # simply what "ALL candidates" already means.
-        use_seed_houdini=True,
-        cands_path=cands_path,
-        use_phasefit=use_phasefit,
-        use_mut=use_mut,
-        use_trace=use_trace,
-        trace_depth=trace_depth,
-        trace_limit=trace_limit,
-        trace_models_per_prefix=trace_models_per_prefix,
-        trace_samples_per_relation=trace_samples_per_relation,
-        trace_candidates_per_relation=trace_candidates_per_relation,
-        houdini_timeout_ms=houdini_timeout_ms,
-        random_seed=random_seed,
-    )
+
+    # Build the initial candidate pool monotonically.  A smaller source set is
+    # tried before adding the next, so an already-certified proof is never lost
+    # merely because Trace-Houdini or mutation makes the later SMT problem
+    # harder.  This mirrors run_trace_houdini's staged portfolio.
+    def _gather(*, with_trace: bool) -> CandidateMap:
+        pool, _gathered, _sound = gather_candidate_pool(
+            program,
+            variables=variables,
+            # FF-Houdini always starts from SeedMiner's full syntactic pool.
+            use_seed_houdini=True,
+            cands_path=cands_path,
+            use_phasefit=use_phasefit,
+            use_mut=False,
+            use_trace=with_trace,
+            trace_depth=trace_depth,
+            trace_limit=trace_limit,
+            trace_models_per_prefix=trace_models_per_prefix,
+            trace_samples_per_relation=trace_samples_per_relation,
+            trace_candidates_per_relation=trace_candidates_per_relation,
+            houdini_timeout_ms=houdini_timeout_ms,
+            random_seed=random_seed,
+        )
+        return pool
+
+    base_pool = _gather(with_trace=False)
+    staged_result = MultiHoudini(
+        program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
+    ).run(base_pool)
+    if staged_result.status is HoudiniStatus.SUCCESS:
+        return FFHoudiniResult(
+            status=FFHoudiniStatus.SAFE,
+            message=(
+                f"round 1: Houdini certified "
+                f"{sum(len(v) for v in staged_result.candidates.values())} "
+                "candidate(s) as inductive before trace/mutation"
+            ),
+            variables=variables,
+            rounds=1,
+            invariants=_as_invariants(staged_result.candidates),
+        )
+
+    if use_trace:
+        base_pool = _gather(with_trace=True)
+        staged_result = MultiHoudini(
+            program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
+        ).run(base_pool)
+        if staged_result.status is HoudiniStatus.SUCCESS:
+            return FFHoudiniResult(
+                status=FFHoudiniStatus.SAFE,
+                message=(
+                    f"round 1: Houdini certified "
+                    f"{sum(len(v) for v in staged_result.candidates.values())} "
+                    "candidate(s) as inductive after trace candidates"
+                ),
+                variables=variables,
+                rounds=1,
+                invariants=_as_invariants(staged_result.candidates),
+            )
+
+    if use_mut:
+        mutation_result = mutate_candidates(
+            base_pool,
+            max_terms_per_relation=DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+        )
+        base_pool = merge_candidate_maps(base_pool, mutation_result.candidates)
+        staged_result = MultiHoudini(
+            program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
+        ).run(base_pool)
+        if staged_result.status is HoudiniStatus.SUCCESS:
+            return FFHoudiniResult(
+                status=FFHoudiniStatus.SAFE,
+                message=(
+                    f"round 1: Houdini certified "
+                    f"{sum(len(v) for v in staged_result.candidates.values())} "
+                    "candidate(s) as inductive after mutation"
+                ),
+                variables=variables,
+                rounds=1,
+                invariants=_as_invariants(staged_result.candidates),
+            )
 
     extra_from_fixpoint: CandidateMap = {}
     previous_signature: frozenset[tuple[str, str]] | None = None
@@ -217,9 +273,15 @@ def run_ff_houdini(
             )
         previous_signature = signature
 
-        houdini_result = MultiHoudini(
-            program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
-        ).run(pool)
+        if round_number == 1 and not extra_from_fixpoint:
+            houdini_result = staged_result
+        else:
+            houdini_result = MultiHoudini(
+                program,
+                variables,
+                timeout_ms=houdini_timeout_ms,
+                random_seed=random_seed,
+            ).run(pool)
 
         if houdini_result.status is HoudiniStatus.SUCCESS:
             return FFHoudiniResult(

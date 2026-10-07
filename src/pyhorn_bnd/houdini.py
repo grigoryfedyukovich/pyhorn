@@ -172,6 +172,17 @@ class MultiHoudini:
         # Optional sexpr → TraceMiner kind label (e.g. string-0-count-I-mod-3-in-1-2).
         # Used to discharge hard regex induction by integer arithmetic.
         self.candidate_kinds = dict(candidate_kinds or {})
+        # Regex classification is structural but still repeated frequently across
+        # filtering/certification. Candidate keys are canonical sexprs, so cache
+        # one classification per candidate for the lifetime of this run.
+        self._regex_candidate_cache: dict[str, bool] = {}
+
+    def _candidate_is_regex(self, key: str, formula: z3.BoolRef) -> bool:
+        cached = self._regex_candidate_cache.get(key)
+        if cached is None:
+            cached = _is_regex_candidate(key, formula)
+            self._regex_candidate_cache[key] = cached
+        return cached
 
     def run(
         self,
@@ -312,7 +323,7 @@ class MultiHoudini:
                     )
                     solver_checks += extra_rx
                     for key in bad_rx:
-                        if key in destination and _is_regex_candidate(
+                        if key in destination and self._candidate_is_regex(
                             key, destination[key]
                         ):
                             removed_candidates.append(
@@ -344,7 +355,7 @@ class MultiHoudini:
                     # violations. A model that falsifies a regex candidate
                     # does so without assuming that regex on the source, so
                     # it is not a valid CTI for that candidate.
-                    if _is_regex_candidate(key, formula):
+                    if self._candidate_is_regex(key, formula):
                         return False
                     kind = self.candidate_kinds.get(key, "")
                     if _arithmetic_count_modulo_preserved(context.rule, kind) is True:
@@ -604,7 +615,7 @@ class MultiHoudini:
                 # leaving a trivial violation; the probe path records it.
                 violated.append(z3.BoolVal(True))
                 continue
-            if _is_regex_candidate(key, formula):
+            if self._candidate_is_regex(key, formula):
                 continue
             violated.append(z3.Not(formula))
         if not violated:
@@ -621,7 +632,7 @@ class MultiHoudini:
         if relation is not None and relation in self.variables:
             active_src = active.get(relation, {})
             for key, cand in active_src.items():
-                if _is_regex_candidate(key, cand):
+                if self._candidate_is_regex(key, cand):
                     continue
                 if _parse_count_modulo_kind(self.candidate_kinds.get(key, "")):
                     continue
@@ -709,7 +720,8 @@ class MultiHoudini:
             for guard, key in zip(
                 context.source_guards, context.source_keys, strict=True
             )
-            if key in active_keys and not _is_regex_candidate(key, active_keys[key])
+            if key in active_keys
+            and not self._candidate_is_regex(key, active_keys[key])
         ]
 
     def _certify_fresh(
@@ -746,7 +758,7 @@ class MultiHoudini:
                     for src_key, src_cand in active.get(
                         rule.src_relation, {}
                     ).items():
-                        if _is_regex_candidate(src_key, src_cand):
+                        if self._candidate_is_regex(src_key, src_cand):
                             continue
                         solver2.add(
                             self._instantiate(
@@ -1006,59 +1018,35 @@ def run_trace_houdini(
         DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
     ),
     extra_candidates: CandidateMap | None = None,
+    seed_result: SeedMiningResult | None = None,
 ) -> HoudiniResult:
-    """Run staged syntactic and trace-generalized Houdini synthesis.
+    """Run a monotone staged invariant-synthesis portfolio.
 
-    The inexpensive syntactic candidate set is tried first.  Trace sampling is
-    invoked only when that baseline is insufficient.  This makes the enhanced
-    pipeline monotonic with respect to the existing Seed-Houdini successes and
-    prevents difficult speculative candidates from turning an already proved
-    benchmark into ``unknown``.
+    Stage 1 runs Houdini on the cheap baseline: SeedMiner plus
+    ``extra_candidates`` (used by the CLI for PhaseFit).  If that already
+    proves the program, return immediately and preserve that proof.
 
-    If ``mutate`` is set, :func:`.seedminer.mutate_candidates` is applied to
-    whatever candidate set is live at each stage -- the seed-mined set for
-    the baseline attempt, and the full seed-plus-trace set for the second
-    stage -- so mutation always sees the complete combined candidate pool
-    available at that point, the same guarantee the CLI's plain
-    ``--seed-houdini``/``--cands``/``--mut`` flow gives. Mutation is applied
-    at the baseline stage too (not only after trace mining) because it is
-    inexpensive relative to trace sampling, so it belongs in the "try cheap
-    things first" half of the staging, same as the syntactic seed candidates
-    themselves.
+    Stage 2 adds trace-generalized candidates and tries Houdini again.  Only
+    if that is still insufficient and ``mutate`` is requested does stage 3
+    derive mutations from the complete seed/extra/trace pool and run one final
+    Houdini pass.  Thus a richer candidate source can never turn a proof found
+    by an earlier stage into ``unknown`` merely because the larger SMT problem
+    is harder.
 
-    ``max_mutation_terms_per_relation`` is passed straight through to every
-    :func:`.seedminer.mutate_candidates` call this makes (see that function's
-    docstring). It defaults to a real cap here, unlike
-    ``mutate_candidates()``'s own default of unbounded: this pipeline's
-    combined seed-plus-trace pools routinely carry far more equalities than
-    the syntactically-mined pools ``mutate_candidates()`` was originally
-    sized for, and pairing cost is quadratic in that count. Pass ``None`` to
-    disable the cap and match ``mutate_candidates()``'s own default.
-
-    ``max_mutation_substitutions_per_relation`` is likewise passed straight
-    through as ``mutate_candidates()``'s ``max_equality_substitutions_per_relation``.
-    It bounds a different mechanism (sort-agnostic equality substitution,
-    not the numeric pairing ``max_mutation_terms_per_relation`` bounds) with
-    its own, independent cost profile, so it gets its own knob rather than
-    reusing the same one.
+    ``seed_result`` lets an orchestrator reuse the exact SeedMiner variable map
+    that was used to produce ``extra_candidates`` (notably PhaseFit), avoiding
+    duplicate mining and ensuring every candidate is over the same canonical
+    variables.
     """
 
     from .candidate_generation import CandidateBatch, merge_candidate_batches
     from .trace_miner import TraceCandidateMiner
 
-    seeds = SeedMiner(program).mine()
-    seed_candidates: CandidateMap = seeds.candidates
-    mutation_result: MutationResult | None = None
-    if mutate:
-        mutation_result = mutate_candidates(
-            seed_candidates,
-            max_terms_per_relation=max_mutation_terms_per_relation,
-            max_equality_substitutions_per_relation=(
-                max_mutation_substitutions_per_relation
-            ),
-        )
-        seed_candidates = merge_candidate_maps(
-            seed_candidates, mutation_result.candidates
+    seeds = seed_result if seed_result is not None else SeedMiner(program).mine()
+    baseline_candidates: CandidateMap = seeds.candidates
+    if extra_candidates:
+        baseline_candidates = merge_candidate_maps(
+            baseline_candidates, extra_candidates
         )
 
     baseline = MultiHoudini(
@@ -1066,7 +1054,7 @@ def run_trace_houdini(
         seeds.variables,
         timeout_ms=timeout_ms,
         random_seed=random_seed,
-    ).run(seed_candidates, seed_result=seeds)
+    ).run(baseline_candidates, seed_result=seeds)
     if baseline.status is HoudiniStatus.SUCCESS:
         return HoudiniResult(
             status=baseline.status,
@@ -1076,7 +1064,6 @@ def run_trace_houdini(
             statistics=baseline.statistics,
             failures=baseline.failures,
             removed_candidates=baseline.removed_candidates,
-            mutation_result=mutation_result,
         )
 
     traces = TraceCandidateMiner(
@@ -1093,12 +1080,9 @@ def run_trace_houdini(
     combined = merge_candidate_batches(
         seeds.variables,
         CandidateBatch(
-            generator_id="seedminer",
+            generator_id="baseline",
             variables=seeds.variables,
-            # Already includes stage-1 mutations, if any: there is no reason
-            # to discard them just because the baseline attempt using them
-            # did not succeed on its own.
-            candidates=seed_candidates,
+            candidates=baseline_candidates,
         ),
         CandidateBatch(
             generator_id="trace-templates",
@@ -1110,55 +1094,89 @@ def run_trace_houdini(
             },
         ),
     )
-    if mutate:
-        # Re-run over the enlarged combined set, not just the stage-1
-        # mutations: a trace-derived equality and a seed-derived inequality
-        # can now be combined into a candidate neither stage alone could
-        # produce. This does recompute the stage-1 pairs too, but
-        # mutate_candidates is a pure function of its input and cheap
-        # relative to the trace sampling that already ran. The same
-        # max_mutation_terms_per_relation cap applies here -- this is the
-        # stage where it actually matters, since the combined pool is where
-        # trace-sampled equalities push the term count up.
-        mutation_result = mutate_candidates(
-            combined,
-            max_terms_per_relation=max_mutation_terms_per_relation,
-            max_equality_substitutions_per_relation=(
-                max_mutation_substitutions_per_relation
-            ),
-        )
-        combined = merge_candidate_maps(combined, mutation_result.candidates)
-    kind_map = {
-        obs.candidate.sexpr(): obs.kind for obs in traces.observations
-    }
-    result = MultiHoudini(
+    kind_map = {obs.candidate.sexpr(): obs.kind for obs in traces.observations}
+
+    trace_pass = MultiHoudini(
         program,
         seeds.variables,
         timeout_ms=timeout_ms,
         random_seed=random_seed,
         candidate_kinds=kind_map,
     ).run(combined, seed_result=seeds)
+    if trace_pass.status is HoudiniStatus.SUCCESS or not mutate:
+        return HoudiniResult(
+            status=trace_pass.status,
+            variables=seeds.variables,
+            candidates=trace_pass.candidates,
+            seed_result=seeds,
+            statistics=trace_pass.statistics,
+            failures=trace_pass.failures,
+            removed_candidates=trace_pass.removed_candidates,
+            trace_result=traces,
+        )
+
+    mutation_result = mutate_candidates(
+        combined,
+        max_terms_per_relation=max_mutation_terms_per_relation,
+        max_equality_substitutions_per_relation=(
+            max_mutation_substitutions_per_relation
+        ),
+    )
+    mutated = merge_candidate_maps(combined, mutation_result.candidates)
+    final = MultiHoudini(
+        program,
+        seeds.variables,
+        timeout_ms=timeout_ms,
+        random_seed=random_seed,
+        candidate_kinds=kind_map,
+    ).run(mutated, seed_result=seeds)
     return HoudiniResult(
-        status=result.status,
+        status=final.status,
         variables=seeds.variables,
-        candidates=result.candidates,
+        candidates=final.candidates,
         seed_result=seeds,
-        statistics=result.statistics,
-        failures=result.failures,
-        removed_candidates=result.removed_candidates,
+        statistics=final.statistics,
+        failures=final.failures,
+        removed_candidates=final.removed_candidates,
         mutation_result=mutation_result,
         trace_result=traces,
     )
 
 
 def _is_regex_candidate(key: str, formula: z3.BoolRef) -> bool:
-    """True for ``str.in_re`` formulas (and sexprs that mention them)."""
+    """Return whether *formula* contains a regular-expression membership.
+
+    This intentionally avoids ``formula.sexpr()``.  Serializing a large Z3 AST
+    merely to search for ``str.in_re`` showed up as a dominant cost (and could
+    be interrupted) in FF-Houdini runs.  The candidate key is already available
+    for the common fast path; otherwise walk the AST structurally, including
+    quantified bodies.
+    """
     if "str.in_re" in key or "InRe" in key:
         return True
-    try:
-        return formula.decl().name() == "str.in_re" or "str.in_re" in formula.sexpr()
-    except z3.Z3Exception:
-        return False
+
+    stack: list[z3.ExprRef] = [formula]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        try:
+            ast_id = current.get_id()
+        except z3.Z3Exception:
+            continue
+        if ast_id in seen:
+            continue
+        seen.add(ast_id)
+
+        try:
+            if z3.is_app(current) and current.decl().kind() == z3.Z3_OP_SEQ_IN_RE:
+                return True
+            if z3.is_quantifier(current):
+                stack.append(current.body())
+            else:
+                stack.extend(current.children())
+        except z3.Z3Exception:
+            continue
+    return False
 
 
 def _parse_count_modulo_kind(

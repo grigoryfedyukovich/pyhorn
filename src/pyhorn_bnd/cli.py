@@ -174,8 +174,8 @@ def _parser() -> argparse.ArgumentParser:
             "run PhaseFit synthesis for branching (ite/mod) loops: extract "
             "guarded branches, compute per-branch closed forms, discover "
             "phase boundaries, and feed the resulting interval lemmas plus "
-            "seed atoms into MultiHoudini. Can be combined with "
-            "--seed-houdini (candidates are merged)."
+            "seed atoms into MultiHoudini. With --trace-houdini, PhaseFit "
+            "forms the first proof stage before trace candidates are added."
         ),
     )
     parser.add_argument(
@@ -205,9 +205,10 @@ def _parser() -> argparse.ArgumentParser:
             "combining pairs of existing numeric equalities and "
             "inequalities within each relation's pool (e.g. x<=y and "
             "y<=z produce x<=z; x=a and y=b also produce x+y=a+b and "
-            "x-y=a-b). Applies to the full combined candidate set from "
-            "whichever of --seed-houdini, --cands, and --trace-houdini "
-            "were used. Requires one of those three."
+            "x-y=a-b). In trace mode it is the final fallback stage, after "
+            "Seed/PhaseFit and trace-only Houdini attempts have failed; this "
+            "preserves earlier proofs instead of rerunning them in a larger "
+            "pool."
         ),
     )
     parser.add_argument(
@@ -1576,15 +1577,21 @@ def main(argv: list[str] | None = None) -> int:
             user_candidates: CandidateMap | None = None
             mutation_result: MutationResult | None = None
             if args.trace_houdini:
-                # A separate top-level pipeline from the accumulate-then-run
-                # flow below: run_trace_houdini stages its own baseline
-                # seed-houdini attempt internally (so a redundant
-                # --seed-houdini alongside it, permitted above, has no
-                # separate effect here) and only spends the trace-sampling
-                # budget if that fails, so there is nothing here to merge
-                # with --cands (disallowed above). --mut is supported
-                # directly by run_trace_houdini, which applies it to the
-                # candidate set live at each of its own stages.
+                # Trace-Houdini is a staged portfolio.  When PhaseFit is also
+                # requested, generate its candidates over the *same* mined
+                # variable map and feed them into stage 1.  Previously this
+                # top-level branch silently bypassed --phasefit entirely.
+                trace_seed_result = None
+                trace_extra_candidates: CandidateMap | None = None
+                if args.phasefit:
+                    from .phasefit import run_phasefit
+
+                    trace_miner = SeedMiner(program)
+                    trace_seed_result = trace_miner.mine()
+                    _pf_results, trace_extra_candidates = run_phasefit(
+                        program, seed_result=trace_seed_result
+                    )
+
                 houdini_result = run_trace_houdini(
                     program,
                     trace_depth=args.trace_depth,
@@ -1607,6 +1614,8 @@ def main(argv: list[str] | None = None) -> int:
                         if args.trace_mutation_substitution_limit == 0
                         else args.trace_mutation_substitution_limit
                     ),
+                    extra_candidates=trace_extra_candidates,
+                    seed_result=trace_seed_result,
                 )
                 mutation_result = houdini_result.mutation_result
             else:

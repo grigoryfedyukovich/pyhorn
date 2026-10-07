@@ -7,7 +7,7 @@ other, up to a round budget:
 ```bash
 pyhorn-expl --ff-houdini input.smt2
 
-# broadened with every other candidate source at once
+# broadened monotonically: PhaseFit -> Trace -> Mutation before FF rounds
 pyhorn-expl --ff-houdini --cands extra.smt2 --phasefit --trace-houdini --mut input.smt2
 ```
 
@@ -21,16 +21,19 @@ see [`forward_fixpoint.md`](forward_fixpoint.md)'s `--ff-seeded` section.
 
 ## The mechanism
 
-Each round:
+Before the alternating rounds, candidate enrichment is tried monotonically:
+SeedMiner plus `--cands`/`--phasefit` first, then trace candidates if requested,
+then mutation if requested. Each stage runs real Houdini and returns immediately
+if it proves SAFE, so a later, larger pool cannot lose an earlier proof due to
+solver cost. The largest unsuccessful pool becomes the base pool for the
+forward-fixpoint alternation.
 
-1. **Houdini, on all candidates at once.** Run `MultiHoudini` on the full
-   candidate pool: SeedMiner's own full syntactic mining (fact-, step-,
-   and query-rule provenance alike, *always* -- this differs from
-   `--ff-seeded`'s narrower fact-rule-only default; see below for why),
-   plus whichever of `--cands`, `--phasefit`, `--mut`, and
-   `--trace-houdini` were also requested. If that alone certifies every
-   rule -- including the query rules -- Houdini has already proven the
-   program SAFE outright: done, no forward-fixpoint pass needed.
+Each round then does:
+
+1. **Houdini on the current full pool.** The first round reuses the last staged
+   Houdini result; later rounds add any reachable-set formulas fed back by
+   forward fixpoint. If Houdini certifies every rule -- including the query
+   rules -- the program is SAFE outright.
 2. **Feed the proven invariants into an accelerated forward-fixpoint
    pass.** If certification instead leaves only *query*-rule failures
    (a query failure just means the invariants found aren't *sufficient*

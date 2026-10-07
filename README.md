@@ -683,10 +683,13 @@ affine equality, and eight string templates):
 pyhorn-expl --trace-houdini --trace-depth 8 input.smt2
 ```
 
-It is staged and monotonic with respect to `--seed-houdini`: an ordinary
-Seed-Houdini attempt runs first, and trace sampling is only invoked -- and
-only spends its budget -- if that baseline does not already prove the
-program. A trace-mined candidate is exactly as untrusted as any other:
+It is staged and monotonic. The first stage is Seed-Houdini plus PhaseFit
+when `--phasefit` is requested; trace sampling is invoked only if that baseline
+does not already prove the program. If `--mut` is also requested, mutation is
+a third fallback stage after the trace-only attempt. Thus adding a richer
+candidate source cannot turn an earlier successful proof into `unknown` merely
+because the larger SMT problem is harder. A trace-mined candidate is exactly
+as untrusted as any other:
 MultiHoudini filters the combined candidate set and every original CHC is
 independently certified by a fresh solver, same as every other mode above.
 
@@ -711,11 +714,11 @@ pyhorn-expl --list-trace-templates --json
 
 This is a separate top-level mode from `--cands` in this release -- it
 cannot yet be combined with `--cands`, `--validate-candidates`,
-`--dump-cands`, or `--dump-promising-candidates`. `--mut` *is* combinable,
-and applies to the full combined seed-plus-trace candidate set at whichever
-stage the pipeline reaches. `--seed-houdini` may be passed alongside it too,
-but has no separate effect, since this pipeline already runs an ordinary
-seed-houdini attempt as its own first stage:
+`--dump-cands`, or `--dump-promising-candidates`. `--phasefit` and `--mut`
+*are* combinable: PhaseFit contributes to the baseline stage, while mutation
+is attempted only after the combined seed/PhaseFit/trace pool still fails.
+`--seed-houdini` may be passed alongside it too, but has no separate effect,
+since the pipeline always begins with SeedMiner's candidates:
 
 ```bash
 pyhorn-expl --trace-houdini --mut --debug --print-invariants input.smt2

@@ -337,45 +337,28 @@ def merge_candidate_maps(
     base: CandidateMap,
     extra: CandidateMap,
 ) -> CandidateMap:
-    """Return a new :data:`.CandidateMap` that is the union of *base* and *extra*.
+    """Return the normalized union of two candidate maps.
 
-    For each relation, conjuncts from *extra* that are not already present in
-    *base* (compared by s-expression string) are appended after the base
-    conjuncts. Neither *base* nor *extra* is mutated.
-
-    This is the intended entry point when ``--cands`` is combined with
-    ``--seed-houdini``: mined candidates form the *base* and user-supplied
-    candidates are the *extra* (or vice versa -- the result is the same set
-    either way, modulo ordering).
-
-    Parameters
-    ----------
-    base:
-        Primary candidate map (e.g. from :class:`.SeedMiner`).
-    extra:
-        Secondary candidate map (e.g. from :func:`parse_candidate_file`).
-
-    Returns
-    -------
-    CandidateMap
-        Merged ``dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]]`` containing
-        all relations from both inputs, with duplicate conjuncts removed.
+    Candidates are simplified before deduplication, so cheap syntactic
+    variants such as ``x <= y`` and ``Not(y < x)`` do not unnecessarily
+    multiply Houdini obligations when Z3 normalizes them to the same formula.
+    Ordering remains deterministic and base-first: the first normalized
+    representative of each s-expression is retained. Neither input is mutated.
     """
-    accumulator: dict[z3.FuncDeclRef, list[z3.BoolRef]] = {
-        rel: list(cands) for rel, cands in base.items()
-    }
-
-    for rel, extra_cands in extra.items():
-        if rel not in accumulator:
-            accumulator[rel] = list(extra_cands)
-            continue
-        existing_sexprs: set[str] = {c.sexpr() for c in accumulator[rel]}
-        for cand in extra_cands:
-            if cand.sexpr() not in existing_sexprs:
-                accumulator[rel].append(cand)
-                existing_sexprs.add(cand.sexpr())
-
-    return {rel: tuple(cands) for rel, cands in accumulator.items()}
+    relations = list(base) + [rel for rel in extra if rel not in base]
+    merged: CandidateMap = {}
+    for rel in relations:
+        bucket: dict[str, z3.BoolRef] = {}
+        for cand in (*base.get(rel, ()), *extra.get(rel, ())):
+            normalized = z3.simplify(cand)
+            if not z3.is_bool(normalized):
+                raise ValueError(
+                    f"candidate for {rel.name()} is not Boolean: {normalized}"
+                )
+            bucket.setdefault(normalized.sexpr(), normalized)
+        if bucket:
+            merged[rel] = tuple(bucket.values())
+    return merged
 
 
 def format_candidates_smt2(
