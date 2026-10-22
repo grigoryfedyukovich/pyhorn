@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_PHASE_BUDGET_K = 8
 DEFAULT_P_MAX = 256
 DEFAULT_MAX_NESTING = 8
+# Keep exact affine-SCC synthesis deliberately small.  Even a mathematically
+# valid polynomial summary is not useful if simplification/translation creates
+# a huge term that dominates invariant generation or ABMC validation.
+_MAX_AFFINE_SCC_EXPR_OPS = 512
 
 # Exception types expected from best-effort z3<->sympy translation and
 # symbolic solving of arbitrary (possibly unsupported) input -- caught
@@ -894,10 +898,21 @@ def compute_closed_form(
         if v.get_id() not in symbol_map:
             symbol_map[v.get_id()] = _state_symbol(v, str(v))
 
+    # Snapshot the real state symbols *before* conversion: _z3_to_sympy's
+    # fallback path mutates symbol_map when it invents an opaque symbol.
+    allowed_input_symbols = set(symbol_map.values())
     try:
         rhs_sp = _z3_to_sympy(update, symbol_map)
     except _SYMBOLIC_BESTEFFORT_EXC as exc:
         logger.debug("z3->sympy failed for %s: %s", update, exc)
+        return None
+
+    # _z3_to_sympy is intentionally best-effort and may represent an
+    # unsupported compound AST by inventing an opaque SymPy symbol.  Such a
+    # symbol has no Z3 reconstruction in init_map, so reject it here rather
+    # than allowing a seemingly valid recurrence to flow downstream.
+    if not rhs_sp.free_symbols.issubset(allowed_input_symbols):
+        logger.debug("closed form rejected opaque symbolic term in %s", update)
         return None
 
     # Substitute trajectories already solved for other simultaneously-changing
@@ -1014,20 +1029,24 @@ def compute_branch_closed_forms(
     pre_vars: Sequence[z3.ExprRef],
     post_to_pre: Mapping[z3.ExprRef, z3.ExprRef],
     init_state: Mapping[z3.ExprRef, z3.ExprRef] | None = None,
+    *,
+    allow_affine_scc: bool = True,
 ) -> dict[z3.ExprRef, ClosedForm]:
     """Compute branch closed forms, including polynomial affine SCCs.
 
     The fast path remains dependency-ordered scalar solving: triangular
     systems are handled by solving a dependency first and substituting its
     trajectory into later recurrences.  If that stalls on a genuinely cyclic
-    component, a small symbolic interpolation pass attempts the whole affine
-    SCC simultaneously.  Candidate polynomial trajectories are accepted only
-    after an exact symbolic recurrence check, so interpolation is a synthesis
-    device rather than a proof rule.
+    affine component, a cheap exact unipotence test handles ``X' = A*X + b``
+    when ``A-I`` is nilpotent.  Non-polynomial cyclic systems fail fast.
 
-    This keeps the public ``ClosedForm`` representation unchanged; PhaseFit
-    invariant generation and ABMC therefore receive the richer forms through
-    their existing paths.
+    ``allow_affine_scc`` lets callers opt out of the cyclic-system extension.
+    ABMC keeps it enabled because validated SCC summaries can materially
+    compress counterexamples.  Invariant PhaseFit disables it: on the measured
+    FreqHorn suite the SCC extension added no invariant proofs, while it made
+    several previously-fast benchmarks spend the full external timeout in
+    downstream symbolic processing.  The scalar and triangular dependency
+    solvers remain shared by both clients.
     """
     forms: dict[z3.ExprRef, ClosedForm] = {}
 
@@ -1112,11 +1131,26 @@ def compute_branch_closed_forms(
         component_ids: Sequence[int],
         solved_ids: set[int],
     ) -> dict[z3.ExprRef, ClosedForm] | None:
+        """Solve a small affine SCC when its linear part is unipotent.
+
+        For ``X' = A*X + b`` with constant rational ``A``, polynomial closed
+        forms exist in the fragment supported by :func:`_sympy_to_z3` whenever
+        ``M = A - I`` is nilpotent.  In that case
+
+            A**n = sum_j binomial(n, j) M**j
+
+        and
+
+            sum_{t=0}^{n-1} A**t b
+              = sum_j binomial(n, j+1) M**j b.
+
+        This exact construction replaces the former interpolate-a-prefix
+        heuristic.  Non-unipotent SCCs (including Fibonacci/exponential
+        systems) are rejected after at most ``dimension`` tiny matrix
+        multiplications instead of growing and simplifying symbolic prefixes.
+        """
         component = [var_by_id[item] for item in component_ids]
         component_set = set(component_ids)
-        # Keep the best-effort fallback deliberately small: symbolic prefixes
-        # grow rapidly with SCC dimension, while larger systems are unlikely to
-        # fit PhaseFit's compact polynomial fragment anyway.
         if len(component) > 4:
             return None
 
@@ -1143,22 +1177,28 @@ def compute_branch_closed_forms(
             v.get_id(): _state_symbol(v, f"{v}_0") for v in component
         }
         for zid, zv in z3_by_id.items():
-            symbol_map[zid] = component_state.get(
-                zid, _state_symbol(zv, str(zv))
-            )
+            symbol_map[zid] = component_state.get(zid, _state_symbol(zv, str(zv)))
 
         rhs_by_id: dict[int, sp.Expr] = {}
         inherited_init: dict[sp.Symbol, z3.ExprRef] = {}
+        rows: list[list[sp.Rational]] = []
+        offsets: list[sp.Expr] = []
+        state_symbols = [component_state[v.get_id()] for v in component]
+
         for var in component:
+            # Snapshot before conversion because the fallback path extends
+            # symbol_map with any opaque AST it cannot translate.
+            allowed_rhs_symbols = set(symbol_map.values())
             try:
                 rhs = _z3_to_sympy(update_by_id[var.get_id()], symbol_map)
             except _SYMBOLIC_BESTEFFORT_EXC:
                 return None
 
-            # Reject opaque compound terms that _z3_to_sympy had to invent a
-            # symbol for: every symbol-map key must correspond to a real Z3
-            # variable we know how to reconstruct later.
-            if any(zid not in z3_by_id for zid in symbol_map):
+            # Reject opaque compound terms invented by the best-effort
+            # translator.  Checking symbol_map after conversion would be
+            # ineffective because the fallback has already inserted the new
+            # symbol by then.
+            if not rhs.free_symbols.issubset(allowed_rhs_symbols):
                 return None
 
             substitutions: dict[sp.Symbol, sp.Expr] = {}
@@ -1171,80 +1211,115 @@ def compute_branch_closed_forms(
                     inherited_init.update(known_cf.init_map)
             if substitutions:
                 try:
-                    rhs = sp.simplify(rhs.subs(substitutions, simultaneous=True))
+                    rhs = sp.expand(rhs.subs(substitutions, simultaneous=True))
                 except _SYMBOLIC_BESTEFFORT_EXC:
                     return None
 
-            # This extension deliberately targets affine SCCs only.  Coefficients
-            # may depend on n or unchanged parameters, but the component's own
-            # state occurs with total degree at most one.
             try:
-                poly = sp.Poly(rhs, *component_state.values())
+                poly = sp.Poly(rhs, *state_symbols)
                 if poly.total_degree() > 1:
                     return None
             except _SYMBOLIC_BESTEFFORT_EXC:
                 return None
-            rhs_by_id[var.get_id()] = rhs
 
-        # Generate a short exact symbolic prefix.  Eight interpolation degrees
-        # covers the small affine systems PhaseFit is designed for; any guessed
-        # polynomial is subsequently proved against the recurrence symbolically.
-        max_degree = DEFAULT_PHASE_BUDGET_K
-        sequences: dict[int, list[sp.Expr]] = {
-            v.get_id(): [component_init[v.get_id()]] for v in component
-        }
-        current = {
-            component_state[v.get_id()]: component_init[v.get_id()]
-            for v in component
-        }
-        for step in range(max_degree + 1):
-            nxt: dict[int, sp.Expr] = {}
-            for var in component:
+            row: list[sp.Rational] = []
+            linear = sp.Integer(0)
+            for state_sym in state_symbols:
                 try:
-                    value = rhs_by_id[var.get_id()].subs(current, simultaneous=True)
-                    value = sp.simplify(value.subs(n, sp.Integer(step)))
+                    coeff = sp.cancel(poly.coeff_monomial(state_sym))
                 except _SYMBOLIC_BESTEFFORT_EXC:
                     return None
-                nxt[var.get_id()] = value
-            for var in component:
-                sequences[var.get_id()].append(nxt[var.get_id()])
-            current = {
-                component_state[v.get_id()]: nxt[v.get_id()] for v in component
-            }
+                # Keep the test deliberately cheap and exact: symbolic or
+                # n-dependent matrix coefficients are outside this fast path.
+                if coeff.free_symbols or coeff.is_Rational is not True:
+                    return None
+                row.append(coeff)
+                linear += coeff * state_sym
 
-        candidates: dict[int, sp.Expr] = {}
-        points = list(range(max_degree + 2))
-        for var in component:
-            values = sequences[var.get_id()]
             try:
-                candidate = sp.interpolate(list(zip(points, values, strict=True)), n)
-                candidate = sp.factor(sp.simplify(candidate))
+                offset = sp.expand(rhs - linear)
             except _SYMBOLIC_BESTEFFORT_EXC:
                 return None
-            # Restrict this fallback to genuine polynomials in n.  Exponential
-            # and periodic systems belong to later domain-specific extensions.
+            if any(sym in offset.free_symbols for sym in state_symbols):
+                return None
+            # The affine offset may contain unchanged parameters, but not a
+            # previously-solved time-varying trajectory.  The latter would be
+            # a non-autonomous system and belongs to a later extension.
+            if n in offset.free_symbols:
+                return None
+
+            rows.append(row)
+            offsets.append(offset)
+            rhs_by_id[var.get_id()] = rhs
+
+        try:
+            A = sp.Matrix(rows)
+            identity = sp.eye(len(component))
+            M = A - identity
+        except _SYMBOLIC_BESTEFFORT_EXC:
+            return None
+
+        def _zero_matrix(matrix: sp.MatrixBase) -> bool:
+            return all(entry == 0 for entry in matrix)
+
+        # For a d-dimensional matrix, nilpotence implies M**d == 0.  Build
+        # exactly the nonzero powers M**0 .. M**(r-1); this is bounded by four
+        # tiny rational-matrix multiplications because of the SCC size guard.
+        powers: list[sp.MatrixBase] = [identity]
+        current = identity
+        nilpotent = False
+        for _degree in range(1, len(component) + 1):
+            current = current * M
+            if _zero_matrix(current):
+                nilpotent = True
+                break
+            powers.append(current)
+        if not nilpotent:
+            return None
+
+        init_vec = sp.Matrix([component_init[v.get_id()] for v in component])
+        offset_vec = sp.Matrix(offsets)
+        closed_vec = sp.zeros(len(component), 1)
+
+        try:
+            for degree, matrix_power in enumerate(powers):
+                choose_state = sp.expand_func(sp.binomial(n, degree))
+                choose_offset = sp.expand_func(sp.binomial(n, degree + 1))
+                closed_vec += choose_state * (matrix_power * init_vec)
+                closed_vec += choose_offset * (matrix_power * offset_vec)
+        except _SYMBOLIC_BESTEFFORT_EXC:
+            return None
+
+        candidates: dict[int, sp.Expr] = {}
+        for index, var in enumerate(component):
             try:
-                if sp.Poly(candidate, n).degree() > max_degree:
+                # ``factor`` can be dramatically more expensive than the
+                # matrix construction itself and is unnecessary for either
+                # correctness or downstream translation.  Keep the canonical
+                # expanded polynomial and reject pathological term growth.
+                candidate = sp.expand(closed_vec[index])
+                if sp.count_ops(candidate) > _MAX_AFFINE_SCC_EXPR_OPS:
                     return None
             except _SYMBOLIC_BESTEFFORT_EXC:
                 return None
             candidates[var.get_id()] = candidate
 
-        # Exact local proof: F(n+1) must equal the original simultaneous update
-        # applied to F(n), with already-solved external trajectories at n.
+        # Keep the exact local recurrence/anchor proof even though the matrix
+        # derivation is exact.  This protects future changes to coefficient
+        # extraction and makes this synthesis path fail closed independently.
         recurrence_subs = {
             component_state[v.get_id()]: candidates[v.get_id()]
             for v in component
         }
         for var in component:
             try:
-                lhs = sp.simplify(candidates[var.get_id()].subs(n, n + 1))
-                rhs = sp.simplify(
+                lhs = sp.expand(candidates[var.get_id()].subs(n, n + 1))
+                rhs = sp.expand(
                     rhs_by_id[var.get_id()].subs(recurrence_subs, simultaneous=True)
                 )
-                if sp.simplify(lhs - rhs) != 0:
+                if sp.expand(lhs - rhs) != 0:
                     return None
-                if sp.simplify(
+                if sp.expand(
                     candidates[var.get_id()].subs(n, 0)
                     - component_init[var.get_id()]
                 ) != 0:
@@ -1255,9 +1330,7 @@ def compute_branch_closed_forms(
         sym_to_z3: dict[sp.Symbol, z3.ExprRef] = dict(inherited_init)
         for var in component:
             init_sym = component_init[var.get_id()]
-            sym_to_z3[init_sym] = (
-                init_state.get(var, var) if init_state else var
-            )
+            sym_to_z3[init_sym] = init_state.get(var, var) if init_state else var
         for zid, sym in symbol_map.items():
             if zid in component_set:
                 continue
@@ -1273,8 +1346,16 @@ def compute_branch_closed_forms(
                 for sym, zexpr in sym_to_z3.items()
                 if sym in expr.free_symbols
             }
-            # Every free symbol except n must be reconstructible by callers.
             if any(sym != n and sym not in init_map for sym in expr.free_symbols):
+                return None
+
+            # Preflight the exact downstream expression language now.  This
+            # prevents PhaseFit from accepting an SCC form that later becomes
+            # unusable in guard re-anchoring or ABMC because _sympy_to_z3
+            # cannot encode one of its operators.
+            probe_map = dict(init_map)
+            probe_map[n] = z3.Int("__phasefit_scc_n_probe")
+            if _sympy_to_z3(expr, probe_map) is None:
                 return None
             result[var] = ClosedForm(var=var, expr=expr, init_map=init_map)
         return result
@@ -1313,7 +1394,10 @@ def compute_branch_closed_forms(
             continue
 
         # No scalar variable is dependency-ready.  Try genuinely cyclic affine
-        # SCCs as polynomial systems, one component at a time.
+        # SCCs as polynomial systems, one component at a time when the caller
+        # explicitly allows that richer closed-form class.
+        if not allow_affine_scc:
+            break
         rescued = False
         for component_ids in _cyclic_components(deferred):
             scc_forms = _solve_polynomial_affine_scc(component_ids, solved_ids)
@@ -1728,7 +1812,16 @@ def stitch_phases(
     for phase_i in range(phase_budget):
         branch = branches[current_branch_idx]
         cforms = compute_branch_closed_forms(
-            branch, pre_vars, post_to_pre, current_init
+            branch,
+            pre_vars,
+            post_to_pre,
+            current_init,
+            # Cyclic affine summaries are useful for accelerated BMC, where
+            # every shortcut is validated independently, but they have not
+            # improved invariant coverage and can make symbolic guard
+            # processing pathological.  Keep PhaseFit invariant mining on the
+            # pre-SCC scalar/triangular fragment.
+            allow_affine_scc=False,
         )
         if not cforms:
             # cannot obtain closed forms – stop

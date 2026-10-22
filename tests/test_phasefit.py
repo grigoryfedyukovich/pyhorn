@@ -43,6 +43,15 @@ def test_closed_form_increment():
     assert n in cf.expr.free_symbols
 
 
+def test_closed_form_rejects_opaque_unsupported_ast():
+    """Unsupported arithmetic must not become an unconstrained SymPy symbol.
+
+    Integer division is deliberately outside _z3_to_sympy's current closed-form
+    fragment.  The fallback translator mutates its symbol map, so this also
+    guards the pre-conversion allowed-symbol snapshot used by the hardening.
+    """
+    x = z3.Int("opaque_div_x")
+    assert compute_closed_form(x / 2, x, [x]) is None
 
 
 def test_closed_form_cyclic_affine_scc_polynomial():
@@ -83,9 +92,44 @@ def test_closed_form_cyclic_affine_scc_polynomial():
     assert value_at(forms[y], 3, 2, 5) == -16
 
 
+
+
+def test_closed_form_cyclic_affine_scc_with_constant_offset():
+    """The unipotent SCC solver handles constant affine offsets exactly."""
+    import sympy as sp
+
+    x, y = z3.Ints("off_x off_y")
+    x1, y1 = z3.Ints("off_x1 off_y1")
+    branch = Branch(
+        guard=z3.BoolVal(True),
+        updates={x1: 2 * x + y + 1, y1: -x},
+    )
+    forms = compute_branch_closed_forms(
+        branch,
+        [x, y],
+        {x1: x, y1: y},
+    )
+    assert set(v.get_id() for v in forms) == {x.get_id(), y.get_id()}
+
+    n = sp.Symbol("n", integer=True, nonnegative=True)
+
+    def value_at(cf, steps: int, xv: int, yv: int):
+        subs = {n: steps}
+        for sym, zexpr in cf.init_map.items():
+            if zexpr.eq(x):
+                subs[sym] = xv
+            elif zexpr.eq(y):
+                subs[sym] = yv
+        return sp.simplify(cf.expr.subs(subs))
+
+    # Starting from (2,5): (10,-2) -> (19,-10) -> (29,-19).
+    assert value_at(forms[x], 3, 2, 5) == 29
+    assert value_at(forms[y], 3, 2, 5) == -19
+
+
 def test_closed_form_cyclic_affine_scc_rejects_exponential_trajectory():
-    """Cyclic affine systems are accepted only when the bounded-degree
-    polynomial guess passes the exact symbolic recurrence check."""
+    """Non-unipotent cyclic affine systems fail fast instead of attempting
+    symbolic-prefix interpolation."""
     x, y = z3.Ints("exp_x exp_y")
     x1, y1 = z3.Ints("exp_x1 exp_y1")
     branch = Branch(
@@ -99,6 +143,24 @@ def test_closed_form_cyclic_affine_scc_rejects_exponential_trajectory():
     )
     # Fibonacci-like/exponential behavior is outside the current translator's
     # polynomial closed-form language and must fail closed.
+    assert not forms
+
+
+def test_closed_form_cyclic_affine_scc_can_be_disabled_for_invariant_mining():
+    """Invariant PhaseFit can retain the cheap scalar/triangular fragment
+    while ABMC keeps the richer SCC summaries enabled."""
+    x, y = z3.Ints("disabled_scc_x disabled_scc_y")
+    x1, y1 = z3.Ints("disabled_scc_x1 disabled_scc_y1")
+    branch = Branch(
+        guard=z3.BoolVal(True),
+        updates={x1: 2 * x + y, y1: -x},
+    )
+    forms = compute_branch_closed_forms(
+        branch,
+        [x, y],
+        {x1: x, y1: y},
+        allow_affine_scc=False,
+    )
     assert not forms
 
 

@@ -348,16 +348,54 @@ def merge_candidate_maps(
     relations = list(base) + [rel for rel in extra if rel not in base]
     merged: CandidateMap = {}
     for rel in relations:
-        bucket: dict[str, z3.BoolRef] = {}
+        # Avoid serializing every candidate with ``sexpr()`` merely to
+        # deduplicate it.  Large quantified/string/array candidates can be
+        # expensive to print.  Z3's structural hash gives a cheap bucket;
+        # ``ExprRef.eq`` then resolves the (rare) hash collision exactly.
+        hash_buckets: dict[int, list[z3.BoolRef]] = {}
+        raw_buckets: dict[int, list[z3.BoolRef]] = {}
+        ordered: list[z3.BoolRef] = []
         for cand in (*base.get(rel, ()), *extra.get(rel, ())):
-            normalized = z3.simplify(cand)
+            # Skip exact raw duplicates before calling simplify; trace/PhaseFit
+            # pools often re-introduce the same formula from multiple sources.
+            try:
+                raw_hash = cand.hash()
+                raw_bucket = raw_buckets.setdefault(raw_hash, [])
+                if any(cand.eq(existing) for existing in raw_bucket):
+                    continue
+                raw_bucket.append(cand)
+            except z3.Z3Exception:
+                pass
+
+            try:
+                normalized = z3.simplify(cand)
+            except z3.Z3Exception:
+                # Simplification is an optimization, not a soundness premise.
+                # Keep the original Boolean candidate and let Houdini decide it.
+                normalized = cand
             if not z3.is_bool(normalized):
                 raise ValueError(
                     f"candidate for {rel.name()} is not Boolean: {normalized}"
                 )
-            bucket.setdefault(normalized.sexpr(), normalized)
-        if bucket:
-            merged[rel] = tuple(bucket.values())
+            try:
+                fingerprint = normalized.hash()
+            except z3.Z3Exception:
+                # A malformed/stale AST should not make candidate merging
+                # crash the whole analysis.  Fall back to keeping it; later
+                # validation will fail closed if Z3 cannot consume it.
+                ordered.append(normalized)
+                continue
+            bucket = hash_buckets.setdefault(fingerprint, [])
+            try:
+                duplicate = any(normalized.eq(existing) for existing in bucket)
+            except z3.Z3Exception:
+                duplicate = False
+            if duplicate:
+                continue
+            bucket.append(normalized)
+            ordered.append(normalized)
+        if ordered:
+            merged[rel] = tuple(ordered)
     return merged
 
 

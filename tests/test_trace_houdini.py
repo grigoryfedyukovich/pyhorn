@@ -21,6 +21,10 @@ from pyhorn_bnd import (
     run_trace_houdini,
 )
 from pyhorn_bnd.cli import main
+from pyhorn_bnd.houdini import (
+    _large_array_relations_removed,
+    _scalar_arithmetic_candidate_map,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LENGTH_EXAMPLES = ROOT / "examples" / "string_length_literature"
@@ -463,3 +467,29 @@ def test_cli_phasefit_trace_houdini_passes_phasefit_candidates(
     capsys.readouterr()
     assert observed["seed_result"] is not None
     assert observed["extra_candidates"]
+
+
+def test_adaptive_mutation_filters_large_arrays_but_keeps_scalar_relations() -> None:
+    scalar_rel = z3.Function("scalar_mut_rel", z3.IntSort(), z3.BoolSort())
+    array_rel = z3.Function(
+        "array_mut_rel",
+        z3.ArraySort(z3.IntSort(), z3.IntSort()),
+        z3.IntSort(),
+        z3.BoolSort(),
+    )
+    x = z3.Int("scalar_mut_x")
+    a = z3.Array("array_mut_a", z3.IntSort(), z3.IntSort())
+    i = z3.Int("array_mut_i")
+
+    candidates: CandidateMap = {
+        scalar_rel: tuple(x == k for k in range(4)),
+        array_rel: tuple(z3.Select(a, i) == k for k in range(65)),
+    }
+
+    bounded = _large_array_relations_removed(candidates)
+    assert scalar_rel in bounded
+    assert array_rel not in bounded
+
+    scalar_only = _scalar_arithmetic_candidate_map(candidates)
+    assert scalar_rel in scalar_only
+    assert array_rel not in scalar_only

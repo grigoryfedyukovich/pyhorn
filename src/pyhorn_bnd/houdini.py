@@ -32,6 +32,71 @@ class HoudiniStatus(Enum):
     UNKNOWN = "unknown"
 
 
+# Adaptive scalar mutation is intentionally wider than the default trace
+# mutation pass, but still bounded.  The previous unbounded retry recovered
+# useful scalar proofs but could recreate the same quadratic/substitution
+# explosion that the default caps were introduced to prevent.
+_ADAPTIVE_SCALAR_MUTATION_TERMS = 128
+_ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS = 4096
+_ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES = 1024
+
+
+def _scalar_arithmetic_candidate_map(candidates: CandidateMap) -> CandidateMap:
+    """Return candidate relations whose arguments are only Int/Real.
+
+    The adaptive mutation fallback deliberately targets scalar arithmetic:
+    that is where the FreqHorn regressions from the trace-mutation cap were
+    observed, while large array relations paid most of the mutation cost and
+    produced no additional proofs.  Keeping this filter relation-based avoids
+    inspecting/serializing every candidate formula.
+    """
+    out: dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]] = {}
+    for relation, relation_candidates in candidates.items():
+        if not relation_candidates:
+            continue
+        try:
+            if relation.arity() == 0:
+                continue
+            if not all(
+                relation.domain(i).kind() in (z3.Z3_INT_SORT, z3.Z3_REAL_SORT)
+                for i in range(relation.arity())
+            ):
+                continue
+        except z3.Z3Exception:
+            continue
+        out[relation] = tuple(relation_candidates)
+    return out
+
+
+def _large_array_relations_removed(
+    candidates: CandidateMap, *, threshold: int = 64
+) -> CandidateMap:
+    """Drop only *large* array-typed relations from generic mutation.
+
+    Small array pools retain the existing mutation behavior (important for
+    focused array-equality examples).  Trace-mined array pools above the
+    threshold are skipped because pairwise/substitution mutation over them was
+    responsible for most one-minute benchmark timeouts without adding a single
+    proof in the measured FreqHorn suite.
+    """
+    out: dict[z3.FuncDeclRef, tuple[z3.BoolRef, ...]] = {}
+    for relation, relation_candidates in candidates.items():
+        items = tuple(relation_candidates)
+        if not items:
+            continue
+        try:
+            has_array = any(
+                relation.domain(i).kind() == z3.Z3_ARRAY_SORT
+                for i in range(relation.arity())
+            )
+        except z3.Z3Exception:
+            has_array = False
+        if has_array and len(items) > threshold:
+            continue
+        out[relation] = items
+    return out
+
+
 @dataclass(frozen=True)
 class HoudiniFailure:
     rule_id: int
@@ -1115,8 +1180,12 @@ def run_trace_houdini(
             trace_result=traces,
         )
 
+    # Keep generic mutation bounded on large trace pools, but do not spend the
+    # quadratic/substitution budget on large array relations: those dominated
+    # the observed timeout regressions and yielded no additional FreqHorn proofs.
+    mutation_input = _large_array_relations_removed(combined)
     mutation_result = mutate_candidates(
-        combined,
+        mutation_input,
         max_terms_per_relation=max_mutation_terms_per_relation,
         max_equality_substitutions_per_relation=(
             max_mutation_substitutions_per_relation
@@ -1130,6 +1199,59 @@ def run_trace_houdini(
         random_seed=random_seed,
         candidate_kinds=kind_map,
     ).run(mutated, seed_result=seeds)
+    if final.status is HoudiniStatus.SUCCESS:
+        return HoudiniResult(
+            status=final.status,
+            variables=seeds.variables,
+            candidates=final.candidates,
+            seed_result=seeds,
+            statistics=final.statistics,
+            failures=final.failures,
+            removed_candidates=final.removed_candidates,
+            mutation_result=mutation_result,
+            trace_result=traces,
+        )
+
+    # The default trace-mutation caps recovered tractability on huge mixed
+    # theory pools, but they also suppressed real scalar arithmetic proofs
+    # (notably exact-iteration benchmarks).  If the caller is using the
+    # defaults, make one *adaptive wider-but-bounded* retry over Int/Real
+    # relations only.  Explicit custom caps (including 0 -> None from the
+    # CLI) remain hard user choices and therefore disable this widening.
+    use_adaptive_scalar_retry = (
+        max_mutation_terms_per_relation == DEFAULT_MAX_MUTATION_TERMS_PER_RELATION
+        and max_mutation_substitutions_per_relation
+        == DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
+    )
+    if use_adaptive_scalar_retry:
+        scalar_input = _scalar_arithmetic_candidate_map(combined)
+        scalar_input_size = sum(len(items) for items in scalar_input.values())
+        if (
+            scalar_input
+            and scalar_input_size <= _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES
+        ):
+            expanded_mutation = mutate_candidates(
+                scalar_input,
+                max_terms_per_relation=_ADAPTIVE_SCALAR_MUTATION_TERMS,
+                max_equality_substitutions_per_relation=(
+                    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS
+                ),
+            )
+            expanded_pool = merge_candidate_maps(
+                mutated, expanded_mutation.candidates
+            )
+            if sum(map(len, expanded_pool.values())) > sum(map(len, mutated.values())):
+                expanded = MultiHoudini(
+                    program,
+                    seeds.variables,
+                    timeout_ms=timeout_ms,
+                    random_seed=random_seed,
+                    candidate_kinds=kind_map,
+                ).run(expanded_pool, seed_result=seeds)
+                if expanded.status is HoudiniStatus.SUCCESS:
+                    final = expanded
+                    mutation_result = expanded_mutation
+
     return HoudiniResult(
         status=final.status,
         variables=seeds.variables,

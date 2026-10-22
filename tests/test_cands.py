@@ -460,6 +460,19 @@ class TestMergeCandidateMaps:
         merged = merge_candidate_maps(base, extra)
         assert len(merged[rel]) == 1
 
+    def test_merge_dedup_does_not_require_sexpr(self, monkeypatch) -> None:
+        """Large-formula dedup should use structural hash/eq, not printing."""
+        x = z3.Int("x_no_sexpr")
+        rel = _rel("inv_no_sexpr", z3.IntSort())
+        c = z3.simplify(x >= 0)
+
+        def fail_sexpr(_self):
+            raise AssertionError("merge_candidate_maps serialized a candidate")
+
+        monkeypatch.setattr(z3.ExprRef, "sexpr", fail_sexpr)
+        merged = merge_candidate_maps({rel: (c,)}, {rel: (c,)})
+        assert len(merged[rel]) == 1
+
     def test_base_not_mutated(self) -> None:
         x, n = z3.Int("x"), z3.Int("n")
         rel = _rel("inv", z3.IntSort(), z3.IntSort())

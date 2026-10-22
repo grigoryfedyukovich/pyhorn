@@ -71,8 +71,17 @@ from .forward_fixpoint import (
     run_forward_fixpoint,
 )
 from .horn import HornProgram, HornRule
-from .houdini import HoudiniStatus, MultiHoudini
+from .houdini import (
+    HoudiniStatus,
+    MultiHoudini,
+    _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES,
+    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS,
+    _ADAPTIVE_SCALAR_MUTATION_TERMS,
+    _large_array_relations_removed,
+    _scalar_arithmetic_candidate_map,
+)
 from .seedminer import (
+    DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
     DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
     CandidateMap,
     SeedMiner,
@@ -124,9 +133,16 @@ class FFHoudiniResult:
     counterexample_model: str | None = None
 
 
-def _pool_signature(pool: CandidateMap) -> frozenset[tuple[str, str]]:
+def _pool_signature(pool: CandidateMap) -> frozenset[tuple[int, int]]:
+    """Cheap structural signature used only to detect a fixpoint stall.
+
+    Serializing the whole pool with ``sexpr()`` can dominate a round for large
+    quantified/string/array formulas.  A Z3 structural hash is sufficient
+    here: a collision can at worst stop FF-Houdini early with ``unknown``; it
+    cannot manufacture a SAFE/UNSAFE result.
+    """
     return frozenset(
-        (relation.name(), candidate.sexpr())
+        (relation.get_id(), candidate.hash())
         for relation, candidates in pool.items()
         for candidate in candidates
     )
@@ -233,9 +249,14 @@ def run_ff_houdini(
             )
 
     if use_mut:
+        pre_mutation_pool = base_pool
+        mutation_input = _large_array_relations_removed(pre_mutation_pool)
         mutation_result = mutate_candidates(
-            base_pool,
+            mutation_input,
             max_terms_per_relation=DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
+            max_equality_substitutions_per_relation=(
+                DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
+            ),
         )
         base_pool = merge_candidate_maps(base_pool, mutation_result.candidates)
         staged_result = MultiHoudini(
@@ -253,6 +274,50 @@ def run_ff_houdini(
                 rounds=1,
                 invariants=_as_invariants(staged_result.candidates),
             )
+
+        # Match Trace-Houdini's adaptive policy before entering the expensive
+        # fixpoint alternation: if bounded mutation did not prove the problem,
+        # retry with a wider but still finite budget on scalar Int/Real
+        # relations only.  Arrays keep the bounded/large-pool-skipping policy.
+        scalar_input = _scalar_arithmetic_candidate_map(pre_mutation_pool)
+        scalar_input_size = sum(len(items) for items in scalar_input.values())
+        if (
+            scalar_input
+            and scalar_input_size <= _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES
+        ):
+            expanded_mutation = mutate_candidates(
+                scalar_input,
+                max_terms_per_relation=_ADAPTIVE_SCALAR_MUTATION_TERMS,
+                max_equality_substitutions_per_relation=(
+                    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS
+                ),
+            )
+            expanded_pool = merge_candidate_maps(
+                base_pool, expanded_mutation.candidates
+            )
+            if sum(map(len, expanded_pool.values())) > sum(
+                map(len, base_pool.values())
+            ):
+                expanded_result = MultiHoudini(
+                    program,
+                    variables,
+                    timeout_ms=houdini_timeout_ms,
+                    random_seed=random_seed,
+                ).run(expanded_pool)
+                base_pool = expanded_pool
+                staged_result = expanded_result
+                if staged_result.status is HoudiniStatus.SUCCESS:
+                    return FFHoudiniResult(
+                        status=FFHoudiniStatus.SAFE,
+                        message=(
+                            f"round 1: Houdini certified "
+                            f"{sum(len(v) for v in staged_result.candidates.values())} "
+                            "candidate(s) as inductive after expanded scalar mutation"
+                        ),
+                        variables=variables,
+                        rounds=1,
+                        invariants=_as_invariants(staged_result.candidates),
+                    )
 
     extra_from_fixpoint: CandidateMap = {}
     previous_signature: frozenset[tuple[str, str]] | None = None
