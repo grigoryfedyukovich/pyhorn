@@ -47,6 +47,11 @@ DEFAULT_MAX_NESTING = 8
 # valid polynomial summary is not useful if simplification/translation creates
 # a huge term that dominates invariant generation or ABMC validation.
 _MAX_AFFINE_SCC_EXPR_OPS = 512
+# Guard classification must stay a proposal heuristic, never an unbounded
+# symbolic-algebra task.  Large substituted guards previously sent SymPy's
+# generic solve() down 100s-scale paths on formula25/formula27/s_split_47.
+_MAX_GUARD_CLASSIFY_OPS = 256
+_MAX_GUARD_GENERIC_SOLVE_OPS = 32
 
 # Exception types expected from best-effort z3<->sympy translation and
 # symbolic solving of arbitrary (possibly unsupported) input -- caught
@@ -1548,49 +1553,88 @@ def classify_guard(
             return None
         return _sympy_as_bool(val)
 
-    # Constant?
+    # Keep classification bounded before invoking simplification/solving.
+    # ``count_ops`` is structural and much cheaper than generic symbolic solve.
+    if pred is True or pred is sp.true or pred == True or pred == sp.true:
+        return ("constant", True)
+    if pred is False or pred is sp.false or pred == False or pred == sp.false:
+        return ("constant", False)
+    try:
+        pred_ops = int(sp.count_ops(pred, visual=False))
+    except _SYMBOLIC_BESTEFFORT_EXC:
+        return ("unknown", None)
+    if pred_ops > _MAX_GUARD_CLASSIFY_OPS:
+        logger.debug(
+            "classify_guard: refusing %s-op substituted guard (budget %s)",
+            pred_ops,
+            _MAX_GUARD_CLASSIFY_OPS,
+        )
+        return ("unknown", None)
+
+    # Constant after cheap-enough simplification?
     const = _sympy_as_bool(pred)
     if const is not None:
         return ("constant", const)
 
-    # Try to solve pred's change of truth value – look for roots of the
-    # boundary equation of the comparison, then confirm the truth value
-    # actually flips there (a root of "lhs == rhs" is not automatically a
-    # sign change, and a "crossover" at n=0 would just mean the guard was
-    # already false the moment this phase began, which is not a usable
-    # interior boundary).
-    try:
-        eqs = []
-        if isinstance(pred, (sp.StrictLessThan, sp.LessThan,
-                             sp.StrictGreaterThan, sp.GreaterThan,
-                             sp.Equality)):
-            eqs.append(sp.Eq(pred.lhs, pred.rhs))
-        for eq in eqs:
-            try:
-                sols = sp.solve(eq, n)
-            except (TypeError, ValueError, NotImplementedError) as exc:
-                logger.debug("classify_guard: solve failed: %s", exc)
+    # Prefer an exact linear boundary computation over SymPy's generic solve.
+    # This covers the common x0 + c*n < K / >= K phase guards while avoiding
+    # the historical 100s-scale solve paths on large symbolic expressions.
+    eqs = []
+    if isinstance(
+        pred,
+        (
+            sp.StrictLessThan,
+            sp.LessThan,
+            sp.StrictGreaterThan,
+            sp.GreaterThan,
+            sp.Equality,
+        ),
+    ):
+        eqs.append(sp.Eq(pred.lhs, pred.rhs))
+
+    for eq in eqs:
+        sols: list[sp.Expr] = []
+        try:
+            delta = eq.lhs - eq.rhs
+            poly = sp.Poly(delta, n)
+            if poly.degree() == 1:
+                slope = poly.nth(1)
+                intercept = poly.nth(0)
+                if slope != 0:
+                    sols = [sp.cancel(-intercept / slope)]
+            elif pred_ops <= _MAX_GUARD_GENERIC_SOLVE_OPS:
+                # Preserve the old behavior for genuinely tiny nonlinear
+                # boundaries, but never call generic solve on a large guard.
+                sols = list(sp.solve(eq, n))
+        except _SYMBOLIC_BESTEFFORT_EXC as exc:
+            logger.debug("classify_guard: polynomial boundary solve failed: %s", exc)
+            if pred_ops <= _MAX_GUARD_GENERIC_SOLVE_OPS:
+                try:
+                    sols = list(sp.solve(eq, n))
+                except _SYMBOLIC_BESTEFFORT_EXC as fallback_exc:
+                    logger.debug(
+                        "classify_guard: tiny generic solve failed: %s",
+                        fallback_exc,
+                    )
+                    sols = []
+            else:
+                sols = []
+
+        for sol in sols:
+            if not (sol.is_real or sol.is_integer):
                 continue
-            for sol in sols:
-                if not (sol.is_real or sol.is_integer):
+            if sol.is_number:
+                n_star = int(sol) if sol.is_Integer else int(sp.ceiling(sol))
+                if n_star <= 0:
                     continue
-                if sol.is_number:
-                    n_star = int(sol) if sol.is_Integer else int(sp.ceiling(sol))
-                    if n_star <= 0:
-                        continue
-                    before, at = _truth_at(n_star - 1), _truth_at(n_star)
-                    if before is not None and at is not None and before != at:
-                        return ("monotonic", n_star)
-                    continue
-                # Symbolic crossover (e.g. the incoming state at this
-                # phase's start isn't a concrete literal): the direction
-                # can't be verified purely symbolically here, so this is
-                # reported provisionally -- callers that re-anchor on it
-                # are expected to check the resulting state against the
-                # target branch's guard before committing to it.
-                return ("monotonic", sol)
-    except (TypeError, ValueError) as exc:
-        logger.debug("monotonic solve failed: %s", exc)
+                before, at = _truth_at(n_star - 1), _truth_at(n_star)
+                if before is not None and at is not None and before != at:
+                    return ("monotonic", n_star)
+                continue
+            # Symbolic crossover (e.g. unknown incoming phase state).  As in
+            # the historical implementation, callers re-anchor and validate
+            # the target branch before committing to this boundary.
+            return ("monotonic", sol)
 
     # Periodicity probe: evaluate truth value for n = 0..P_max and look for
     # a repeating pattern.

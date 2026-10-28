@@ -683,13 +683,14 @@ affine equality, and eight string templates):
 pyhorn-expl --trace-houdini --trace-depth 8 input.smt2
 ```
 
-It is staged and monotonic. The first stage is Seed-Houdini plus PhaseFit
-when `--phasefit` is requested; trace sampling is invoked only if that baseline
-does not already prove the program. If `--mut` is also requested, mutation is
-a third fallback stage after the trace-only attempt. Thus adding a richer
-candidate source cannot turn an earlier successful proof into `unknown` merely
-because the larger SMT problem is harder. A trace-mined candidate is exactly
-as untrusted as any other:
+It is staged and monotonic in both *proof checking* and *candidate generation*.
+Seed-Houdini always runs first. Trace sampling runs next; if `--mut` is also
+requested, the PhaseFit-free trace pool is mutated before any PhaseFit work is
+started. Only unresolved inputs then generate PhaseFit candidates, followed by
+combined PhaseFit+Trace (and, if requested, richer mutation) stages. Thus adding
+a richer source cannot hide an earlier proof or consume a finite mutation budget
+before the cheaper source has had its own chance. A trace-mined candidate is
+exactly as untrusted as any other:
 MultiHoudini filters the combined candidate set and every original CHC is
 independently certified by a fresh solver, same as every other mode above.
 

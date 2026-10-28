@@ -446,11 +446,14 @@ def test_cli_trace_mutation_substitution_limit_is_wired_through(
 
 
 
-def test_cli_phasefit_trace_houdini_passes_phasefit_candidates(
+def test_cli_phasefit_trace_houdini_delegates_lazy_phasefit(
     capsys, monkeypatch
 ) -> None:
-    """Regression: --trace-houdini used to select a separate CLI branch
-    that silently ignored --phasefit."""
+    """The CLI must delegate PhaseFit to the shared staged orchestrator.
+
+    PhaseFit candidates must *not* be precomputed in the CLI, because doing so
+    can turn a seed-solvable benchmark into a PhaseFit-generation timeout.
+    """
     from pyhorn_bnd import cli as cli_module
 
     path = ROOT / "examples" / "bench_horn" / "03_mixed_bool_int_mod_ite.smt2"
@@ -458,15 +461,60 @@ def test_cli_phasefit_trace_houdini_passes_phasefit_candidates(
     observed = {}
 
     def wrapped(program, **kwargs):
-        observed["seed_result"] = kwargs.get("seed_result")
+        observed["use_phasefit"] = kwargs.get("use_phasefit")
         observed["extra_candidates"] = kwargs.get("extra_candidates")
         return original(program, **kwargs)
 
     monkeypatch.setattr(cli_module, "run_trace_houdini", wrapped)
     main(["--phasefit", "--trace-houdini", "--json", str(path)])
     capsys.readouterr()
-    assert observed["seed_result"] is not None
-    assert observed["extra_candidates"]
+    assert observed["use_phasefit"] is True
+    assert observed["extra_candidates"] is None
+
+
+
+def test_phasefit_generation_is_skipped_when_seed_stage_already_proves(
+    tmp_path, monkeypatch
+) -> None:
+    """Generation monotonicity: a Seed-Houdini proof returns before PhaseFit.
+
+    This is the formula25/formula27 regression shape: those benchmarks are
+    cheap seed proofs, so a richer mode must never invoke an expensive
+    PhaseFit generator before preserving the seed result.
+    """
+    source = tmp_path / "seed_proves_before_phasefit.smt2"
+    source.write_text(
+        """
+        (set-logic HORN)
+        (declare-var x Int)
+        (declare-var y Int)
+        (declare-var x1 Int)
+        (declare-var y1 Int)
+        (declare-rel inv (Int Int))
+        (declare-rel fail ())
+        (rule (inv 0 0))
+        (rule (=> (and (inv x y) (= x1 (+ x 1)) (= y1 (+ y 2)))
+                  (inv x1 y1)))
+        (rule (=> (and (inv x y) (not (= y (* 2 x)))) fail))
+        (query fail)
+        """
+    )
+    program = parse_chc_file(source, slice_program=False)
+
+    import pyhorn_bnd.phasefit as phasefit_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("PhaseFit should not run after a seed-stage proof")
+
+    monkeypatch.setattr(phasefit_module, "run_phasefit", forbidden)
+    result = run_trace_houdini(
+        program,
+        use_phasefit=True,
+        use_trace=True,
+        timeout_ms=2_000,
+    )
+    assert result.status is HoudiniStatus.SUCCESS
+    assert result.stage == "seed"
 
 
 def test_adaptive_mutation_filters_large_arrays_but_keeps_scalar_relations() -> None:

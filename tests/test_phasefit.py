@@ -164,6 +164,79 @@ def test_closed_form_cyclic_affine_scc_can_be_disabled_for_invariant_mining():
     assert not forms
 
 
+
+def test_classify_guard_uses_direct_linear_boundary_without_generic_solve(monkeypatch):
+    """Common affine guards must not depend on SymPy's generic solve()."""
+    import sympy as sp
+    import pyhorn_bnd.phasefit as phasefit_module
+    from pyhorn_bnd.phasefit import ClosedForm, classify_guard
+
+    x = z3.Int("guard_budget_x")
+    n = sp.Symbol("n", integer=True, nonnegative=True)
+    cf = ClosedForm(var=x, expr=n, init_map={})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("generic solve() should not be used for a linear guard")
+
+    monkeypatch.setattr(phasefit_module.sp, "solve", forbidden)
+    kind, boundary = classify_guard(x < 10, {x: cf})
+    assert kind == "monotonic"
+    assert boundary == 10
+
+
+def test_classify_guard_rejects_oversized_symbolic_boundary_before_solve(monkeypatch):
+    """Large substituted guards fail fast instead of entering generic solve()."""
+    import sympy as sp
+    import pyhorn_bnd.phasefit as phasefit_module
+    from pyhorn_bnd.phasefit import ClosedForm, classify_guard
+
+    x = z3.Int("guard_budget_big_x")
+    n = sp.Symbol("n", integer=True, nonnegative=True)
+    # Distinct powers prevent SymPy from collapsing the expression to one term.
+    expr = sum(n**i for i in range(1, 150))
+    cf = ClosedForm(var=x, expr=expr, init_map={})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("generic solve() must not run for an oversized guard")
+
+    monkeypatch.setattr(phasefit_module.sp, "solve", forbidden)
+    kind, boundary = classify_guard(x < 1000, {x: cf})
+    assert kind == "unknown"
+    assert boundary is None
+
+
+
+def test_cli_phasefit_skips_generation_after_seed_proof(tmp_path, monkeypatch, capsys):
+    """Plain --phasefit must preserve a cheaper Seed-Houdini proof."""
+    from pyhorn_bnd.cli import main
+    import pyhorn_bnd.phasefit as phasefit_module
+
+    source = tmp_path / "seed_before_plain_phasefit.smt2"
+    source.write_text(
+        """
+        (set-logic HORN)
+        (declare-var x Int)
+        (declare-var y Int)
+        (declare-var x1 Int)
+        (declare-var y1 Int)
+        (declare-rel inv (Int Int))
+        (declare-rel fail ())
+        (rule (inv 0 0))
+        (rule (=> (and (inv x y) (= x1 (+ x 1)) (= y1 (+ y 2)))
+                  (inv x1 y1)))
+        (rule (=> (and (inv x y) (not (= y (* 2 x)))) fail))
+        (query fail)
+        """
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("PhaseFit generation should have been skipped")
+
+    monkeypatch.setattr(phasefit_module, "run_phasefit", forbidden)
+    assert main(["--phasefit", str(source)]) == 0
+    assert capsys.readouterr().out.strip() == "Success"
+
+
 def test_phasefit_runs_without_error():
     prog = parse_chc_file(EXAMPLES / "03_mixed_bool_int_mod_ite.smt2")
     results, cmap = run_phasefit(prog)

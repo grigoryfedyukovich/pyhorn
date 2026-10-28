@@ -148,19 +148,20 @@ limits, and emission conditions are specified in
 [`trace_candidate_templates.md`](trace_candidate_templates.md) and exposed by
 `trace_template_specifications()` / `--list-trace-templates --json`.
 
-`run_trace_houdini()` is staged: ordinary SeedMiner + MultiHoudini runs
-first, and trace sampling is invoked only when that baseline does not prove
-the program, so it is monotonic with respect to plain `--seed-houdini`
-successes. See [`trace_model_generalization.md`](trace_model_generalization.md)
-for the full design and current evaluation. No trace-derived candidate has
-proof authority: candidates are merged with syntactic seeds, filtered by
-MultiHoudini, and certified with fresh solvers, exactly as in section 5.
+`run_trace_houdini()` is the shared staged candidate orchestrator. Ordinary
+SeedMiner + MultiHoudini runs first. Trace sampling, trace-only mutation,
+PhaseFit, combined PhaseFit+Trace, and richer mutation are added only after the
+preceding stages fail. In particular trace mutation is attempted *before*
+PhaseFit generation, so finite mutation budgets are not perturbed by PhaseFit
+terms. Every successful stage returns immediately. See
+[`trace_model_generalization.md`](trace_model_generalization.md) for the full
+design. No generated candidate has proof authority: every stage is filtered by
+MultiHoudini and freshly certified against the CHCs.
 
-`run_trace_houdini()` also accepts `mutate=True` (wired to `--mut`), applying
-`mutate_candidates()` to the candidate set live at each of its own stages --
-the seed-mined set for the baseline attempt, and the full seed-plus-trace
-set for the second stage -- so `--mut` sees the complete combined pool
-available at that point, whichever sources contributed to it.
+`run_ff_houdini()` reuses the same staged orchestrator before entering its
+forward-fixpoint rounds. FF is therefore a true fallback: enabling it cannot
+replace a successful Seed/Trace/Mutation/PhaseFit proof with `unknown`. The
+richest unsuccessful proposal pool is retained for the alternating FF rounds.
 
 `mutate_candidates()`'s pairing cost is quadratic in the number of
 equalities/inequalities per relation, and trace-sampled pools routinely

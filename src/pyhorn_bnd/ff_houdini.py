@@ -3,14 +3,13 @@ other.
 
 Each round:
 
-1. **Houdini, on all candidates at once.** Run :class:`MultiHoudini` on
-   the full candidate pool -- SeedMiner's own full syntactic mining
-   (fact-, step-, and query-rule provenance alike, always -- see
-   `run_ff_houdini`'s own docstring for why this differs from
-   `--ff-seeded`'s narrower default), plus whichever of `--cands`,
-   `--phasefit`, `--mut`, and `--trace-houdini` were also requested (the
-   same sources `ff_seeded.gather_candidate_pool` draws from).
-   Every candidate that survives incremental elimination and passes a
+1. **Shared staged Houdini, then the full pool.** Before any forward-fixpoint
+   round, reuse :func:`houdini.run_trace_houdini`'s generation-monotone
+   portfolio: Seed first, then caller extras/Trace/Trace+Mutation, then
+   PhaseFit and combined richer stages only if needed. A successful stage
+   returns SAFE immediately. If every stage is UNKNOWN, its richest full
+   proposal pool becomes the base pool for FF rounds. Every candidate that
+   survives incremental elimination and passes a
    *fresh, independent* re-certification against every non-query rule is
    a genuine, proven invariant of its relation -- that's what
    `MultiHoudini`'s own final certification pass exists to guarantee
@@ -60,8 +59,8 @@ from pathlib import Path
 
 import z3
 
-from .cands import merge_candidate_maps
-from .ff_seeded import gather_candidate_pool
+from .cands import merge_candidate_maps, parse_candidate_file
+from .ff_seeded import _filter_candidate_pool_by_initiation
 from .forward_fixpoint import (
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_OVERALL_TIMEOUT_S,
@@ -71,23 +70,8 @@ from .forward_fixpoint import (
     run_forward_fixpoint,
 )
 from .horn import HornProgram, HornRule
-from .houdini import (
-    HoudiniStatus,
-    MultiHoudini,
-    _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES,
-    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS,
-    _ADAPTIVE_SCALAR_MUTATION_TERMS,
-    _large_array_relations_removed,
-    _scalar_arithmetic_candidate_map,
-)
-from .seedminer import (
-    DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION,
-    DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
-    CandidateMap,
-    SeedMiner,
-    VariableMap,
-    mutate_candidates,
-)
+from .houdini import HoudiniStatus, MultiHoudini, run_trace_houdini
+from .seedminer import CandidateMap, SeedMiner, VariableMap
 from .trace_miner import (
     DEFAULT_MODELS_PER_PREFIX,
     DEFAULT_SAMPLES_PER_RELATION,
@@ -187,137 +171,85 @@ def run_ff_houdini(
     """Run the alternation described in the module docstring, up to
     *max_rounds* times.
     """
-    variables = SeedMiner(program).variables
+    miner = SeedMiner(program)
+    seeds = miner.mine()
+    variables = seeds.variables
 
-    # Build the initial candidate pool monotonically.  A smaller source set is
-    # tried before adding the next, so an already-certified proof is never lost
-    # merely because Trace-Houdini or mutation makes the later SMT problem
-    # harder.  This mirrors run_trace_houdini's staged portfolio.
-    def _gather(*, with_trace: bool) -> CandidateMap:
-        pool, _gathered, _sound = gather_candidate_pool(
+    broadened = (
+        cands_path is not None or use_phasefit or use_trace or use_mut
+    )
+    if broadened:
+        user_candidates: CandidateMap | None = None
+        if cands_path is not None:
+            user_candidates = parse_candidate_file(cands_path, variables)
+
+        # The shared orchestrator itself starts with Seed-Houdini, so there is
+        # no duplicate seed pass here.  If any ordinary staged source proves
+        # the input, FF is a strict fallback and is never entered.
+        staged = run_trace_houdini(
             program,
-            variables=variables,
-            # FF-Houdini always starts from SeedMiner's full syntactic pool.
-            use_seed_houdini=True,
-            cands_path=cands_path,
-            use_phasefit=use_phasefit,
-            use_mut=False,
-            use_trace=with_trace,
             trace_depth=trace_depth,
             trace_limit=trace_limit,
-            trace_models_per_prefix=trace_models_per_prefix,
-            trace_samples_per_relation=trace_samples_per_relation,
-            trace_candidates_per_relation=trace_candidates_per_relation,
-            houdini_timeout_ms=houdini_timeout_ms,
+            models_per_prefix=trace_models_per_prefix,
+            max_samples_per_relation=trace_samples_per_relation,
+            max_trace_candidates_per_relation=trace_candidates_per_relation,
+            timeout_ms=houdini_timeout_ms,
             random_seed=random_seed,
+            mutate=use_mut,
+            extra_candidates=user_candidates,
+            seed_result=seeds,
+            use_phasefit=use_phasefit,
+            use_trace=use_trace,
         )
-        return pool
+        if staged.status is HoudiniStatus.SUCCESS:
+            return FFHoudiniResult(
+                status=FFHoudiniStatus.SAFE,
+                message=(
+                    f"round 1: staged Houdini certified "
+                    f"{sum(len(v) for v in staged.candidates.values())} "
+                    f"candidate(s) at stage {staged.stage or 'unknown'}"
+                ),
+                variables=variables,
+                rounds=1,
+                invariants=_as_invariants(staged.candidates),
+            )
 
-    base_pool = _gather(with_trace=False)
-    staged_result = MultiHoudini(
-        program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
-    ).run(base_pool)
-    if staged_result.status is HoudiniStatus.SUCCESS:
-        return FFHoudiniResult(
-            status=FFHoudiniStatus.SAFE,
-            message=(
-                f"round 1: Houdini certified "
-                f"{sum(len(v) for v in staged_result.candidates.values())} "
-                "candidate(s) as inductive before trace/mutation"
-            ),
-            variables=variables,
-            rounds=1,
-            invariants=_as_invariants(staged_result.candidates),
+        # Keep the *full* proposal pool for future FF rounds, not merely the
+        # candidates that survived the last Houdini pass.  A rejected formula
+        # can become useful after a reachable-set formula is fed back.  Filter
+        # initiation once here rather than regenerating expensive candidate
+        # sources.
+        proposed = staged.candidate_pool or seeds.candidates
+        base_pool, _gathered, _sound = _filter_candidate_pool_by_initiation(
+            program, variables, proposed
         )
-
-    if use_trace:
-        base_pool = _gather(with_trace=True)
-        staged_result = MultiHoudini(
-            program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
-        ).run(base_pool)
-        if staged_result.status is HoudiniStatus.SUCCESS:
+        staged_result = staged
+    else:
+        # Plain FF-Houdini uses the same full SeedMiner pool it historically
+        # used.  Try it once, preserve an immediate proof, then initiation-
+        # filter that exact pool for the alternating FF rounds.
+        seed_stage = MultiHoudini(
+            program,
+            variables,
+            timeout_ms=houdini_timeout_ms,
+            random_seed=random_seed,
+        ).run(seeds.candidates, seed_result=seeds)
+        if seed_stage.status is HoudiniStatus.SUCCESS:
             return FFHoudiniResult(
                 status=FFHoudiniStatus.SAFE,
                 message=(
                     f"round 1: Houdini certified "
-                    f"{sum(len(v) for v in staged_result.candidates.values())} "
-                    "candidate(s) as inductive after trace candidates"
+                    f"{sum(len(v) for v in seed_stage.candidates.values())} "
+                    "candidate(s) at the seed stage"
                 ),
                 variables=variables,
                 rounds=1,
-                invariants=_as_invariants(staged_result.candidates),
+                invariants=_as_invariants(seed_stage.candidates),
             )
-
-    if use_mut:
-        pre_mutation_pool = base_pool
-        mutation_input = _large_array_relations_removed(pre_mutation_pool)
-        mutation_result = mutate_candidates(
-            mutation_input,
-            max_terms_per_relation=DEFAULT_MAX_MUTATION_TERMS_PER_RELATION,
-            max_equality_substitutions_per_relation=(
-                DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
-            ),
+        base_pool, _gathered, _sound = _filter_candidate_pool_by_initiation(
+            program, variables, seeds.candidates
         )
-        base_pool = merge_candidate_maps(base_pool, mutation_result.candidates)
-        staged_result = MultiHoudini(
-            program, variables, timeout_ms=houdini_timeout_ms, random_seed=random_seed
-        ).run(base_pool)
-        if staged_result.status is HoudiniStatus.SUCCESS:
-            return FFHoudiniResult(
-                status=FFHoudiniStatus.SAFE,
-                message=(
-                    f"round 1: Houdini certified "
-                    f"{sum(len(v) for v in staged_result.candidates.values())} "
-                    "candidate(s) as inductive after mutation"
-                ),
-                variables=variables,
-                rounds=1,
-                invariants=_as_invariants(staged_result.candidates),
-            )
-
-        # Match Trace-Houdini's adaptive policy before entering the expensive
-        # fixpoint alternation: if bounded mutation did not prove the problem,
-        # retry with a wider but still finite budget on scalar Int/Real
-        # relations only.  Arrays keep the bounded/large-pool-skipping policy.
-        scalar_input = _scalar_arithmetic_candidate_map(pre_mutation_pool)
-        scalar_input_size = sum(len(items) for items in scalar_input.values())
-        if (
-            scalar_input
-            and scalar_input_size <= _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES
-        ):
-            expanded_mutation = mutate_candidates(
-                scalar_input,
-                max_terms_per_relation=_ADAPTIVE_SCALAR_MUTATION_TERMS,
-                max_equality_substitutions_per_relation=(
-                    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS
-                ),
-            )
-            expanded_pool = merge_candidate_maps(
-                base_pool, expanded_mutation.candidates
-            )
-            if sum(map(len, expanded_pool.values())) > sum(
-                map(len, base_pool.values())
-            ):
-                expanded_result = MultiHoudini(
-                    program,
-                    variables,
-                    timeout_ms=houdini_timeout_ms,
-                    random_seed=random_seed,
-                ).run(expanded_pool)
-                base_pool = expanded_pool
-                staged_result = expanded_result
-                if staged_result.status is HoudiniStatus.SUCCESS:
-                    return FFHoudiniResult(
-                        status=FFHoudiniStatus.SAFE,
-                        message=(
-                            f"round 1: Houdini certified "
-                            f"{sum(len(v) for v in staged_result.candidates.values())} "
-                            "candidate(s) as inductive after expanded scalar mutation"
-                        ),
-                        variables=variables,
-                        rounds=1,
-                        invariants=_as_invariants(staged_result.candidates),
-                    )
+        staged_result = seed_stage
 
     extra_from_fixpoint: CandidateMap = {}
     previous_signature: frozenset[tuple[str, str]] | None = None

@@ -111,6 +111,20 @@ def fact_rule_conjuncts(
     return by_relation
 
 
+def _filter_candidate_pool_by_initiation(
+    program: HornProgram,
+    variables: VariableMap,
+    candidates: CandidateMap,
+) -> tuple[CandidateMap, int, int]:
+    """Filter an already-generated pool by fact-rule initiation.
+
+    This is the filtering half of :func:`gather_candidate_pool`, split out so
+    FF-Houdini can reuse the exact pool produced by the shared staged Houdini
+    orchestrator instead of regenerating PhaseFit/trace/mutation candidates.
+    """
+    return _filter_candidate_pool_by_initiation(program, variables, candidates)
+
+
 def gather_candidate_pool(
     program: HornProgram,
     *,

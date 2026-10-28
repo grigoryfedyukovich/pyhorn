@@ -7,7 +7,7 @@ other, up to a round budget:
 ```bash
 pyhorn-expl --ff-houdini input.smt2
 
-# broadened monotonically: PhaseFit -> Trace -> Mutation before FF rounds
+# shared staged portfolio first; FF rounds only if every Houdini stage is unknown
 pyhorn-expl --ff-houdini --cands extra.smt2 --phasefit --trace-houdini --mut input.smt2
 ```
 
@@ -21,12 +21,13 @@ see [`forward_fixpoint.md`](forward_fixpoint.md)'s `--ff-seeded` section.
 
 ## The mechanism
 
-Before the alternating rounds, candidate enrichment is tried monotonically:
-SeedMiner plus `--cands`/`--phasefit` first, then trace candidates if requested,
-then mutation if requested. Each stage runs real Houdini and returns immediately
-if it proves SAFE, so a later, larger pool cannot lose an earlier proof due to
-solver cost. The largest unsuccessful pool becomes the base pool for the
-forward-fixpoint alternation.
+Before the alternating rounds, FF-Houdini calls the same staged portfolio used
+by ordinary Trace-Houdini: Seed first; Trace next; PhaseFit-free Trace+Mutation
+when requested; PhaseFit only after those cheaper stages fail; then combined
+PhaseFit+Trace and richer mutation. Every successful stage returns immediately,
+so FF is strictly a fallback and cannot erase an earlier Houdini proof. The
+richest unsuccessful proposal pool is initiation-filtered once and becomes the
+base pool for the forward-fixpoint alternation.
 
 Each round then does:
 

@@ -36,11 +36,16 @@ pyhorn-expl \
 The strategy is staged:
 
 - ordinary SeedMiner + MultiHoudini runs first;
-- if it proves the input, trace sampling is skipped;
-- otherwise, trace candidates are generated and the combined set is checked.
+- if it proves the input, every richer generator is skipped;
+- otherwise trace candidates are generated and checked;
+- when mutation is requested, the Seed+Trace pool is mutated before PhaseFit
+  candidates are generated;
+- when PhaseFit is requested, its own pool and then the combined pool are tried
+  only after the cheaper trace stages failed.
 
-This prevents speculative trace candidates from turning an existing
-Seed-Houdini proof into `unknown`.
+This prevents speculative generators from turning an existing proof into
+`unknown`, and prevents PhaseFit terms from consuming a finite mutation budget
+before the PhaseFit-free trace pool has been tried.
 
 To inspect the supported template registry without supplying an input file:
 

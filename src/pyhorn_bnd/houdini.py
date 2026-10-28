@@ -186,6 +186,13 @@ class HoudiniResult:
     # since it describes the trace-sampling stage itself, not a filtering
     # outcome.
     trace_result: TraceMiningResult | None = None
+    # Full proposal pool used by the richest staged attempt.  MultiHoudini's
+    # ``candidates`` field contains only survivors; FF-Houdini needs the full
+    # pool so candidates rejected in one round can become useful after a
+    # forward-fixpoint handoff.  Plain run_seed_houdini leaves this as None.
+    candidate_pool: CandidateMap | None = None
+    # Human/debug label for the stage whose result is returned.
+    stage: str | None = None
 
     @property
     def success(self) -> bool:
@@ -1084,184 +1091,301 @@ def run_trace_houdini(
     ),
     extra_candidates: CandidateMap | None = None,
     seed_result: SeedMiningResult | None = None,
+    use_phasefit: bool = False,
+    use_trace: bool = True,
 ) -> HoudiniResult:
-    """Run a monotone staged invariant-synthesis portfolio.
+    """Run one monotone staged invariant-synthesis portfolio.
 
-    Stage 1 runs Houdini on the cheap baseline: SeedMiner plus
-    ``extra_candidates`` (used by the CLI for PhaseFit).  If that already
-    proves the program, return immediately and preserve that proof.
+    The ordering is deliberately *generation monotone*, not merely Houdini
+    monotone.  In particular, expensive PhaseFit generation is never executed
+    before the cheap Seed-Houdini baseline has had a chance to prove the
+    program.  When both PhaseFit and trace mutation are requested, the
+    PhaseFit-free trace/mutation portfolio is also tried before mutating the
+    richer pool.  This preserves proofs that can otherwise disappear merely
+    because a finite mutation budget is consumed by extra PhaseFit terms.
 
-    Stage 2 adds trace-generalized candidates and tries Houdini again.  Only
-    if that is still insufficient and ``mutate`` is requested does stage 3
-    derive mutations from the complete seed/extra/trace pool and run one final
-    Houdini pass.  Thus a richer candidate source can never turn a proof found
-    by an earlier stage into ``unknown`` merely because the larger SMT problem
-    is harder.
+    Stages (when requested) are::
 
-    ``seed_result`` lets an orchestrator reuse the exact SeedMiner variable map
-    that was used to produce ``extra_candidates`` (notably PhaseFit), avoiding
-    duplicate mining and ensuring every candidate is over the same canonical
-    variables.
+        seed
+        seed + caller-supplied extras
+        seed/extras + trace
+        seed/extra + trace + mutation
+        seed/extra + PhaseFit
+        seed/extra + PhaseFit + trace
+        seed/extra + PhaseFit + trace + mutation
+
+    Any SUCCESS returns immediately.  ``candidate_pool`` on the returned
+    :class:`HoudiniResult` records the full proposal pool of the returned (or
+    richest attempted) stage so FF-Houdini can reuse it without regenerating
+    PhaseFit/trace candidates.
     """
 
-    from .candidate_generation import CandidateBatch, merge_candidate_batches
     from .trace_miner import TraceCandidateMiner
 
     seeds = seed_result if seed_result is not None else SeedMiner(program).mine()
-    baseline_candidates: CandidateMap = seeds.candidates
-    if extra_candidates:
-        baseline_candidates = merge_candidate_maps(
-            baseline_candidates, extra_candidates
-        )
+    seed_pool: CandidateMap = seeds.candidates
 
-    baseline = MultiHoudini(
-        program,
-        seeds.variables,
-        timeout_ms=timeout_ms,
-        random_seed=random_seed,
-    ).run(baseline_candidates, seed_result=seeds)
-    if baseline.status is HoudiniStatus.SUCCESS:
+    def _run(
+        pool: CandidateMap,
+        *,
+        kind_map: Mapping[str, str] | None = None,
+    ) -> HoudiniResult:
+        return MultiHoudini(
+            program,
+            seeds.variables,
+            timeout_ms=timeout_ms,
+            random_seed=random_seed,
+            candidate_kinds=kind_map,
+        ).run(pool, seed_result=seeds)
+
+    def _pack(
+        result: HoudiniResult,
+        pool: CandidateMap,
+        stage: str,
+        *,
+        mutation_result: MutationResult | None = None,
+        traces: TraceMiningResult | None = None,
+    ) -> HoudiniResult:
         return HoudiniResult(
-            status=baseline.status,
+            status=result.status,
             variables=seeds.variables,
-            candidates=baseline.candidates,
+            candidates=result.candidates,
             seed_result=seeds,
-            statistics=baseline.statistics,
-            failures=baseline.failures,
-            removed_candidates=baseline.removed_candidates,
-        )
-
-    traces = TraceCandidateMiner(
-        program,
-        seeds.variables,
-        max_depth=trace_depth,
-        max_prefixes=trace_limit,
-        models_per_prefix=models_per_prefix,
-        max_samples_per_relation=max_samples_per_relation,
-        max_candidates_per_relation=max_trace_candidates_per_relation,
-        timeout_ms=timeout_ms,
-        random_seed=random_seed,
-    ).mine()
-    combined = merge_candidate_batches(
-        seeds.variables,
-        CandidateBatch(
-            generator_id="baseline",
-            variables=seeds.variables,
-            candidates=baseline_candidates,
-        ),
-        CandidateBatch(
-            generator_id="trace-templates",
-            variables=traces.variables,
-            candidates=traces.candidates,
-            metadata={
-                "samples": traces.statistics.models_extracted,
-                "templates": len({item.template_id for item in traces.observations}),
-            },
-        ),
-    )
-    kind_map = {obs.candidate.sexpr(): obs.kind for obs in traces.observations}
-
-    trace_pass = MultiHoudini(
-        program,
-        seeds.variables,
-        timeout_ms=timeout_ms,
-        random_seed=random_seed,
-        candidate_kinds=kind_map,
-    ).run(combined, seed_result=seeds)
-    if trace_pass.status is HoudiniStatus.SUCCESS or not mutate:
-        return HoudiniResult(
-            status=trace_pass.status,
-            variables=seeds.variables,
-            candidates=trace_pass.candidates,
-            seed_result=seeds,
-            statistics=trace_pass.statistics,
-            failures=trace_pass.failures,
-            removed_candidates=trace_pass.removed_candidates,
-            trace_result=traces,
-        )
-
-    # Keep generic mutation bounded on large trace pools, but do not spend the
-    # quadratic/substitution budget on large array relations: those dominated
-    # the observed timeout regressions and yielded no additional FreqHorn proofs.
-    mutation_input = _large_array_relations_removed(combined)
-    mutation_result = mutate_candidates(
-        mutation_input,
-        max_terms_per_relation=max_mutation_terms_per_relation,
-        max_equality_substitutions_per_relation=(
-            max_mutation_substitutions_per_relation
-        ),
-    )
-    mutated = merge_candidate_maps(combined, mutation_result.candidates)
-    final = MultiHoudini(
-        program,
-        seeds.variables,
-        timeout_ms=timeout_ms,
-        random_seed=random_seed,
-        candidate_kinds=kind_map,
-    ).run(mutated, seed_result=seeds)
-    if final.status is HoudiniStatus.SUCCESS:
-        return HoudiniResult(
-            status=final.status,
-            variables=seeds.variables,
-            candidates=final.candidates,
-            seed_result=seeds,
-            statistics=final.statistics,
-            failures=final.failures,
-            removed_candidates=final.removed_candidates,
+            statistics=result.statistics,
+            failures=result.failures,
+            removed_candidates=result.removed_candidates,
             mutation_result=mutation_result,
             trace_result=traces,
+            candidate_pool=pool,
+            stage=stage,
         )
 
-    # The default trace-mutation caps recovered tractability on huge mixed
-    # theory pools, but they also suppressed real scalar arithmetic proofs
-    # (notably exact-iteration benchmarks).  If the caller is using the
-    # defaults, make one *adaptive wider-but-bounded* retry over Int/Real
-    # relations only.  Explicit custom caps (including 0 -> None from the
-    # CLI) remain hard user choices and therefore disable this widening.
-    use_adaptive_scalar_retry = (
-        max_mutation_terms_per_relation == DEFAULT_MAX_MUTATION_TERMS_PER_RELATION
-        and max_mutation_substitutions_per_relation
-        == DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
-    )
-    if use_adaptive_scalar_retry:
-        scalar_input = _scalar_arithmetic_candidate_map(combined)
-        scalar_input_size = sum(len(items) for items in scalar_input.values())
-        if (
-            scalar_input
-            and scalar_input_size <= _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES
-        ):
-            expanded_mutation = mutate_candidates(
-                scalar_input,
-                max_terms_per_relation=_ADAPTIVE_SCALAR_MUTATION_TERMS,
-                max_equality_substitutions_per_relation=(
-                    _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS
-                ),
-            )
-            expanded_pool = merge_candidate_maps(
-                mutated, expanded_mutation.candidates
-            )
-            if sum(map(len, expanded_pool.values())) > sum(map(len, mutated.values())):
-                expanded = MultiHoudini(
-                    program,
-                    seeds.variables,
-                    timeout_ms=timeout_ms,
-                    random_seed=random_seed,
-                    candidate_kinds=kind_map,
-                ).run(expanded_pool, seed_result=seeds)
-                if expanded.status is HoudiniStatus.SUCCESS:
-                    final = expanded
-                    mutation_result = expanded_mutation
+    def _mutate_and_run(
+        pool: CandidateMap,
+        *,
+        kind_map: Mapping[str, str] | None,
+        traces: TraceMiningResult | None,
+    ) -> tuple[HoudiniResult, CandidateMap, MutationResult]:
+        mutation_input = _large_array_relations_removed(pool)
+        mutation_result = mutate_candidates(
+            mutation_input,
+            max_terms_per_relation=max_mutation_terms_per_relation,
+            max_equality_substitutions_per_relation=(
+                max_mutation_substitutions_per_relation
+            ),
+        )
+        mutated = merge_candidate_maps(pool, mutation_result.candidates)
+        final = _run(mutated, kind_map=kind_map)
+        if final.status is HoudiniStatus.SUCCESS:
+            return final, mutated, mutation_result
 
-    return HoudiniResult(
-        status=final.status,
-        variables=seeds.variables,
-        candidates=final.candidates,
-        seed_result=seeds,
-        statistics=final.statistics,
-        failures=final.failures,
-        removed_candidates=final.removed_candidates,
-        mutation_result=mutation_result,
-        trace_result=traces,
+        # A wider scalar retry is deliberately attempted only for default
+        # budgets.  Explicit CLI caps are hard user choices and are preserved.
+        use_adaptive_scalar_retry = (
+            max_mutation_terms_per_relation
+            == DEFAULT_MAX_MUTATION_TERMS_PER_RELATION
+            and max_mutation_substitutions_per_relation
+            == DEFAULT_MAX_EQUALITY_SUBSTITUTIONS_PER_RELATION
+        )
+        if use_adaptive_scalar_retry:
+            scalar_input = _scalar_arithmetic_candidate_map(pool)
+            scalar_input_size = sum(len(items) for items in scalar_input.values())
+            if (
+                scalar_input
+                and scalar_input_size
+                <= _ADAPTIVE_SCALAR_MUTATION_MAX_INPUT_CANDIDATES
+            ):
+                expanded_mutation = mutate_candidates(
+                    scalar_input,
+                    max_terms_per_relation=_ADAPTIVE_SCALAR_MUTATION_TERMS,
+                    max_equality_substitutions_per_relation=(
+                        _ADAPTIVE_SCALAR_MUTATION_SUBSTITUTIONS
+                    ),
+                )
+                expanded_pool = merge_candidate_maps(
+                    mutated, expanded_mutation.candidates
+                )
+                if sum(map(len, expanded_pool.values())) > sum(
+                    map(len, mutated.values())
+                ):
+                    expanded = _run(expanded_pool, kind_map=kind_map)
+                    # Return the richest attempted pool even on UNKNOWN; FF can
+                    # reuse it, and a later PhaseFit-enriched stage can extend it.
+                    return expanded, expanded_pool, expanded_mutation
+        return final, mutated, mutation_result
+
+    # Stage 0: cheapest complete baseline.  No user extras, trace, mutation,
+    # or PhaseFit have been invoked yet.
+    baseline = _run(seed_pool)
+    if baseline.status is HoudiniStatus.SUCCESS:
+        return _pack(baseline, seed_pool, "seed")
+
+    base = seed_pool
+    last_result = baseline
+    last_pool = seed_pool
+    last_stage = "seed"
+    if extra_candidates:
+        extra_pool = merge_candidate_maps(seed_pool, extra_candidates)
+        extra_pass = _run(extra_pool)
+        base = extra_pool
+        last_result, last_pool, last_stage = extra_pass, extra_pool, "extra"
+        if extra_pass.status is HoudiniStatus.SUCCESS:
+            return _pack(extra_pass, extra_pool, "extra")
+    last_mutation: MutationResult | None = None
+    trace_mutated_pool: CandidateMap | None = None
+
+    phasefit_candidates: CandidateMap | None = None
+    phasefit_pool = base
+
+    traces: TraceMiningResult | None = None
+    kind_map: dict[str, str] = {}
+    trace_pool = base
+    if use_trace:
+        traces = TraceCandidateMiner(
+            program,
+            seeds.variables,
+            max_depth=trace_depth,
+            max_prefixes=trace_limit,
+            models_per_prefix=models_per_prefix,
+            max_samples_per_relation=max_samples_per_relation,
+            max_candidates_per_relation=max_trace_candidates_per_relation,
+            timeout_ms=timeout_ms,
+            random_seed=random_seed,
+        ).mine()
+        trace_pool = merge_candidate_maps(base, traces.candidates)
+        # MultiHoudini currently keys candidates by canonical s-expression.
+        # Keep kind metadata aligned with that key until the active-candidate
+        # representation itself is migrated away from strings.
+        kind_map = {obs.candidate.sexpr(): obs.kind for obs in traces.observations}
+        trace_pass = _run(trace_pool, kind_map=kind_map)
+        last_result, last_pool, last_stage = trace_pass, trace_pool, "trace"
+        if trace_pass.status is HoudiniStatus.SUCCESS:
+            return _pack(trace_pass, trace_pool, "trace", traces=traces)
+
+        # Important regression-recovery stage: mutate the PhaseFit-free trace
+        # pool first.  Historical exact-iteration proofs depended on these
+        # mutations; adding PhaseFit terms ahead of a finite mutation budget
+        # can crowd the useful terms out.
+        if mutate:
+            trace_mut, trace_mut_pool, trace_mutation = _mutate_and_run(
+                trace_pool,
+                kind_map=kind_map,
+                traces=traces,
+            )
+            trace_mutated_pool = trace_mut_pool
+            last_result, last_pool, last_stage, last_mutation = (
+                trace_mut,
+                trace_mut_pool,
+                "trace-mutation",
+                trace_mutation,
+            )
+            if trace_mut.status is HoudiniStatus.SUCCESS:
+                return _pack(
+                    trace_mut,
+                    trace_mut_pool,
+                    "trace-mutation",
+                    mutation_result=trace_mutation,
+                    traces=traces,
+                )
+
+    if use_phasefit:
+        from .phasefit import run_phasefit
+
+        _pf_results, phasefit_candidates = run_phasefit(
+            program, seed_result=seeds
+        )
+        phasefit_pool = merge_candidate_maps(base, phasefit_candidates)
+        if sum(map(len, phasefit_pool.values())) > sum(map(len, base.values())):
+            phasefit_pass = _run(phasefit_pool)
+            last_result, last_pool, last_stage = (
+                phasefit_pass,
+                phasefit_pool,
+                "phasefit",
+            )
+            if phasefit_pass.status is HoudiniStatus.SUCCESS:
+                return _pack(phasefit_pass, phasefit_pool, "phasefit")
+
+    # If both generators were requested, try their union only *after* each
+    # cheaper source has had its own chance.  This preserves combination wins
+    # without allowing PhaseFit to starve the trace-only mutation budget.
+    combined_pool = phasefit_pool
+    if use_trace:
+        combined_pool = merge_candidate_maps(
+            phasefit_pool, traces.candidates if traces else {}
+        )
+
+    if use_phasefit and use_trace:
+        combined_pass = _run(combined_pool, kind_map=kind_map)
+        last_result, last_pool, last_stage = (
+            combined_pass,
+            combined_pool,
+            "phasefit-trace",
+        )
+        if combined_pass.status is HoudiniStatus.SUCCESS:
+            return _pack(
+                combined_pass,
+                combined_pool,
+                "phasefit-trace",
+                traces=traces,
+            )
+
+        # Preserve trace-derived mutations when adding PhaseFit candidates.
+        # Re-generating mutations over the richer pool can choose a different
+        # bounded subset, so explicitly try the union before asking mutation
+        # to spend another finite budget.
+        if mutate and trace_mutated_pool is not None:
+            combined_with_trace_mutation = merge_candidate_maps(
+                phasefit_pool, trace_mutated_pool
+            )
+            carried = _run(combined_with_trace_mutation, kind_map=kind_map)
+            last_result, last_pool, last_stage = (
+                carried,
+                combined_with_trace_mutation,
+                "phasefit-trace-carried-mutation",
+            )
+            if carried.status is HoudiniStatus.SUCCESS:
+                return _pack(
+                    carried,
+                    combined_with_trace_mutation,
+                    "phasefit-trace-carried-mutation",
+                    mutation_result=last_mutation,
+                    traces=traces,
+                )
+
+    if mutate and (use_phasefit or (not use_trace)):
+        # For PhaseFit+Trace this is the final richer mutation attempt.  With
+        # PhaseFit but no trace it is the natural PhaseFit mutation stage.
+        mutation_base = combined_pool if use_trace else phasefit_pool
+        if use_trace and trace_mutated_pool is not None:
+            mutation_base = merge_candidate_maps(
+                mutation_base, trace_mutated_pool
+            )
+        rich_mut, rich_mut_pool, rich_mutation = _mutate_and_run(
+            mutation_base,
+            kind_map=kind_map,
+            traces=traces,
+        )
+        last_result, last_pool, last_stage, last_mutation = (
+            rich_mut,
+            rich_mut_pool,
+            "phasefit-trace-mutation" if use_trace else "phasefit-mutation",
+            rich_mutation,
+        )
+        if rich_mut.status is HoudiniStatus.SUCCESS:
+            return _pack(
+                rich_mut,
+                rich_mut_pool,
+                last_stage,
+                mutation_result=rich_mutation,
+                traces=traces,
+            )
+
+    return _pack(
+        last_result,
+        last_pool,
+        last_stage,
+        mutation_result=last_mutation,
+        traces=traces,
     )
 
 

@@ -309,6 +309,60 @@ def test_round_budget_is_respected(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+
+def test_ff_houdini_returns_shared_staged_success_before_fixpoint(monkeypatch):
+    """FF is a fallback: a proof from the shared staged Houdini pipeline wins.
+
+    This prevents the nonlin_gauss_sum/nonlin_mult_5 regression shape where
+    ordinary mutation proved safety but enabling FF later returned unknown.
+    """
+    import pyhorn_bnd.ff_houdini as ff_module
+    from pyhorn_bnd.houdini import HoudiniResult, HoudiniStatistics, HoudiniStatus
+
+    program = parse_chc_file(ARRAY_EQ_EXAMPLE, slice_program=False)
+    called = {"staged": 0, "ff": 0}
+
+    def fake_staged(program, **kwargs):
+        called["staged"] += 1
+        seeds = kwargs["seed_result"]
+        return HoudiniResult(
+            status=HoudiniStatus.SUCCESS,
+            variables=seeds.variables,
+            candidates=seeds.candidates,
+            seed_result=seeds,
+            statistics=HoudiniStatistics(
+                iterations=1,
+                solver_contexts=0,
+                solver_checks=0,
+                candidates_initial=sum(len(v) for v in seeds.candidates.values()),
+                candidates_removed=0,
+                candidates_remaining=sum(len(v) for v in seeds.candidates.values()),
+                countermodels=0,
+                unknown_checks=0,
+                certification_checks=0,
+            ),
+            failures=(),
+            removed_candidates=(),
+            candidate_pool=seeds.candidates,
+            stage="trace-mutation",
+        )
+
+    def forbidden_ff(*args, **kwargs):
+        called["ff"] += 1
+        raise AssertionError("forward fixpoint must not run after staged success")
+
+    monkeypatch.setattr(ff_module, "run_trace_houdini", fake_staged)
+    monkeypatch.setattr(ff_module, "run_forward_fixpoint", forbidden_ff)
+    result = run_ff_houdini(
+        program,
+        use_trace=True,
+        use_mut=True,
+        houdini_timeout_ms=1000,
+    )
+    assert result.status is FFHoudiniStatus.SAFE
+    assert called == {"staged": 1, "ff": 0}
+
+
 def test_cli_ff_houdini_reports_success(capsys):
     from pyhorn_bnd.cli import main
 

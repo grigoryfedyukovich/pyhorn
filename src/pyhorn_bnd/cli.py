@@ -174,8 +174,9 @@ def _parser() -> argparse.ArgumentParser:
             "run PhaseFit synthesis for branching (ite/mod) loops: extract "
             "guarded branches, compute per-branch closed forms, discover "
             "phase boundaries, and feed the resulting interval lemmas plus "
-            "seed atoms into MultiHoudini. With --trace-houdini, PhaseFit "
-            "forms the first proof stage before trace candidates are added."
+            "seed atoms into MultiHoudini. With --trace-houdini, the cheap "
+            "Seed/Trace stages run first; PhaseFit is generated only if those "
+            "earlier stages do not already prove the program."
         ),
     )
     parser.add_argument(
@@ -276,8 +277,10 @@ def _parser() -> argparse.ArgumentParser:
             "already succeeds, trace sampling is skipped entirely. "
             "--seed-houdini may be passed alongside it but has no separate "
             "effect, since this pipeline already performs that attempt as "
-            "its own first stage. Combinable with --mut (applied at every "
-            "stage of this pipeline); a separate mode from --cands in this "
+            "its own first stage. With --phasefit, trace and trace-mutation "
+            "are tried before PhaseFit generation so finite mutation budgets "
+            "cannot be starved by richer candidates. Combinable with --mut; "
+            "a separate mode from --cands in this "
             "release -- not yet combinable with --cands, "
             "--validate-candidates, --dump-cands, or "
             "--dump-promising-candidates."
@@ -641,6 +644,10 @@ def _as_json(
 ) -> str:
     data = {
         "status": result.status.value,
+        "stage": result.stage,
+        "proposal_candidates": None
+        if result.candidate_pool is None
+        else sum(len(items) for items in result.candidate_pool.values()),
         "requested_upto": result.requested_upto,
         "explored_upto": result.explored_upto,
         "complete": result.complete,
@@ -1011,13 +1018,14 @@ def _print_houdini(
         )
     if debug:
         stats = result.statistics
+        stage_suffix = f", stage={result.stage}" if result.stage else ""
         print(
             f"MultiHoudini: iterations={stats.iterations}, "
             f"checks={stats.solver_checks}, "
             f"certification-checks={stats.certification_checks}, "
             f"countermodels={stats.countermodels}, "
             f"removed={stats.candidates_removed}, "
-            f"remaining={stats.candidates_remaining}"
+            f"remaining={stats.candidates_remaining}{stage_suffix}"
         )
     if debug and result.removed_candidates:
         print(
@@ -1493,12 +1501,10 @@ def main(argv: list[str] | None = None) -> int:
     # seed-houdini attempt as its own first stage, so passing --seed-houdini
     # alongside it is accepted as a (redundant but harmless) no-op rather
     # than an error.
-    # --ff-houdini and --ff-seeded both build their own candidate pool
-    # directly (see docs/ff_houdini.md and docs/forward_fixpoint.md)
-    # rather than delegating to run_trace_houdini(), so neither shares
-    # that function's "--trace-houdini cannot be combined with --cands"
-    # limitation -- exempted here rather than rejecting a combination
-    # they both actually support.
+    # --ff-houdini reuses the shared staged Houdini generator but can also
+    # ingest --cands before its FF fallback; --ff-seeded has its own pool
+    # construction.  Both therefore support --trace-houdini + --cands even
+    # though the plain trace-Houdini CLI keeps that combination disabled.
     if (
         args.trace_houdini
         and args.cands is not None
@@ -1577,21 +1583,10 @@ def main(argv: list[str] | None = None) -> int:
             user_candidates: CandidateMap | None = None
             mutation_result: MutationResult | None = None
             if args.trace_houdini:
-                # Trace-Houdini is a staged portfolio.  When PhaseFit is also
-                # requested, generate its candidates over the *same* mined
-                # variable map and feed them into stage 1.  Previously this
-                # top-level branch silently bypassed --phasefit entirely.
-                trace_seed_result = None
-                trace_extra_candidates: CandidateMap | None = None
-                if args.phasefit:
-                    from .phasefit import run_phasefit
-
-                    trace_miner = SeedMiner(program)
-                    trace_seed_result = trace_miner.mine()
-                    _pf_results, trace_extra_candidates = run_phasefit(
-                        program, seed_result=trace_seed_result
-                    )
-
+                # One shared staged portfolio now owns PhaseFit/trace/mutation
+                # ordering.  In particular Seed-Houdini runs *before* PhaseFit
+                # candidate generation, so a cheap seed proof cannot be turned
+                # into a timeout by a richer generator.
                 houdini_result = run_trace_houdini(
                     program,
                     trace_depth=args.trace_depth,
@@ -1614,16 +1609,13 @@ def main(argv: list[str] | None = None) -> int:
                         if args.trace_mutation_substitution_limit == 0
                         else args.trace_mutation_substitution_limit
                     ),
-                    extra_candidates=trace_extra_candidates,
-                    seed_result=trace_seed_result,
+                    use_phasefit=args.phasefit,
                 )
                 mutation_result = houdini_result.mutation_result
             else:
                 # SeedMiner allocates the canonical VariableMap in __init__,
                 # independent of the candidate-mining pass performed by
-                # .mine(). Only run .mine() when --seed-houdini was
-                # requested, so a plain --cands run does not pay for
-                # syntactic candidate mining it will not use.
+                # .mine(). Only run .mine() when a source actually needs it.
                 miner = SeedMiner(program)
                 seed_result = miner.mine() if args.seed_houdini else None
                 candidates: CandidateMap = (
@@ -1634,40 +1626,51 @@ def main(argv: list[str] | None = None) -> int:
                     user_candidates = parse_candidate_file(args.cands, miner.variables)
                     candidates = merge_candidate_maps(candidates, user_candidates)
 
+                early_houdini_result = None
                 if args.phasefit:
                     from .phasefit import run_phasefit
-                    # Ensure we have a seed_result for atom harvesting. If we
-                    # had to mine it fresh here (i.e. --seed-houdini wasn't
-                    # also given), merge its candidates in too -- otherwise
-                    # relations PhaseFit doesn't touch (or fails to split)
-                    # would get no candidates at all from a --phasefit-only
-                    # run, contradicting --phasefit's own help text.
+
+                    # PhaseFit needs mined atoms.  Once they are available, try
+                    # the cheap seed/user pool *before* generating PhaseFit.
+                    # This is intentionally a generation-stage early return:
+                    # formula25/formula27-class cases are already provable from
+                    # seeds and must not pay for expensive PhaseFit work.
                     if seed_result is None:
                         seed_result = miner.mine()
                         candidates = merge_candidate_maps(
                             candidates, seed_result.candidates
                         )
-                    _pf_results, pf_cands = run_phasefit(
-                        program, seed_result=seed_result
-                    )
-                    candidates = merge_candidate_maps(candidates, pf_cands)
+                    early_houdini_result = MultiHoudini(
+                        program,
+                        miner.variables,
+                        timeout_ms=args.timeout_ms,
+                        random_seed=args.random_seed,
+                    ).run(candidates, seed_result=seed_result)
+                    if early_houdini_result.status is not HoudiniStatus.SUCCESS:
+                        _pf_results, pf_cands = run_phasefit(
+                            program, seed_result=seed_result
+                        )
+                        candidates = merge_candidate_maps(candidates, pf_cands)
 
-                if args.mut:
-                    # Applies to whatever's in `candidates` at this point --
-                    # seed-mined, user-supplied, or both merged together --
-                    # since mutate_candidates only looks at the expressions
-                    # themselves.
-                    mutation_result = mutate_candidates(candidates)
-                    candidates = merge_candidate_maps(
-                        candidates, mutation_result.candidates
-                    )
+                if (
+                    early_houdini_result is not None
+                    and early_houdini_result.status is HoudiniStatus.SUCCESS
+                ):
+                    houdini_result = early_houdini_result
+                else:
+                    if args.mut:
+                        # Applies to whatever is in `candidates` at this point.
+                        mutation_result = mutate_candidates(candidates)
+                        candidates = merge_candidate_maps(
+                            candidates, mutation_result.candidates
+                        )
 
-                houdini_result = MultiHoudini(
-                    program,
-                    miner.variables,
-                    timeout_ms=args.timeout_ms,
-                    random_seed=args.random_seed,
-                ).run(candidates, seed_result=seed_result)
+                    houdini_result = MultiHoudini(
+                        program,
+                        miner.variables,
+                        timeout_ms=args.timeout_ms,
+                        random_seed=args.random_seed,
+                    ).run(candidates, seed_result=seed_result)
 
             candidate_validations: tuple[CandidateValidation, ...] | None = None
             candidate_files_by_index: dict[int, Path] = {}
